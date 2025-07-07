@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2025-07-07 14:52:41 by Eclipse SUMO netedit Version 1.22.0
+<neteditConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/neteditConfiguration.xsd">
+
+    <input>
+        <sumocfg-file value="C:\Users\Admin\Downloads\sumo test\New folder\dataset1.sumocfg"/>
+        <route-files value="C:\Users\Admin\Downloads\sumo test\New folder\dataset1.rou.xml"/>
+        <sumo-net-file value="C:\Users\Admin\Downloads\sumo test\New folder\dataset.net.xml"/>
+    </input>
+
+    <processing>
+        <geometry.min-radius.fix.railways value="false"/>
+        <geometry.max-grade.fix value="false"/>
+        <offset.disable-normalization value="true"/>
+        <lefthand value="0"/>
+    </processing>
+
+    <junctions>
+        <no-turnarounds value="true"/>
+        <junctions.corner-detail value="5"/>
+        <junctions.limit-turn-speed value="5.50"/>
+        <rectangular-lane-cut value="0"/>
+    </junctions>
+
+    <pedestrian>
+        <walkingareas value="0"/>
+    </pedestrian>
+
+</neteditConfiguration>
+-->
+
+<tlLogic id="E3" type="actuated" programID="0" offset="0">
+    <!-- Phase thông thường -->
+    <phase duration="20" state="rrrrrrGGGGggrrrrrGGGgggggg" minDur="5" maxDur="30"/>
+    <phase duration="3"  state="rrrrrryyyyyyrrrrryyyyyyyyy" minDur="3" maxDur="3"/>
+    <phase duration="40" state="GGGGggrrrrrrGGGggrrrrrrrrr" minDur="5" maxDur="60"/>
+    <phase duration="3"  state="yyyyyyrrrrrryyyyyrrrrrrrrr" minDur="3" maxDur="3"/>
+
+    <!-- ✅ Protected left-turn phase: E1-3_1 (vị trí 1) -->
+    <phase duration="10" state="rGrrrrrrrrrrrrrrrrrrrrrrr" minDur="5" maxDur="10"/>
+    <phase duration="3"  state="ryrrrrrrrrrrrrrrrrrrrrrrr" minDur="3" maxDur="3"/>
+
+    <!-- ✅ Protected left-turn phase: E5-3_1 (vị trí 5) -->
+    <phase duration="10" state="rrrrrGrrrrrrrrrrrrrrrrrrrr" minDur="5" maxDur="10"/>
+    <phase duration="3"  state="rrrrryrrrrrrrrrrrrrrrrrrrr" minDur="3" maxDur="3"/>
+
+    <!-- ✅ Protected left-turn phase: E3-2_1 (vị trí 7) -->
+    <phase duration="10" state="rrrrrrrGrrrrrrrrrrrrrrrrrr" minDur="5" maxDur="10"/>
+    <phase duration="3"  state="rrrrrrryrrrrrrrrrrrrrrrrrr" minDur="3" maxDur="3"/>
+</tlLogic>
+
+
+
