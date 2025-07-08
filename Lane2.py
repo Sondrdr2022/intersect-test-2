@@ -512,10 +512,7 @@ class SmartTrafficController:
                     is_left_turn = lane_id in self.left_turn_lanes
                     is_right_turn = lane_id in self.right_turn_lanes
                     # Debug print for verification
-                    if is_left_turn:
-                        print(f"DEBUG: Lane {lane_id} marked as LEFT TURN")
-                    if is_right_turn:
-                        print(f"DEBUG: Lane {lane_id} marked as RIGHT TURN")
+                    
                     
                     # Store lane data
                     lane_data[lane_id] = {

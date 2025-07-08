@@ -13,10 +13,11 @@ NET_FILE = 'dataset.net.xml'
 ROUTE_FILE = 'random_trips.rou.xml'
 VTYPES_FILE = 'vtypes.xml'
 SUMOCFG_FILE = 'random_simulation.sumocfg'
+TLL_FILE = ""  # <- Place your traffic light logic file here
 RANDOM_SEED = int(time.time())
 
 # Optimized congestion parameters
-TRIP_NUMBER = 1000
+TRIP_NUMBER = 1800
 BEGIN_TIME = 0
 END_TIME = 3600
 USE_GUI = True
@@ -24,8 +25,8 @@ USE_GUI = True
 # Congestion settings
 PEAK_INTENSITY = 2.0
 CONGESTION_PERIODS = [
-    (900, 1200),   # Morning rush: 15-20 minutes
-    (1800, 2100)   # Evening rush: 30-35 minutes
+    (200, 800),   
+    (1800, 2100)   
 ]
 
 SUMO_HOME = os.environ.get('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
@@ -34,7 +35,7 @@ RANDOMTRIPS_PATH = os.path.join(TOOLS_PATH, 'randomTrips.py')
 SUMO_BINARY = os.path.join(SUMO_HOME, 'bin', 'sumo-gui.exe' if USE_GUI else 'sumo.exe')
 
 def create_vehicle_types():
-    """Create optimized vehicle types for congestion"""
+    """Create vehicle types including emergency vehicles with low spawn rate."""
     vtypes = ET.Element('routes')
     
     # Passenger car (60% of vehicles)
@@ -48,7 +49,7 @@ def create_vehicle_types():
         'sigma': '0.5'
     })
     
-    # Truck (25% of vehicles)
+    # Truck (20% of vehicles)
     ET.SubElement(vtypes, 'vType', {
         'id': 'truck',
         'vClass': 'truck',
@@ -59,7 +60,7 @@ def create_vehicle_types():
         'sigma': '0.3'
     })
     
-    # Bus (15% of vehicles)
+    # Bus (10% of vehicles)
     ET.SubElement(vtypes, 'vType', {
         'id': 'bus',
         'vClass': 'bus',
@@ -69,14 +70,72 @@ def create_vehicle_types():
         'decel': '3.5',
         'sigma': '0.4'
     })
+
+    # Delivery van (6% of vehicles)
+    ET.SubElement(vtypes, 'vType', {
+        'id': 'delivery',
+        'vClass': 'delivery',
+        'length': '7.5',
+        'maxSpeed': '45',
+        'accel': '1.8',
+        'decel': '3.2',
+        'sigma': '0.6'
+    })
+
+    # Motorbike (2% of vehicles)
+    ET.SubElement(vtypes, 'vType', {
+        'id': 'motorbike',
+        'vClass': 'motorcycle',
+        'length': '2.3',
+        'maxSpeed': '60',
+        'accel': '3.0',
+        'decel': '5.0',
+        'sigma': '0.7'
+    })
+
+    # Emergency vehicle: Ambulance (~0.7% of vehicles)
+    ET.SubElement(vtypes, 'vType', {
+        'id': 'ambulance',
+        'vClass': 'emergency',
+        'length': '6',
+        'maxSpeed': '65',
+        'accel': '2.8',
+        'decel': '5.0',
+        'sigma': '0.3',
+        'color': '1,0,0'
+    })
+
+    # Emergency vehicle: Firetruck (~0.5% of vehicles)
+    ET.SubElement(vtypes, 'vType', {
+        'id': 'firetruck',
+        'vClass': 'emergency',
+        'length': '8',
+        'maxSpeed': '55',
+        'accel': '2.2',
+        'decel': '4.5',
+        'sigma': '0.3',
+        'color': '1,0.5,0'
+    })
+
+    # Emergency vehicle: Police (~0.8% of vehicles)
+    ET.SubElement(vtypes, 'vType', {
+        'id': 'police',
+        'vClass': 'emergency',
+        'length': '5',
+        'maxSpeed': '70',
+        'accel': '3.0',
+        'decel': '5.0',
+        'sigma': '0.2',
+        'color': '0,0,1'
+    })
     
     tree = ET.ElementTree(vtypes)
     with open(VTYPES_FILE, 'wb') as f:
         tree.write(f, encoding='utf-8', xml_declaration=True)
-    print(f"[INFO] Created optimized vehicle types: {VTYPES_FILE}")
+    print(f"[INFO] Created vehicle types (including emergency): {VTYPES_FILE}")
 
 def generate_randomtrips():
-    """Generate trips with optimized congestion"""
+    """Generate trips with optimized congestion and rare emergency vehicles."""
     base_vehicles = int(TRIP_NUMBER * 0.7)
     congestion_vehicles = int(TRIP_NUMBER * 0.3 * PEAK_INTENSITY)
     
@@ -120,40 +179,43 @@ def generate_randomtrips():
         subprocess.check_call(congestion_cmd)
         route_files.append(f'congestion_{i}.rou.xml')
     
-    # Merge files with sorting
+    # Merge files with sorting and assign vehicle types (including rare emergencies)
     merge_and_assign_vehicles(route_files, ROUTE_FILE)
     print(f"[INFO] Optimized routes generated: {ROUTE_FILE}")
 
 def merge_and_assign_vehicles(route_files, output_file):
-    """Merge route files with optimized assignments and proper sorting"""
-    # Create dictionary to store vehicles by departure time
+    """Merge route files with optimized assignments and proper sorting, including rare emergencies."""
+    # Probability ranges for vehicle types
+    # Format: (upper_bound, 'vtype_id')
+    vtype_probs = [
+        (0.360, 'passenger'),
+        (0.450, 'truck'),
+        (0.477, 'bus'),
+        (0.612, 'delivery'),
+        (0.972, 'motorbike'),
+        (0.981, 'ambulance'),
+        (0.990, 'firetruck'),
+        (1.000, 'police')
+    ]
     vehicles_by_time = defaultdict(list)
     
-    # Process files and collect vehicles
     for route_file in route_files:
         tree = ET.parse(route_file)
         root = tree.getroot()
         
         for element in root:
             if element.tag in ['trip', 'vehicle']:
-                # Get departure time (default to 0 if missing)
                 depart_time = float(element.get('depart', '0'))
-                
-                # Assign vehicle type
+
                 rand = random.random()
-                if 'baseline' in route_file:
-                    vtype = 'passenger' if rand < 0.7 else 'truck' if rand < 0.9 else 'bus'
-                else:  # Congestion file
-                    vtype = 'passenger' if rand < 0.5 else 'truck' if rand < 0.8 else 'bus'
-                element.set('type', vtype)
-                
-                # Store in dictionary by time
+                for upper, vtype in vtype_probs:
+                    if rand < upper:
+                        element.set('type', vtype)
+                        break
+
                 vehicles_by_time[depart_time].append(element)
     
-    # Create sorted list of departure times
     sorted_times = sorted(vehicles_by_time.keys())
-    
-    # Create new root element
     routes = ET.Element('routes')
     
     # Add vehicle types first
@@ -177,11 +239,14 @@ def merge_and_assign_vehicles(route_files, output_file):
             os.remove(file)
 
 def build_sumocfg():
-    """Build optimized SUMO configuration"""
+    """Build optimized SUMO configuration, with section for traffic light logic file."""
     cfg = ET.Element('configuration')
     input_elem = ET.SubElement(cfg, 'input')
     ET.SubElement(input_elem, 'net-file').set('value', NET_FILE)
     ET.SubElement(input_elem, 'route-files').set('value', ROUTE_FILE)
+    
+    # Section for traffic light logic file (user should place file in working directory)
+    ET.SubElement(input_elem, 'additional-files').set('value', TLL_FILE)
     
     time_elem = ET.SubElement(cfg, 'time')
     ET.SubElement(time_elem, 'begin').set('value', str(BEGIN_TIME))
@@ -191,10 +256,11 @@ def build_sumocfg():
     with open(SUMOCFG_FILE, 'wb') as f:
         tree.write(f, encoding='utf-8', xml_declaration=True)
     print(f"[INFO] Generated optimized SUMO config: {SUMOCFG_FILE}")
+    print(f"[INFO] Place your traffic light logic file as '{TLL_FILE}' in this directory.")
 
 def run_rl_script(extra_args=None):
     """Run with connection retry optimization"""
-    rl_script = 'Lane.py'
+    rl_script = 'Lane2.py'
     cmd = [sys.executable, rl_script, '--sumo', SUMOCFG_FILE]
     
     # Add connection retry parameters
@@ -252,7 +318,9 @@ if __name__ == '__main__':
     # Run with retry parameters
     run_rl_script(extra_args=[
         '--max-steps', '1500',
-        '--episodes', '2'
+        '--episodes', '2',
+        '--mode','train'
     ])
     
     print("\n🎉 Simulation completed successfully!")
+    print(f"\n[INFO] To use your custom traffic light logic, place your .tll.xml file as '{TLL_FILE}' in this directory.")
