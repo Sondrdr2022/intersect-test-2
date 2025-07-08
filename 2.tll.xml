@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2025-07-07 14:52:41 by Eclipse SUMO netedit Version 1.22.0
+<!-- generated on 2025-07-08 11:01:21 by Eclipse SUMO netedit Version 1.22.0
 <neteditConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/neteditConfiguration.xsd">
 
     <input>
-        <sumocfg-file value="C:\Users\Admin\Downloads\sumo test\New folder\dataset1.sumocfg"/>
-        <route-files value="C:\Users\Admin\Downloads\sumo test\New folder\dataset1.rou.xml"/>
-        <sumo-net-file value="C:\Users\Admin\Downloads\sumo test\New folder\dataset.net.xml"/>
+        <sumocfg-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\dataset1.sumocfg"/>
+        <route-files value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\dataset1.rou.xml"/>
+        <sumo-net-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\dataset.net.xml"/>
     </input>
 
     <processing>
@@ -30,25 +30,16 @@
 </neteditConfiguration>
 -->
 
-<tlLogic id="E3" type="actuated" programID="0" offset="0">
-    <!-- Phase thông thường -->
-    <phase duration="20" state="rrrrrrGGGGggrrrrrGGGgggggg" minDur="5" maxDur="30"/>
-    <phase duration="3"  state="rrrrrryyyyyyrrrrryyyyyyyyy" minDur="3" maxDur="3"/>
-    <phase duration="40" state="GGGGggrrrrrrGGGggrrrrrrrrr" minDur="5" maxDur="60"/>
-    <phase duration="3"  state="yyyyyyrrrrrryyyyyrrrrrrrrr" minDur="3" maxDur="3"/>
-
-    <!-- ✅ Protected left-turn phase: E1-3_1 (vị trí 1) -->
-    <phase duration="10" state="rGrrrrrrrrrrrrrrrrrrrrrrr" minDur="5" maxDur="10"/>
-    <phase duration="3"  state="ryrrrrrrrrrrrrrrrrrrrrrrr" minDur="3" maxDur="3"/>
-
-    <!-- ✅ Protected left-turn phase: E5-3_1 (vị trí 5) -->
-    <phase duration="10" state="rrrrrGrrrrrrrrrrrrrrrrrrrr" minDur="5" maxDur="10"/>
-    <phase duration="3"  state="rrrrryrrrrrrrrrrrrrrrrrrrr" minDur="3" maxDur="3"/>
-
-    <!-- ✅ Protected left-turn phase: E3-2_1 (vị trí 7) -->
-    <phase duration="10" state="rrrrrrrGrrrrrrrrrrrrrrrrrr" minDur="5" maxDur="10"/>
-    <phase duration="3"  state="rrrrrrryrrrrrrrrrrrrrrrrrr" minDur="3" maxDur="3"/>
-</tlLogic>
-
-
-
+<additional xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/additional_file.xsd">
+    <tlLogic id="E3" type="static" programID="0" offset="0">
+        <phase duration="12" state="rrrrrGGrrrrrrrrrrrrrrrr"/> <!-- North approach left only -->
+        <phase duration="3" state="rrrrryrrrrrrrrrrrrrrrr"/>
+        <phase duration="42" state="rrrrrrGGGGGggrrrrrGGGgg"/>
+        <phase duration="3" state="rrrrrryyyyyyyrrrrryyyyy"/>
+        <phase duration="12" state="rrrrrrrrrrrGGrrrrrrrrr"/> <!-- East approach left only -->
+        <phase duration="3" state="rrrrrrrrrrryyrrrrrrrrr"/>
+        <phase duration="42" state="GGGGggrrrrrrGGGGggrrrrr"/>
+        <phase duration="3" state="yyyyyyrrrrrryyyyyyrrrrr"/>
+<!-- repeat for south and west as needed -->
+    </tlLogic>
+</additional>

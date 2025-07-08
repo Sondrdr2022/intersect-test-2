@@ -1,16 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2025-07-07 15:54:17 by Eclipse SUMO netedit Version 1.22.0
+<!-- generated on 2025-07-08 09:06:43 by Eclipse SUMO netedit Version 1.22.0
 <neteditConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/neteditConfiguration.xsd">
 
     <input>
-        <sumocfg-file value="C:\Users\Admin\Downloads\sumo test\New folder\dataset1.sumocfg"/>
-        <route-files value="C:\Users\Admin\Downloads\sumo test\New folder\dataset1.rou.xml"/>
-        <sumo-net-file value="C:\Users\Admin\Downloads\sumo test\New folder\dataset.net.xml"/>
+        <route-files value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\dataset1.rou.xml"/>
+        <sumo-net-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\dataset.net.xml"/>
     </input>
 
     <output>
-        <output-file value="C:\Users\Admin\Downloads\sumo test\New folder\dataset.net.xml"/>
+        <output-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\dataset.net.xml"/>
     </output>
 
     <processing>
@@ -134,11 +133,11 @@
         <lane id="E5-3_1" index="1" speed="13.89" length="500.00" shape="-44.12,-61.74 -44.47,-9.20"/>
     </edge>
 
-    <tlLogic id="E3" type="actuated" programID="0" offset="0">
-        <phase duration="20" state="rrrrrrGGGGggrrrrrGGGgg" minDur="5" maxDur="30"/>
-        <phase duration="3"  state="rrrrrryyyyyyrrrrryyyyy" minDur="3" maxDur="3"/>
-        <phase duration="40" state="GGGGggrrrrrrGGGggrrrrr" minDur="5" maxDur="60"/>
-        <phase duration="3"  state="yyyyyyrrrrrryyyyyrrrrr" minDur="3" maxDur="3"/>
+    <tlLogic id="E3" type="static" programID="0" offset="0">
+        <phase duration="42" state="rrrrrrGGGGggrrrrrGGGggr"/>
+        <phase duration="3"  state="rrrrrryyyyyyrrrrryyyyyr"/>
+        <phase duration="42" state="GGGGggrrrrrrGGGggrrrrrr"/>
+        <phase duration="3"  state="yyyyyyrrrrrryyyyyrrrrrr"/>
     </tlLogic>
 
     <junction id="E1" type="dead_end" x="-44.47" y="62.58" incLanes="E3-1_0 E3-1_1" intLanes="" shape="-44.47,62.58 -38.07,62.41 -44.47,62.58"/>
