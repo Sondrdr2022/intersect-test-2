@@ -142,7 +142,7 @@ def export_training_data_xlsx_only(training_data: List[Dict[str, Any]], base_fil
         clean_entry['density'] = float(clean_entry['density'])
         clean_entry['mean_speed'] = float(clean_entry['mean_speed'])
         clean_entry['ambulance'] = bool(clean_entry['ambulance'])
-        clean_entry['left_turn'] = bool(clean_entry['left_turn'])
+        clean_entry['left_turn'] = bool(entry.get('left_turn', False))        
         clean_entry['epsilon'] = float(clean_entry['epsilon'])
         clean_entry['learning_rate'] = float(clean_entry['learning_rate'])
         clean_entry['raw_reward'] = int(entry.get('raw_reward', 0))
@@ -424,6 +424,6 @@ if __name__ == "__main__":
     
     # Use first command line argument as file if provided
     import sys
-    pkl_file = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\Admin\Downloads\New-folder--7-\New folder (2)\enhanced_q_table.pkl"
+    pkl_file = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\Admin\Downloads\New-folder--6-\enhanced_q_table.pkl"
     
     analyze_qtable(pkl_file)
