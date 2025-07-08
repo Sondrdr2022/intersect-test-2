@@ -1,14 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2025-07-08 09:06:43 by Eclipse SUMO netedit Version 1.22.0
+<!-- generated on 2025-07-08 14:20:47 by Eclipse SUMO netedit Version 1.22.0
 <neteditConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/neteditConfiguration.xsd">
 
     <input>
+        <sumocfg-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\dataset1.sumocfg"/>
         <route-files value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\dataset1.rou.xml"/>
         <sumo-net-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\dataset.net.xml"/>
     </input>
 
     <output>
+        <tls-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\2.tll.xml"/>
         <output-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\dataset.net.xml"/>
     </output>
 
@@ -134,10 +136,18 @@
     </edge>
 
     <tlLogic id="E3" type="static" programID="0" offset="0">
-        <phase duration="42" state="rrrrrrGGGGggrrrrrGGGggr"/>
+        <phase duration="15" state="rrrGGGrrrrrrrrGGGrrrrrr"/>
+        <phase duration="3"  state="rrryyyrrrrrrrryyyrrrrrr"/>
+        <phase duration="45" state="rrrrrrGGGGggrrrrrGGGggr"/>
         <phase duration="3"  state="rrrrrryyyyyyrrrrryyyyyr"/>
-        <phase duration="42" state="GGGGggrrrrrrGGGggrrrrrr"/>
+        <phase duration="15" state="rrrrrrrrrGGGrrrrrrrGGGr"/>
+        <phase duration="3"  state="rrrrrrrrryyyrrrrrrryyyr"/>
+        <phase duration="45" state="GGGGggrrrrrrGGGggrrrrrr"/>
         <phase duration="3"  state="yyyyyyrrrrrryyyyyrrrrrr"/>
+        <phase duration="15" state="rrrrrrrrrGGGrrrrrrrGGGr"/>
+        <phase duration="3"  state="rrrrrrrrryyyrrrrrrryyyr"/>
+        <phase duration="15" state="rrrGGGrrrrrrrrGGGrrrrrr"/>
+        <phase duration="3"  state="rrryyyrrrrrrrryyyrrrrrr"/>
     </tlLogic>
 
     <junction id="E1" type="dead_end" x="-44.47" y="62.58" incLanes="E3-1_0 E3-1_1" intLanes="" shape="-44.47,62.58 -38.07,62.41 -44.47,62.58"/>

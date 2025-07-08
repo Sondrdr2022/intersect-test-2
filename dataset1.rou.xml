@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2025-07-02 14:52:17 by Eclipse SUMO netedit Version 1.22.0
+<!-- generated on 2025-07-08 14:16:51 by Eclipse SUMO netedit Version 1.22.0
 -->
 
 <routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
@@ -8,25 +8,25 @@
     <vType id="emergency" vClass="emergency" guiShape="emergency"/>
     <vType id="motorbike" vClass="motorcycle" color="60,27,244,0"/>
     <!-- Vehicles, persons and containers (sorted by depart) -->
-    <flow id="f_0" begin="0.00" from="E1-3" to="E4-3" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_1" begin="0.00" from="E1-3" to="E3-5" end="3600.00" vehsPerHour="1500"/>
+    <flow id="f_0" type="DEFAULT_BIKETYPE" begin="0.00" from="E1-3" to="E2-3" end="3600.00" vehsPerHour="1800"/>
+    <flow id="f_1" type="DEFAULT_BIKETYPE" begin="0.00" from="E1-3" to="E4-3" end="3600.00" vehsPerHour="1800"/>
     <flow id="f_10" begin="0.00" from="E3-4" to="E2-3" end="3600.00" vehsPerHour="1500"/>
     <flow id="f_11" begin="0.00" from="E3-4" to="E3-1" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_12" type="motorbike" begin="0.00" from="E5-3" to="E2-3" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_13" type="motorbike" begin="0.00" from="E5-3" to="E3-1" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_14" type="motorbike" begin="0.00" from="E5-3" to="E4-3" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_15" type="motorbike" begin="0.00" from="E3-2" to="E3-1" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_16" type="motorbike" begin="0.00" from="E3-2" to="E4-3" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_17" type="motorbike" begin="0.00" from="E3-2" to="E3-5" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_18" type="motorbike" begin="0.00" from="E1-3" to="E2-3" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_19" type="motorbike" begin="0.00" from="E1-3" to="E3-5" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_2" begin="0.00" from="E1-3" to="E2-3" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_20" type="motorbike" begin="0.00" from="E1-3" to="E4-3" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_21" type="motorbike" begin="0.00" from="E3-4" to="E3-1" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_22" type="motorbike" begin="0.00" from="E3-4" to="E2-3" end="3600.00" vehsPerHour="1500"/>
-    <flow id="f_23" type="motorbike" begin="0.00" from="E3-4" to="E3-5" end="3600.00" vehsPerHour="1500"/>
+    <flow id="f_12" type="DEFAULT_BIKETYPE" begin="0.00" from="E5-3" to="E2-3" end="3600.00" vehsPerHour="1500"/>
+    <flow id="f_13" type="DEFAULT_BIKETYPE" begin="0.00" from="E5-3" to="E3-1" end="3600.00" vehsPerHour="1500"/>
+    <flow id="f_14" type="DEFAULT_BIKETYPE" begin="0.00" from="E5-3" to="E4-3" end="3600.00" vehsPerHour="1500"/>
+    <flow id="f_15" type="DEFAULT_BIKETYPE" begin="0.00" from="E3-2" to="E3-1" end="3600.00" vehsPerHour="1500"/>
+    <flow id="f_16" type="DEFAULT_BIKETYPE" begin="0.00" from="E3-2" to="E4-3" end="3600.00" vehsPerHour="1500"/>
+    <flow id="f_17" type="DEFAULT_BIKETYPE" begin="0.00" from="E3-2" to="E3-5" end="3600.00" vehsPerHour="1500"/>
+    <flow id="f_18" begin="0.00" from="E1-3" to="E2-3" end="3600.00" vehsPerHour="1800"/>
+    <flow id="f_19" begin="0.00" from="E1-3" to="E4-3" end="3600.00" vehsPerHour="1800"/>
+    <flow id="f_2" type="DEFAULT_BIKETYPE" begin="0.00" from="E1-3" to="E3-5" end="3600.00" vehsPerHour="1800"/>
+    <flow id="f_20" begin="0.00" from="E1-3" to="E3-5" end="3600.00" vehsPerHour="1800"/>
+    <flow id="f_21" type="DEFAULT_BIKETYPE" begin="0.00" from="E3-4" to="E3-1" end="3600.00" vehsPerHour="1500"/>
+    <flow id="f_22" type="DEFAULT_BIKETYPE" begin="0.00" from="E3-4" to="E2-3" end="3600.00" vehsPerHour="1500"/>
+    <flow id="f_23" type="DEFAULT_BIKETYPE" begin="0.00" from="E3-4" to="E3-5" end="3600.00" vehsPerHour="1500"/>
     <flow id="f_24" type="emergency" begin="0.00" from="E3-2" to="E4-3" number="2" period="600.00"/>
-    <flow id="f_25" type="emergency" begin="0.00" from="E1-3" to="E2-3" number="2" period="600.00"/>
+    <flow id="f_25" type="emergency" begin="0.00" from="E1-3" to="E3-5" number="2" probability="0.5"/>
     <flow id="f_26" type="emergency" begin="0.00" from="E3-4" to="E3-5" number="2" period="600.00"/>
     <flow id="f_27" type="emergency" begin="0.00" from="E5-3" to="E4-3" number="2" period="600.00"/>
     <flow id="f_3" begin="0.00" from="E3-2" to="E3-1" end="3600.00" vehsPerHour="1500"/>
