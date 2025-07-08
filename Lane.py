@@ -368,13 +368,118 @@ class SmartTrafficController:
             for lane_id in lanes:
                 connections = traci.lane.getLinks(lane_id)
                 for conn in connections:
-                    if len(conn) > 3 and conn[3] == 'l':
+                    # Check both possible direction indicators
+                    if (len(conn) > 6 and conn[6] == 'l') or (len(conn) > 3 and conn[3] == 'l'):
                         self.left_turn_lanes.add(lane_id)
                         break
             print(f"Auto-detected left-turn lanes: {sorted(self.left_turn_lanes)}")
         except Exception as e:
             print(f"Error initializing left-turn lanes: {e}")
- 
+
+    def _handle_protected_left_turn(self, tl_id, left_turn_lanes, lane_data, current_time):
+        """Handle protected left turn phase activation (exclusive left-turn green)"""
+        try:
+            # Find the left turn lane with highest priority
+            left_turn_lanes.sort(key=lambda x: (
+                lane_data[x]['queue_length'],
+                lane_data[x]['waiting_time']
+            ), reverse=True)
+            
+            target_lane = left_turn_lanes[0]
+            current_phase = traci.trafficlight.getPhase(tl_id)
+            logic = self._get_traffic_light_logic(tl_id)
+            
+            # Find the best protected left-turn phase
+            left_turn_phase = self._find_best_left_turn_phase(tl_id, target_lane, lane_data)
+            
+            if left_turn_phase is not None and current_phase != left_turn_phase:
+                # Calculate duration based on queue and waiting time
+                queue_length = lane_data[target_lane]['queue_length']
+                waiting_time = lane_data[target_lane]['waiting_time']
+                base_duration = 5 + min(queue_length * 0.5, 10) + min(waiting_time * 0.1, 5)
+                
+                # Apply adaptive parameters
+                duration = min(
+                    max(base_duration, self.adaptive_params['min_green']),
+                    self.adaptive_params['max_green']
+                )
+                
+                # Set the protected left-turn phase
+                traci.trafficlight.setPhase(tl_id, left_turn_phase)
+                traci.trafficlight.setPhaseDuration(tl_id, duration)
+                
+                print(f"↩️ PROTECTED LEFT TURN: Activated for {target_lane} at {tl_id} "
+                    f"(queue={queue_length}, wait={waiting_time:.1f}s, duration={duration:.1f}s)")
+                
+                # Update tracking variables
+                self.last_green_time[target_lane] = current_time
+                self.last_phase_change[tl_id] = current_time
+                self.phase_utilization[(tl_id, left_turn_phase)] += 1
+                
+                return True  # Indicate that left turn was handled
+                
+        except Exception as e:
+            print(f"Error in _handle_protected_left_turn: {e}")
+        return False
+
+    def _find_best_left_turn_phase(self, tl_id, left_turn_lane, lane_data):
+        """
+        Finds the best phase for protected left turns, considering:
+        - Exclusive left-turn phases (only left turns get green)
+        - Permissive phases (left turns share green with straight traffic)
+        """
+        try:
+            logic = self._get_traffic_light_logic(tl_id)
+            if not logic:
+                return None
+
+            controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
+            target_idx = controlled_lanes.index(left_turn_lane)
+            
+            best_phase = None
+            best_score = -1
+            
+            for phase_idx, phase in enumerate(logic.phases):
+                state = phase.state.upper()
+                
+                # Skip if this phase doesn't give green to our left-turn lane
+                if target_idx >= len(state) or state[target_idx] != 'G':
+                    continue
+                    
+                # Calculate phase score
+                score = 0
+                
+                # Prefer exclusive left-turn phases (where only left turns are green)
+                is_exclusive = True
+                for i, signal in enumerate(state):
+                    if i != target_idx and signal != 'r' and signal != 'R':
+                        is_exclusive = False
+                        break
+                        
+                if is_exclusive:
+                    score += 20  # Bonus for exclusive left-turn phase
+                
+                # Consider other lanes in this phase
+                for i, lane in enumerate(controlled_lanes):
+                    if i >= len(state):
+                        continue
+                        
+                    if state[i] == 'G' and lane in lane_data:
+                        # Penalize phases that give green to congested opposing lanes
+                        if lane != left_turn_lane and lane_data[lane]['queue_length'] > 5:
+                            score -= lane_data[lane]['queue_length'] * 0.5
+                            
+                # Track the best scoring phase
+                if score > best_score:
+                    best_score = score
+                    best_phase = phase_idx
+                    
+            return best_phase
+            
+        except Exception as e:
+            print(f"Error in _find_best_left_turn_phase: {e}")
+            return None
+
     def _is_left_turn_lane(self, lane_id):
         """Check if the lane is a left-turn lane."""
         return lane_id in self.left_turn_lanes
@@ -733,14 +838,23 @@ class SmartTrafficController:
             print(f"Error in _adjust_traffic_lights: {e}")
 
     def _handle_priority_conditions(self, tl_id, controlled_lanes, lane_data, current_time):
-        """Handle priority conditions (ambulances)"""
-        # Check for ambulances first
+        """Handle priority conditions (ambulances, left turns)"""
+        # Check for ambulances first (highest priority)
         ambulance_lanes = [lane for lane in controlled_lanes 
-                         if lane in lane_data and lane_data[lane]['ambulance']]
+                        if lane in lane_data and lane_data[lane]['ambulance']]
         
         if ambulance_lanes:
             self._handle_ambulance_priority(tl_id, ambulance_lanes, current_time)
             return True
+            
+        # Check for left turns with significant queues
+        left_turn_lanes = [lane for lane in controlled_lanes 
+                        if lane in lane_data and lane_data[lane]['left_turn'] 
+                        and (lane_data[lane]['queue_length'] > 3 or 
+                            lane_data[lane]['waiting_time'] > 10)]
+        
+        if left_turn_lanes:
+            return self._handle_protected_left_turn(tl_id, left_turn_lanes, lane_data, current_time)
             
         return False  # No left-turn priority logic
 
@@ -1053,13 +1167,18 @@ class SmartTrafficController:
         """Calculate comprehensive reward signal with detailed components"""
         try:
             data = lane_data[lane_id]
-            
+            left_turn_factor = 1.5 if data['left_turn'] else 1.0
+
             # Core components
-            queue_penalty = -min(data['queue_length'] * self.adaptive_params['queue_weight'], 30)
-            wait_penalty = -min(data['waiting_time'] * self.adaptive_params['wait_weight'], 20)
+            queue_penalty = -min(data['queue_length'] * self.adaptive_params['queue_weight'] * left_turn_factor, 30)
+            wait_penalty = -min(data['waiting_time'] * self.adaptive_params['wait_weight'] * left_turn_factor, 20)
             throughput_reward = min(data['flow'] * self.adaptive_params['flow_weight'], 25)
             speed_reward = min(data['mean_speed'] * self.adaptive_params['speed_weight'], 15)
-
+            # Bonus for handling left turns effectively
+            left_turn_bonus = 0
+            if data['left_turn'] and action_taken == 0:  # Green light action
+                if data['queue_length'] < 2:  # Successfully cleared left turn queue
+                    left_turn_bonus = 15
             # Action effectiveness
             action_bonus = 0
             if action_taken == 0:  # Green light action
