@@ -940,56 +940,56 @@ class SmartTrafficController:
             print(f"Error finding phase for lane {target_lane}: {e}")
         return 0
 
-def _process_rl_learning(self, lane_data, current_time):
-    for lane_id, data in lane_data.items():
-        print(f">> Checking lane_id {lane_id}")
-        state = self._create_state_vector(lane_id, lane_data)
-        if not self.rl_agent.is_valid_state(state):
-            print(f"  Invalid state for lane {lane_id}, shape: {state.shape}, values: {state}")
-            continue
-        action = self.rl_agent.get_action(state, lane_id=lane_id)
-        print(f"  Got action {action} for lane {lane_id}")
-        if lane_id in self.previous_states and lane_id in self.previous_actions:
-            # ADD THIS: Compute reward and reward_components
-            reward, reward_components, raw_reward = self._calculate_reward(
-                lane_id, lane_data, self.previous_actions[lane_id], current_time
-            )
-            print(f"  Previous state/action exists for {lane_id}, updating Q-table")
-            for comp, value in reward_components.items():
-                print(f"  - {comp}: {value:.2f}")
-            print(f"  Total reward: {reward:.2f}")
-            # Update Q-table
-            self.rl_agent.update_q_table(
-                self.previous_states[lane_id],
-                self.previous_actions[lane_id],
-                reward,
-                state,
-                lane_info={
-                    'lane_id': lane_id,
-                    'edge_id': data['edge_id'],
-                    'route_id': data['route_id'],
-                    'queue_length': data['queue_length'],
-                    'waiting_time': data['waiting_time'],
-                    'density': data['density'],
-                    'mean_speed': data['mean_speed'],
-                    'flow': data['flow'],
-                    'queue_route': data.get('queue_route', 0),
-                    'flow_route': data.get('flow_route', 0),
-                    'ambulance': data['ambulance'],
-                    'tl_id': self.lane_to_tl.get(lane_id, ''),
-                    'phase_id': traci.trafficlight.getPhase(self.lane_to_tl.get(lane_id, '')) if lane_id in self.lane_to_tl else -1,
-                    'epsilon': self.rl_agent.epsilon,
-                    'learning_rate': self.rl_agent.learning_rate,
-                    'adaptive_params': self.adaptive_params.copy(),
-                    'simulation_time': current_time,
-                    'reward_components': reward_components,
-                    'raw_reward': int(round(raw_reward)),
-                    'left_turn': data.get('left_turn', False)
-                }
-            )
-        # Store current state and action
-        self.previous_states[lane_id] = state
-        self.previous_actions[lane_id] = action
+    def _process_rl_learning(self, lane_data, current_time):
+        for lane_id, data in lane_data.items():
+            print(f">> Checking lane_id {lane_id}")
+            state = self._create_state_vector(lane_id, lane_data)
+            if not self.rl_agent.is_valid_state(state):
+                print(f"  Invalid state for lane {lane_id}, shape: {state.shape}, values: {state}")
+                continue
+            action = self.rl_agent.get_action(state, lane_id=lane_id)
+            print(f"  Got action {action} for lane {lane_id}")
+            if lane_id in self.previous_states and lane_id in self.previous_actions:
+                # ADD THIS: Compute reward and reward_components
+                reward, reward_components, raw_reward = self._calculate_reward(
+                    lane_id, lane_data, self.previous_actions[lane_id], current_time
+                )
+                print(f"  Previous state/action exists for {lane_id}, updating Q-table")
+                for comp, value in reward_components.items():
+                    print(f"  - {comp}: {value:.2f}")
+                print(f"  Total reward: {reward:.2f}")
+                # Update Q-table
+                self.rl_agent.update_q_table(
+                    self.previous_states[lane_id],
+                    self.previous_actions[lane_id],
+                    reward,
+                    state,
+                    lane_info={
+                        'lane_id': lane_id,
+                        'edge_id': data['edge_id'],
+                        'route_id': data['route_id'],
+                        'queue_length': data['queue_length'],
+                        'waiting_time': data['waiting_time'],
+                        'density': data['density'],
+                        'mean_speed': data['mean_speed'],
+                        'flow': data['flow'],
+                        'queue_route': data.get('queue_route', 0),
+                        'flow_route': data.get('flow_route', 0),
+                        'ambulance': data['ambulance'],
+                        'tl_id': self.lane_to_tl.get(lane_id, ''),
+                        'phase_id': traci.trafficlight.getPhase(self.lane_to_tl.get(lane_id, '')) if lane_id in self.lane_to_tl else -1,
+                        'epsilon': self.rl_agent.epsilon,
+                        'learning_rate': self.rl_agent.learning_rate,
+                        'adaptive_params': self.adaptive_params.copy(),
+                        'simulation_time': current_time,
+                        'reward_components': reward_components,
+                        'raw_reward': int(round(raw_reward)),
+                        'left_turn': data.get('left_turn', False)
+                    }
+                )
+            # Store current state and action
+            self.previous_states[lane_id] = state
+            self.previous_actions[lane_id] = action
 
     def _create_state_vector(self, lane_id, lane_data):
         """Create comprehensive state vector"""
