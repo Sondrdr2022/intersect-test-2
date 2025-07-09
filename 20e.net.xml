@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2025-07-09 09:16:46 by Eclipse SUMO netedit Version 1.22.0
+<!-- generated on 2025-07-09 09:35:53 by Eclipse SUMO netedit Version 1.22.0
 <neteditConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/neteditConfiguration.xsd">
 
     <input>
+        <sumocfg-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\2.sumocfg"/>
+        <route-files value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\random_trips.rou.xml"/>
         <sumo-net-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\20e.net.xml"/>
     </input>
 
@@ -725,23 +727,23 @@
 
     <tlLogic id="J11" type="static" programID="0" offset="0">
         <phase duration="42" state="GGGGGgrr"/>
-        <phase duration="3"  state="Gyyyyyrr"/>
+        <phase duration="3"  state="yyyyygrr"/>
         <phase duration="10" state="rrrrrrGr"/>
         <phase duration="3"  state="rrrrrryr"/>
         <phase duration="42" state="GrrrrrGG"/>
-        <phase duration="3"  state="Grrrrryy"/>
+        <phase duration="3"  state="yrrrrryy"/>
     </tlLogic>
     <tlLogic id="J13" type="static" programID="0" offset="0">
         <phase duration="24" state="GGggrrrrrrrrGGGG"/>
-        <phase duration="3"  state="GGggrrrrrrrryyyy"/>
+        <phase duration="3"  state="yygyrrrrrrrryyyy"/>
         <phase duration="8"  state="rrrrGrrrrrrrrrrr"/>
         <phase duration="3"  state="rrrryrrrrrrrrrrr"/>
         <phase duration="6"  state="GGGGrrrrrrrrrrrr"/>
         <phase duration="3"  state="yyyyrrrrrrrrrrrr"/>
         <phase duration="24" state="rrrrGGGGGrrrrrrr"/>
-        <phase duration="3"  state="rrrryyyyGrrrrrrr"/>
+        <phase duration="3"  state="rrrryyyyyrrrrrrr"/>
         <phase duration="24" state="rrrrrrrrGGGGGrrr"/>
-        <phase duration="3"  state="rrrrrrrryyyyGrrr"/>
+        <phase duration="3"  state="rrrrrrrryyyyyrrr"/>
     </tlLogic>
     <tlLogic id="J14" type="static" programID="0" offset="0">
         <phase duration="42" state="GGgrrGGG"/>
@@ -750,6 +752,7 @@
         <phase duration="3"  state="rrryrrrr"/>
         <phase duration="42" state="rrrGGGrr"/>
         <phase duration="3"  state="rrryyGrr"/>
+        <phase duration="3"  state="yyyrrGyy"/>
     </tlLogic>
     <tlLogic id="J17" type="static" programID="0" offset="0">
         <phase duration="14" state="rrrrrrrrrrrrrrrrrrGGGGGgrrrrrrrGGGggg"/>
@@ -775,22 +778,28 @@
     <tlLogic id="J19" type="static" programID="0" offset="0">
         <phase duration="42" state="GGgrrGGG"/>
         <phase duration="3"  state="yyyrrGyy"/>
+        <phase duration="2"  state="rrrrrrrr"/>
         <phase duration="10" state="rrrrGrrr"/>
         <phase duration="3"  state="rrrryrrr"/>
+        <phase duration="2"  state="rrrrrrrr"/>
         <phase duration="42" state="rrrGGGrr"/>
         <phase duration="3"  state="rrryyGrr"/>
+        <phase duration="2"  state="rrrrrrrr"/>
     </tlLogic>
     <tlLogic id="J21" type="static" programID="0" offset="0">
         <phase duration="42" state="GGGGGgrr"/>
-        <phase duration="3"  state="Gyyyyyrr"/>
+        <phase duration="3"  state="yyyyyyrr"/>
         <phase duration="10" state="rrrrrrGr"/>
         <phase duration="3"  state="rrrrrryr"/>
         <phase duration="42" state="GrrrrrGG"/>
-        <phase duration="3"  state="Grrrrryy"/>
+        <phase duration="3"  state="yrrrrryy"/>
     </tlLogic>
     <tlLogic id="J32" type="static" programID="0" offset="0">
         <phase duration="22" state="rrrrrGGGGgrrrrrGGGggrrrrrr"/>
         <phase duration="3"  state="rrrrryyyygrrrrryyyggrrrrrr"/>
+        <phase duration="22" state="rrrrrrrrrrrGGGGGrrrrrGGGGG"/>
+        <phase duration="3"  state="rrrrrrrrrrryyyyyrrrrryyyyy"/>
+        <phase duration="2"  state="rrrrrrrrrrrrrrrrrrrrrrrrrr"/>
     </tlLogic>
 
     <junction id="J10" type="priority" x="314.75" y="-40.39" incLanes="-E32_0 -E32_1 E29_0 E29_1" intLanes=":J10_0_0 :J10_0_1 :J10_2_0 :J10_2_1" shape="300.18,-43.29 303.33,-30.88 314.97,-25.53 317.67,-32.80 318.30,-38.34 316.87,-42.15 313.37,-44.25 307.81,-44.63">

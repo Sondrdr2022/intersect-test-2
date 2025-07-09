@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<configuration><input><net-file value="20e.net.xml" /><route-files value="random_trips.rou.xml" /><additional-files value="" /></input><time><begin value="0" /><end value="3600" /></time></configuration>
