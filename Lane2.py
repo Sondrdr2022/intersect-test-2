@@ -282,6 +282,22 @@ class SmartTrafficController:
         else:
             self.adaptive_params = default_adaptive_params.copy()
             print("🆕 Using default adaptive parameters")
+        
+        # Congested mode parameters
+        self.is_congested_mode = False
+        self.normal_adaptive_params = self.adaptive_params.copy()
+        self.congested_adaptive_params = {
+            'min_green': min(90, self.normal_adaptive_params['min_green'] * 1.5),
+            'max_green': min(120, self.normal_adaptive_params['max_green'] * 1.8),
+            'starvation_threshold': self.normal_adaptive_params['starvation_threshold'],
+            'reward_scale': self.normal_adaptive_params['reward_scale'],
+            'queue_weight': min(1.0, self.normal_adaptive_params['queue_weight'] * 1.3),
+            'wait_weight': min(1.0, self.normal_adaptive_params['wait_weight'] * 1.2),
+            'flow_weight': min(1.0, self.normal_adaptive_params['flow_weight'] * 1.4),
+            'speed_weight': self.normal_adaptive_params['speed_weight'],
+            'left_turn_priority': self.normal_adaptive_params['left_turn_priority']
+        }
+        
         self.norm_bounds = {
             'queue': 20,
             'wait': 120,
@@ -304,6 +320,71 @@ class SmartTrafficController:
             self.left_turn_lanes = set()
             self.right_turn_lanes = set()
             self._init_left_turn_lanes()
+    
+    def detect_congestion(self, lane_data):
+        """
+        Detect congestion based on average queue length and waiting time across all lanes.
+        Returns True if congestion is detected.
+        """
+        if not lane_data:
+            return False
+            
+        try:
+            total_queue = 0
+            total_waiting = 0
+            valid_lanes = 0
+            
+            # Calculate averages across all lanes
+            for lane_id, data in lane_data.items():
+                if data['queue_length'] >= 0 and data['waiting_time'] >= 0:
+                    total_queue += data['queue_length']
+                    total_waiting += data['waiting_time']
+                    valid_lanes += 1
+            
+            if valid_lanes == 0:
+                return False
+                
+            avg_queue = total_queue / valid_lanes
+            avg_waiting = total_waiting / valid_lanes
+            
+            # Congestion thresholds
+            queue_threshold = 8.0  # Average queue length threshold
+            waiting_threshold = 60.0  # Average waiting time threshold (seconds)
+            
+            # Detect congestion if either threshold is exceeded
+            is_congested = avg_queue >= queue_threshold or avg_waiting >= waiting_threshold
+            
+            return is_congested
+            
+        except Exception as e:
+            print(f"Error in detect_congestion: {e}")
+            return False
+    
+    def set_congested_mode(self, enabled: bool):
+        """
+        Change adaptive parameters according to congested mode state.
+        Args:
+            enabled: True to enable congested mode, False for normal mode
+        """
+        try:
+            if enabled and not self.is_congested_mode:
+                # Switch to congested mode
+                self.is_congested_mode = True
+                self.adaptive_params = self.congested_adaptive_params.copy()
+                print("🚨 CONGESTED MODE ACTIVATED - Increased green times and throughput priority")
+                print(f"   Min green: {self.adaptive_params['min_green']}s, Max green: {self.adaptive_params['max_green']}s")
+                print(f"   Flow weight: {self.adaptive_params['flow_weight']}, Queue weight: {self.adaptive_params['queue_weight']}")
+                
+            elif not enabled and self.is_congested_mode:
+                # Switch to normal mode
+                self.is_congested_mode = False
+                self.adaptive_params = self.normal_adaptive_params.copy()
+                print("✅ NORMAL MODE RESTORED - Standard adaptive parameters")
+                print(f"   Min green: {self.adaptive_params['min_green']}s, Max green: {self.adaptive_params['max_green']}s")
+                print(f"   Flow weight: {self.adaptive_params['flow_weight']}, Queue weight: {self.adaptive_params['queue_weight']}")
+                
+        except Exception as e:
+            print(f"Error in set_congested_mode: {e}")
     
     def _init_left_turn_lanes(self):
         """Scan and cache all left-turn lanes based on SUMO network connections."""
@@ -472,6 +553,11 @@ class SmartTrafficController:
             lane_data = self._collect_enhanced_lane_data()
             if not lane_data:
                 return
+            
+            # Check for congestion and switch modes as needed
+            is_congested = self.detect_congestion(lane_data)
+            self.set_congested_mode(is_congested)
+            
             lane_status = self._update_lane_status_and_score(lane_data)
             self._adjust_traffic_lights(lane_data, lane_status, current_time)
             self._process_rl_learning(lane_data, current_time)
