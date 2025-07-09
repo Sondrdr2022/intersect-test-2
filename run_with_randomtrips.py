@@ -9,7 +9,7 @@ from collections import defaultdict
 # Always work in script's directory
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-NET_FILE = 'dataset.net.xml'
+NET_FILE = '20e.net.xml'
 ROUTE_FILE = 'random_trips.rou.xml'
 VTYPES_FILE = 'vtypes.xml'
 SUMOCFG_FILE = 'random_simulation.sumocfg'
@@ -195,7 +195,7 @@ def merge_and_assign_vehicles(route_files, output_file):
         (0.972, 'motorbike'),
         (0.981, 'ambulance'),
         (0.990, 'firetruck'),
-        (1.000, 'police')
+        (1.000,  'police')
     ]
     vehicles_by_time = defaultdict(list)
     
@@ -260,7 +260,7 @@ def build_sumocfg():
 
 def run_rl_script(extra_args=None):
     """Run with connection retry optimization"""
-    rl_script = 'Lane2.py'
+    rl_script = 'Lane3.py'
     cmd = [sys.executable, rl_script, '--sumo', SUMOCFG_FILE]
     
     # Add connection retry parameters
@@ -317,8 +317,8 @@ if __name__ == '__main__':
     
     # Run with retry parameters
     run_rl_script(extra_args=[
-        '--max-steps', '1500',
-        '--episodes', '2',
+        '--max-steps', '1000',
+        '--episodes', '1',
         '--mode','train'
     ])
     

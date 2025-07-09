@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2025-07-09 10:43:33 by Eclipse SUMO netedit Version 1.22.0
+<neteditConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/neteditConfiguration.xsd">
+
+    <input>
+        <sumocfg-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\2.sumocfg"/>
+        <route-files value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\random_trips.rou.xml"/>
+        <sumo-net-file value="C:\Users\Admin\Downloads\New-folder&#45;&#45;6-\20e.net.xml"/>
+    </input>
+
+    <processing>
+        <geometry.min-radius.fix.railways value="false"/>
+        <geometry.max-grade.fix value="false"/>
+        <offset.disable-normalization value="true"/>
+        <lefthand value="0"/>
+    </processing>
+
+    <junctions>
+        <no-turnarounds value="true"/>
+        <junctions.corner-detail value="5"/>
+        <junctions.limit-turn-speed value="5.50"/>
+        <rectangular-lane-cut value="0"/>
+    </junctions>
+
+    <pedestrian>
+        <walkingareas value="0"/>
+    </pedestrian>
+
+</neteditConfiguration>
+-->
+
+<additional xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/additional_file.xsd">
+    <tlLogic id="J32" type="static" programID="0" offset="0">
+        <!-- Phase 0: Initial state with all required greens -->
+        <phase duration="22" state="GGGGGGGGGGrrrrrGGGggrrrrrr"/>  <!-- Indices 1-4,10 now green -->
+        
+        <!-- Transition for index 11 (G→y) -->
+        <phase duration="3" state="GGGGGGGGGGyrrrryyyygrrrrrr"/>
+        
+        <!-- Transition for indices 1-4 (G→y) -->
+        <phase duration="3" state="yyyyyrGGGGyrrrryyyygrrrrrr"/>
+        
+        <!-- Phase 1: Original phase with indices 1-4 now red -->
+        <phase duration="3" state="yrrrryyyyyrrrrryyyggrrrrrr"/>
+        
+        <!-- Transition for indices 3-4 (g→y) -->
+        <phase duration="3" state="yrrrryyyyyrrrrryyyrrrrrrr"/>
+        
+        <!-- Phase 2: Main state -->
+        <phase duration="25" state="rrrrrrrrrrrGGGGGrrrrrGGGGG"/>
+        
+        <!-- Transition for indices 1,4,11,18 (G→y) -->
+        <phase duration="3" state="yrrryrrrrryGGGGrrrrryGGGG"/>
+        
+        <!-- Transition for index 18 (y→r) -->
+        <phase duration="3" state="yrrryrrrrryyyyyrrrrryyyyy"/>
+        
+        <!-- Phase 3: All red -->
+        <phase duration="2" state="rrrrrrrrrrrrrrrrrrrrrrrrrr"/>
+    </tlLogic>
+</additional>

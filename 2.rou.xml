@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2025-07-09 11:04:29 by Eclipse SUMO netedit Version 1.22.0
+-->
+
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <!-- VTypes -->
+    <vType id="ambulance" length="6.00" maxSpeed="65.00" vClass="emergency" color="red" accel="2.8" decel="5.0" sigma="0.3"/>
+    <vType id="bus" length="12.00" maxSpeed="40.00" vClass="bus" accel="1.5" decel="3.5" sigma="0.4"/>
+    <vType id="delivery" length="7.50" maxSpeed="45.00" vClass="delivery" accel="1.8" decel="3.2" sigma="0.6"/>
+    <vType id="firetruck" length="8.00" maxSpeed="55.00" vClass="emergency" color="orange" accel="2.2" decel="4.5" sigma="0.3"/>
+    <vType id="motorbike" length="2.30" maxSpeed="60.00" vClass="motorcycle" accel="3.0" decel="5.0" sigma="0.7"/>
+    <vType id="passenger" length="4.50" maxSpeed="55.00" vClass="passenger" accel="2.6" decel="4.5" sigma="0.5"/>
+    <vType id="police" length="5.00" maxSpeed="70.00" vClass="emergency" color="blue" accel="3.0" decel="5.0" sigma="0.2"/>
+    <vType id="truck" length="16.00" maxSpeed="35.00" vClass="truck" accel="1.3" decel="3.0" sigma="0.3"/>
+</routes>

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2025-07-09 10:25:46 by Eclipse SUMO netedit Version 1.22.0
+<!-- generated on 2025-07-09 11:01:00 by Eclipse SUMO netedit Version 1.22.0
 <neteditConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/neteditConfiguration.xsd">
 
     <input>
@@ -780,16 +780,19 @@
         <phase duration="1"  state="rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"/>
     </tlLogic>
     <tlLogic id="J19" type="static" programID="0" offset="0">
-        <phase duration="42" state="GGgrrGGG"/>
+        <phase duration="42" state="GGggrGGG"/>
+        <phase duration="3"  state="yyyyrGyy"/>
         <phase duration="3"  state="yyyrrGyy"/>
+        <phase duration="3"  state="yyyrryyy"/>
         <phase duration="2"  state="rrrrrrrr"/>
+        <phase duration="3"  state="yyyrryry"/>
         <phase duration="3"  state="yyyrryyy"/>
         <phase duration="10" state="rrrrGrrr"/>
-        <phase duration="3"  state="rrrryrrr"/>
+        <phase duration="3"  state="rrryyyrr"/>
         <phase duration="2"  state="rrrrrrrr"/>
         <phase duration="3"  state="rrryyyyy"/>
-        <phase duration="42" state="rrrGGGrr"/>
-        <phase duration="3"  state="rrryyGrr"/>
+        <phase duration="42" state="rrryyyyr"/>
+        <phase duration="3"  state="yyyrryyy"/>
         <phase duration="2"  state="rrrrrrrr"/>
         <phase duration="3"  state="yyyrryyy"/>
     </tlLogic>
@@ -802,11 +805,10 @@
         <phase duration="3"  state="yrrrrryy"/>
     </tlLogic>
     <tlLogic id="J32" type="static" programID="0" offset="0">
-        <phase duration="22" state="rrrrrGGGGggrrrrGGGggrrrrrr"/>
-        <phase duration="3"  state="rrrrryyyygrrrrryyyggrrrrrr"/>
-        <phase duration="25" state="rrrrrrrrrrrGGGGGrrrrrGGGGG"/>
-        <phase duration="3"  state="rrrrrrrrrrryyyyyrrrrryyyyy"/>
-        <phase duration="2"  state="rrrrrrrrrrrrrrrrrrrrrrrrrr"/>
+        <phase duration="22" state="GGGGGGGGGGrrrrrGGGggrrrrrr"/>
+        <phase duration="3"  state="GGGGGGGGGGyrrrryyyygrrrrrr"/>
+        <phase duration="3"  state="yyyyyrGGGGyrrrryyyygrrrrrr"/>
+        <phase duration="3"  state="yrrrryyyyyrrrrryyyggrrrrrr"/>
     </tlLogic>
 
     <junction id="J10" type="priority" x="314.75" y="-40.39" incLanes="-E32_0 -E32_1 E29_0 E29_1" intLanes=":J10_0_0 :J10_0_1 :J10_2_0 :J10_2_1" shape="300.18,-43.29 303.33,-30.88 314.97,-25.53 317.67,-32.80 318.30,-38.34 316.87,-42.15 313.37,-44.25 307.81,-44.63">
@@ -995,10 +997,10 @@
         <request index="19" response="00000000000110000000000000" foes="11110000000111100111111100" cont="0"/>
         <request index="20" response="00000000000110000000000010" foes="11110000000110000110000010" cont="0"/>
         <request index="21" response="00000000000000000000000010" foes="00000000000000000110000010" cont="0"/>
-        <request index="22" response="00000111111100000000001110" foes="00000111111100001110001110" cont="0"/>
-        <request index="23" response="00000111111100000000001110" foes="00000111111100001110001110" cont="0"/>
+        <request index="22" response="00000111111000000000001110" foes="00000111111100001110001110" cont="0"/>
+        <request index="23" response="00000111111000000000001110" foes="00000111111100001110001110" cont="0"/>
         <request index="24" response="00000111110011100000011110" foes="00000111110011101110011110" cont="0"/>
-        <request index="25" response="00000111000011100000011110" foes="00000111000011100001011110" cont="0"/>
+        <request index="25" response="00000111000001100000011110" foes="00000111000011100001011110" cont="0"/>
     </junction>
     <junction id="J35" type="dead_end" x="-156.53" y="-324.33" incLanes="E38_0 E38_1" intLanes="" shape="-156.53,-324.33 -162.63,-322.39 -156.53,-324.33"/>
     <junction id="J7" type="priority" x="-200.17" y="1.96" incLanes="E28_0 E28_1 -E3_0 -E3_1" intLanes=":J7_0_0 :J7_0_1 :J7_2_0 :J7_2_1" shape="-205.60,5.34 -194.59,-1.18 -194.67,-1.32 -205.81,5.00">
@@ -1032,8 +1034,8 @@
     <junction id=":J21_8_0" type="internal" x="-143.45" y="-239.44" incLanes=":J21_5_0 -E10_0 -E10_1" intLanes=":J21_1_0 :J21_1_1 :J21_7_0"/>
     <junction id=":J28_8_0" type="internal" x="33.23" y="-141.24" incLanes=":J28_1_0 E26_0 E26_1" intLanes=":J28_5_0 :J28_6_0 :J28_7_0"/>
     <junction id=":J28_8_1" type="internal" x="37.33" y="-145.47" incLanes=":J28_1_1 E26_0 E26_1" intLanes=":J28_5_0 :J28_6_0 :J28_7_0"/>
-    <junction id=":J32_26_0" type="internal" x="131.01" y="-9.20" incLanes=":J32_13_0 E32_0 E32_1" intLanes=":J32_0_0 :J32_1_0 :J32_2_0 :J32_2_1 :J32_6_0 :J32_7_0 :J32_7_1 :J32_9_0 :J32_16_0 :J32_16_1 :J32_18_0 :J32_18_1 :J32_20_0 :J32_24_0 :J32_25_0"/>
-    <junction id=":J32_27_0" type="internal" x="130.50" y="-9.35" incLanes=":J32_14_0 E32_0 E32_1" intLanes=":J32_1_0 :J32_2_0 :J32_2_1 :J32_7_0 :J32_7_1 :J32_9_0 :J32_16_0 :J32_16_1 :J32_18_0 :J32_18_1 :J32_20_0 :J32_21_0 :J32_22_0 :J32_22_1"/>
+    <junction id=":J32_26_0" type="internal" x="131.01" y="-9.20" incLanes=":J32_13_0 -E36_1 E32_0 E32_1" intLanes=":J32_0_0 :J32_1_0 :J32_2_0 :J32_2_1 :J32_6_0 :J32_7_0 :J32_7_1 :J32_9_0 :J32_16_0 :J32_16_1 :J32_18_0 :J32_18_1 :J32_20_0 :J32_24_0 :J32_25_0"/>
+    <junction id=":J32_27_0" type="internal" x="130.50" y="-9.35" incLanes=":J32_14_0 -E36_0 -E36_1 E32_0 E32_1" intLanes=":J32_1_0 :J32_2_0 :J32_2_1 :J32_7_0 :J32_7_1 :J32_9_0 :J32_16_0 :J32_16_1 :J32_18_0 :J32_18_1 :J32_20_0 :J32_21_0 :J32_22_0 :J32_22_1"/>
     <junction id=":J8_8_0" type="internal" x="-248.08" y="-81.05" incLanes=":J8_1_0 E20_0 E20_1" intLanes=":J8_5_0 :J8_6_0 :J8_7_0"/>
     <junction id=":J8_8_1" type="internal" x="-244.68" y="-74.75" incLanes=":J8_1_1 E20_0 E20_1" intLanes=":J8_5_0 :J8_6_0 :J8_7_0"/>
 
