@@ -199,10 +199,13 @@ class EnhancedQLearningAgent:
                 if adaptive_params:
                     print(f"📋 Loaded adaptive parameters from previous run")
                 return True, adaptive_params
+            else:
+                print("No existing Q-table, starting fresh")
+                return False, {}
         except Exception as e:
             print(f"Error loading model: {e}")
-        print("No existing Q-table, starting fresh")
-        return False, {}
+            print("No existing Q-table, starting fresh")
+            return False, {}
 
     def save_model(self, filepath=None, adaptive_params=None):
         if filepath is None:
@@ -239,7 +242,7 @@ class EnhancedQLearningAgent:
             }
             if adaptive_params:
                 model_data['adaptive_params'] = adaptive_params.copy()
-                print(f"💾 Saving adaptive parameters: {adaptive_params}")
+                print(f"Saving adaptive parameters: {adaptive_params}")
             with open(filepath, 'wb') as f:
                 pickle.dump(model_data, f, protocol=pickle.HIGHEST_PROTOCOL)
             print(f"✅ Model saved with {len(self.training_data)} training entries")
@@ -294,10 +297,10 @@ class SmartTrafficController:
         success, loaded_adaptive_params = self.rl_agent.load_model()
         if success and loaded_adaptive_params:
             self.adaptive_params = loaded_adaptive_params.copy()
-            print(f"🔄 Loaded adaptive parameters: {self.adaptive_params}")
+            print(f" Loaded adaptive parameters: {self.adaptive_params}")
         else:
             self.adaptive_params = default_adaptive_params.copy()
-            print("🆕 Using default adaptive parameters")
+            print(" Using default adaptive parameters")
         self.norm_bounds = {
             'queue': 20,
             'wait': 120,
@@ -334,6 +337,8 @@ class SmartTrafficController:
             print(f"Auto-detected left-turn lanes: {sorted(self.left_turn_lanes)}")
         except Exception as e:
             print(f"Error initializing left-turn lanes: {e}")
+    
+    
     def _handle_protected_left_turn(self, tl_id, left_turn_lanes, lane_data, current_time):
         """Handle protected left turn phase activation (exclusive left-turn green)"""
         try:
@@ -366,13 +371,14 @@ class SmartTrafficController:
                 traci.trafficlight.setPhase(tl_id, left_turn_phase)
                 traci.trafficlight.setPhaseDuration(tl_id, duration)
                 
-                print(f"↩️ PROTECTED LEFT TURN: Activated for {target_lane} at {tl_id} "
-                    f"(queue={queue_length}, wait={waiting_time:.1f}s, duration={duration:.1f}s)")
+                #print(f"↩️ PROTECTED LEFT TURN: Activated for {target_lane} at {tl_id} "
+               #     f"(queue={queue_length}, wait={waiting_time:.1f}s, duration={duration:.1f}s)")
                 
                 # Update tracking variables
-                self.last_green_time[target_lane] = current_time
+                lane_idx = self.lane_id_to_idx[target_lane]
+                self.last_green_time[lane_idx] = current_time
                 self.last_phase_change[tl_id] = current_time
-                self.phase_utilization[(tl_id, left_turn_phase)] += 1
+                self.phase_utilization[(tl_id, left_turn_phase)] = self.phase_utilization.get((tl_id, left_turn_phase), 0) + 1
                 
                 return True  # Indicate that left turn was handled
                 
@@ -635,44 +641,35 @@ class SmartTrafficController:
                 data = lane_data[lane]
                 max_queue = max(max_queue, data['queue_length'])
                 max_wait = max(max_wait, data['waiting_time'])
-                # Estimate arrival rate if not available
                 if 'arrival_rate' not in data:
                     data['arrival_rate'] = self._calculate_arrival_rate(lane)
                 max_arrival = max(max_arrival, data['arrival_rate'])
 
-        # Avoid division by zero
         max_queue = max(max_queue, 1)
         max_wait = max(max_wait, 1)
         max_arrival = max(max_arrival, 0.1)
 
         for lane in controlled_lanes:
-            if lane in lane_data:
+            if lane in lane_data and lane in self.lane_id_to_idx:
                 data = lane_data[lane]
-
-                # Base score from lane scoring system
                 lane_idx = self.lane_id_to_idx[lane]
                 score = self.lane_scores[lane_idx]
 
-                # Normalized factors
                 queue_factor = (data['queue_length'] / max_queue) * 10
                 wait_factor = (data['waiting_time'] / max_wait) * 5
                 arrival_factor = (data.get('arrival_rate', 0) / max_arrival) * 8
 
-                # Starvation prevention
                 last_green = self.last_green_time[lane_idx]
                 starvation_factor = 0
                 if current_time - last_green > self.adaptive_params['starvation_threshold']:
                     starvation_factor = min(15, (current_time - last_green -
                                                 self.adaptive_params['starvation_threshold']) * 0.3)
 
-                # Emergency vehicle priority
                 emergency_boost = 20 if data.get('ambulance', False) else 0
 
-                # Phase efficiency consideration
                 current_phase = traci.trafficlight.getPhase(tl_id)
                 phase_efficiency = self._get_phase_efficiency(tl_id, current_phase)
 
-                # Total priority score
                 total_score = (
                     score +
                     queue_factor +
@@ -688,7 +685,6 @@ class SmartTrafficController:
         if not candidate_lanes:
             return None
 
-        # Select lane with highest priority
         candidate_lanes.sort(key=lambda x: x[1], reverse=True)
         return candidate_lanes[0][0]
     
@@ -797,9 +793,7 @@ class SmartTrafficController:
                         
                         # Get direction from lane ID (last character)
                         direction = target_lane[-1]
-                        print(f"🚑 [EMERGENCY] T={current_time:.1f} TL={tl_id} "
-                            f"Lane={target_lane}({direction}) Dist={min_distance:.1f}m - "
-                            f"Granting {duration}s green")
+
             else:
                 # Check if ambulance still present OR timeout
                 still_present = any(self._detect_priority_vehicles(lane) 
@@ -808,7 +802,7 @@ class SmartTrafficController:
                 
                 if not still_present or timeout:
                     self.ambulance_active[tl_id] = False
-                    print(f"✅ [EMERGENCY CLEARED] T={current_time:.1f} TL={tl_id}")
+                    
         except Exception as e:
             print(f"Error in _handle_ambulance_priority: {e}")
     def _perform_normal_control(self, tl_id, controlled_lanes, lane_data, current_time):
@@ -874,7 +868,9 @@ class SmartTrafficController:
                     traci.trafficlight.setPhase(tl_id, target_phase)
                     traci.trafficlight.setPhaseDuration(tl_id, green_time)
                     self.last_phase_change[tl_id] = current_time
-                    self.last_green_time[target_lane] = current_time
+
+                    lane_idx = self.lane_id_to_idx[target_lane]
+                    self.last_green_time[lane_idx] = current_time
                     print(f"🟢 RL ACTION: Green for {target_lane} (duration={green_time}s)")
                             
             elif action == 1:  # Next phase
@@ -915,7 +911,8 @@ class SmartTrafficController:
                     
             # Update phase utilization stats
             new_phase = traci.trafficlight.getPhase(tl_id)
-            self.phase_utilization[(tl_id, new_phase)] += 1
+            key = (tl_id, new_phase)
+            self.phase_utilization[key] = self.phase_utilization.get(key, 0) + 1
             
         except Exception as e:
             print(f"Error in _execute_control_action: {e}")
@@ -988,9 +985,6 @@ class SmartTrafficController:
     def _process_rl_learning(self, lane_data, current_time):
         """Process RL learning for each lane"""
         try:
-            if not isinstance(lane_data, dict):
-                print("⚠️ Invalid lane_data in _process_rl_learning")
-                return
 
             for lane_id, data in lane_data.items():
                 state = self._create_state_vector(lane_id, lane_data)
@@ -998,15 +992,16 @@ class SmartTrafficController:
                     continue
                     
                 action = self.rl_agent.get_action(state, lane_id=lane_id)
-                
+                reward = 0
+                reward_components = {}
+                if lane_id in self.previous_states and lane_id in self.previous_actions:
+                    reward, reward_components, raw_reward = self._calculate_reward(lane_id, lane_data, 
+                                                    self.previous_actions[lane_id], current_time)
                 if lane_id in self.previous_states and lane_id in self.previous_actions:
                     reward, reward_components, raw_reward = self._calculate_reward(
                         lane_id, lane_data, self.previous_actions[lane_id], current_time
                     )
-                    print(f"  Previous state/action exists for {lane_id}, updating Q-table")
-                    for comp, value in reward_components.items():
-                        print(f"  - {comp}: {value:.2f}")
-                    print(f"  Total reward: {reward:.2f}")
+                    
                     
                     # Update Q-table
                     self.rl_agent.update_q_table(
@@ -1194,14 +1189,22 @@ class SmartTrafficController:
         """Finalize episode and save data"""
         try:
             # Save RL model with updated adaptive parameters
-            if self.step_count % 1000 == 0:
-                self.rl_agent.save_model(adaptive_params=self.adaptive_params)
+       
+            self.rl_agent.save_model(adaptive_params=self.adaptive_params)
             
+            rewards = [entry['reward'] for entry in self.rl_agent.training_data if 'reward' in entry]
+            avg_reward = np.mean(rewards) if rewards else 0
+            performance_stats = {'avg_reward': avg_reward}
+            self._update_adaptive_parameters(performance_stats)
+            print(f"✅ Episode {self.current_episode} completed")
+            print(f"📊 Added {len(self.rl_agent.training_data)} training data entries this episode.")
+            print(f"ℹ️  Average reward this episode: {avg_reward:.3f}")
             # Reset episode-specific state
             self.previous_states.clear()
             self.previous_actions.clear()
             
             print(f"✅ Episode {self.current_episode} completed")
+            print(f"📊 Added {len(self.rl_agent.training_data)} training data entries this episode.")
             
         except Exception as e:
             print(f"Error ending episode: {e}")
