@@ -21,7 +21,7 @@ def subscribe_lanes(lane_id_list):
             traci.constants.LAST_STEP_MEAN_SPEED,
             traci.constants.LAST_STEP_VEHICLE_HALTING_NUMBER,
             traci.constants.VAR_ACCUMULATED_WAITING_TIME,  # <- updated
-            traci.constants.LENGTH,
+            traci.lane.getLength(lane_id),
         ])
 # Set SUMO_HOME environment variable
 if 'SUMO_HOME' not in os.environ:
@@ -524,7 +524,7 @@ class SmartTrafficController:
                     mean_speed = results.get(traci.constants.LAST_STEP_MEAN_SPEED, 0)
                     queue_length = results.get(traci.constants.LAST_STEP_VEHICLE_HALTING_NUMBER, 0)
                     waiting_time = results.get(traci.constants.VAR_ACCUMULATED_WAITING_TIME, 0)
-                    lane_length = results.get(traci.constants.LENGTH, 1.0)  # Avoid division by zero
+                    lane_length = results.get(traci.lane.getLength(lane_id), 1.0)  # Avoid division by zero
 
                     density = vehicle_count / lane_length
                     speed = max(mean_speed, 0.0)
@@ -914,7 +914,6 @@ class SmartTrafficController:
                 traci.trafficlight.setPhase(tl_id, next_phase)
                 traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
                 self.last_phase_change[tl_id] = current_time
-                print(f"⏭️ RL ACTION: Next phase ({next_phase})")
                 
             elif action == 2:  # Extend current phase
                 try:
@@ -922,7 +921,6 @@ class SmartTrafficController:
                     extension = min(15, self.adaptive_params['max_green'] - remaining)
                     if extension > 0:
                         traci.trafficlight.setPhaseDuration(tl_id, remaining + extension)
-                        print(f"⏱️ RL ACTION: Extended phase by {extension}s")
                 except Exception as e:
                     print(f"Could not extend phase: {e}")
                     
