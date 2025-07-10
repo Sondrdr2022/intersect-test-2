@@ -14,6 +14,17 @@ import warnings
 warnings.filterwarnings('ignore')
 import traceback
 
+def subscribe_lanes(lane_id_list):
+    # Use the actual TraCI constants for subscription
+    for lane_id in lane_id_list:
+        traci.lane.subscribe(lane_id, [
+            traci.constants.LAST_STEP_VEHICLE_NUMBER,
+            traci.constants.LAST_STEP_MEAN_SPEED,
+            traci.constants.LAST_STEP_VEHICLE_HALTING_NUMBER,
+            traci.constants.LAST_STEP_WAITING_TIME,
+            traci.constants.LENGTH,
+        ])
+
 # Set SUMO_HOME environment variable
 if 'SUMO_HOME' not in os.environ:
     os.environ['SUMO_HOME'] = r'C:\Program Files (x86)\Eclipse\Sumo'
@@ -258,7 +269,7 @@ class SmartTrafficController:
         self.num_lanes = len(self.lane_id_list)
         self.lane_id_to_idx = {lid: i for i, lid in enumerate(self.lane_id_list)}
         self.idx_to_lane_id = {i: lid for i, lid in enumerate(self.lane_id_list)}
-
+        # ... (rest of init)
         # Numpy arrays for per-lane data
         self.lane_scores = np.zeros(self.num_lanes)
         self.lane_states = np.full(self.num_lanes, "UNKNOWN", dtype=object)
@@ -310,6 +321,8 @@ class SmartTrafficController:
             'time_since_green': 120,
             'arrival_rate': 10
         }
+        if traci.isLoaded() and self.lane_id_list:
+            subscribe_lanes(self.lane_id_list)
         if sumocfg_path is not None:
             try:
                 left_lanes, right_lanes = detect_turning_lanes_with_traci(sumocfg_path)
@@ -502,25 +515,29 @@ class SmartTrafficController:
         """Collect comprehensive lane data with route information"""
         lane_data = {}
         try:
-            lanes = traci.lane.getIDList()
-            edge_queues = np.zeros(self.num_lanes)
-            edge_flows = np.zeros(self.num_lanes)
-            route_queues = np.zeros(self.num_lanes)
-            route_flows = np.zeros(self.num_lanes)
+            lanes = self.lane_id_list
             for idx, lane_id in enumerate(lanes):
                 try:
-                    lane_length = traci.lane.getLength(lane_id)
+                    results = traci.lane.getSubscriptionResults(lane_id)
+                    if results is None:
+                        continue
+                    
+                    # Access the subscribed variables using their constants
+                    vehicle_count = results.get(traci.constants.LAST_STEP_VEHICLE_NUMBER, 0)
+                    mean_speed = results.get(traci.constants.LAST_STEP_MEAN_SPEED, 0)
+                    queue_length = results.get(traci.constants.LAST_STEP_VEHICLE_HALTING_NUMBER, 0)
+                    waiting_time = results.get(traci.constants.LAST_STEP_WAITING_TIME, 0)
+                    lane_length = results.get(traci.constants.LENGTH, 0)
+                    
                     if lane_length <= 0:
                         continue
-                    queue_length = traci.lane.getLastStepHaltingNumber(lane_id)
-                    waiting_time = traci.lane.getWaitingTime(lane_id)
-                    vehicle_count = traci.lane.getLastStepVehicleNumber(lane_id)
-                    mean_speed = traci.lane.getLastStepMeanSpeed(lane_id)
+                        
                     edge_id = traci.lane.getEdgeID(lane_id)
                     route_id = self._get_route_for_lane(lane_id)
                     ambulance_detected = self._detect_priority_vehicles(lane_id)
                     is_left_turn = lane_id in self.left_turn_lanes
                     is_right_turn = lane_id in self.right_turn_lanes
+                    
                     lane_data[lane_id] = {
                         'queue_length': queue_length,
                         'waiting_time': waiting_time,
@@ -541,8 +558,6 @@ class SmartTrafficController:
         except Exception as e:
             print(f"Error in _collect_enhanced_lane_data: {e}")
         return lane_data
-    
-
     def _get_route_for_lane(self, lane_id):
         """Get route ID for vehicles in the lane"""
         try:
