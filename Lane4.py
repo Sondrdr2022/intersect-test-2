@@ -196,10 +196,16 @@ class EnhancedQLearningAgent:
                 self.epsilon = params.get('epsilon', self.epsilon)
                 adaptive_params = model_data.get('adaptive_params', {})
                 print(f"Loaded Q-table with {len(self.q_table)} states from {filepath}")
+                if adaptive_params:
+                    print(f"📋 Loaded adaptive parameters from previous run")
+                return True, adaptive_params
+            else:
+                print("No existing Q-table, starting fresh")
+                return False, {}
         except Exception as e:
             print(f"Error loading model: {e}")
-        print("No existing Q-table, starting fresh")
-        return False, {}
+            print("No existing Q-table, starting fresh")
+            return False, {}
 
     def save_model(self, filepath=None, adaptive_params=None):
         if filepath is None:
@@ -1183,9 +1189,16 @@ class SmartTrafficController:
         """Finalize episode and save data"""
         try:
             # Save RL model with updated adaptive parameters
-            if self.step_count % 1000 == 0:
-                self.rl_agent.save_model(adaptive_params=self.adaptive_params)
+       
+            self.rl_agent.save_model(adaptive_params=self.adaptive_params)
             
+            rewards = [entry['reward'] for entry in self.rl_agent.training_data if 'reward' in entry]
+            avg_reward = np.mean(rewards) if rewards else 0
+            performance_stats = {'avg_reward': avg_reward}
+            self._update_adaptive_parameters(performance_stats)
+            print(f"✅ Episode {self.current_episode} completed")
+            print(f"📊 Added {len(self.rl_agent.training_data)} training data entries this episode.")
+            print(f"ℹ️  Average reward this episode: {avg_reward:.3f}")
             # Reset episode-specific state
             self.previous_states.clear()
             self.previous_actions.clear()
