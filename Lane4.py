@@ -761,32 +761,57 @@ class SmartTrafficController:
         return False  # No left-turn priority logic
 
     def _handle_ambulance_priority(self, tl_id, ambulance_lanes, current_time):
-        """Handle ambulance priority with timeout"""
         try:
-            if not self.ambulance_active[tl_id]:
-                # New ambulance detected - activate priority
-                ambulance_lane = ambulance_lanes[0]
-                phase_index = self._find_phase_for_lane(tl_id, ambulance_lane)
+            # Only act if ambulance priority is not already active
+            if not self.ambulance_active.get(tl_id, False):
+                # Find closest emergency vehicle to the intersection
+                min_distance = float('inf')
+                target_lane = None
                 
-                if phase_index is not None:
-                    # Set green for ambulance lane with extended duration
-                    traci.trafficlight.setPhase(tl_id, phase_index)
-                    traci.trafficlight.setPhaseDuration(tl_id, 30)
-                    
-                    self.ambulance_active[tl_id] = True
-                    self.ambulance_start_time[tl_id] = current_time
-                    print(f"🚑 AMBULANCE PRIORITY: Green for {ambulance_lane} at {tl_id}")
+                for lane_id in ambulance_lanes:
+                    try:
+                        # Get emergency vehicles in lane
+                        vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
+                        for vid in vehicles:
+                            if traci.vehicle.getVehicleClass(vid) in ['emergency', 'authority']:
+                                # Calculate distance to end of lane (traffic light)
+                                lane_length = traci.lane.getLength(lane_id)
+                                vehicle_pos = traci.vehicle.getLanePosition(vid)
+                                distance = lane_length - vehicle_pos
+                                
+                                if distance < min_distance:
+                                    min_distance = distance
+                                    target_lane = lane_id
+                    except Exception as e:
+                        print(f"Error processing ambulance lane {lane_id}: {e}")
+                
+                if target_lane:
+                    phase_index = self._find_phase_for_lane(tl_id, target_lane)
+                    if phase_index is not None:
+                        # Set longer green time for high-priority emergency
+                        duration = 30 if min_distance < 30 else 20
+                        
+                        traci.trafficlight.setPhase(tl_id, phase_index)
+                        traci.trafficlight.setPhaseDuration(tl_id, duration)
+                        self.ambulance_active[tl_id] = True
+                        self.ambulance_start_time[tl_id] = current_time
+                        
+                        # Get direction from lane ID (last character)
+                        direction = target_lane[-1]
+                        print(f"🚑 [EMERGENCY] T={current_time:.1f} TL={tl_id} "
+                            f"Lane={target_lane}({direction}) Dist={min_distance:.1f}m - "
+                            f"Granting {duration}s green")
             else:
-                # Check if priority should be released
-                if current_time - self.ambulance_start_time[tl_id] > 30:  # 30s timeout
+                # Check if ambulance still present OR timeout
+                still_present = any(self._detect_priority_vehicles(lane) 
+                                for lane in ambulance_lanes)
+                timeout = (current_time - self.ambulance_start_time.get(tl_id, 0)) > 30
+                
+                if not still_present or timeout:
                     self.ambulance_active[tl_id] = False
-                    print(f"🚑 AMBULANCE CLEARED: Released priority at {tl_id}")
-                    
+                    print(f"✅ [EMERGENCY CLEARED] T={current_time:.1f} TL={tl_id}")
         except Exception as e:
             print(f"Error in _handle_ambulance_priority: {e}")
-
-    # --- REMOVED: All left-turn related control, reward, and phase-finding logic ---
-
     def _perform_normal_control(self, tl_id, controlled_lanes, lane_data, current_time):
         """Perform normal RL-based traffic control"""
         try:
