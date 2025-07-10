@@ -12,6 +12,7 @@ import json
 from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings('ignore')
+import traceback
 
 # Set SUMO_HOME environment variable
 if 'SUMO_HOME' not in os.environ:
@@ -71,16 +72,15 @@ class EnhancedQLearningAgent:
             self.epsilon = 0.01
 
     def is_valid_state(self, state):
-        if isinstance(state, (list, np.ndarray)):
-            state_array = np.array(state)
-            if np.isnan(state_array).any() or np.isinf(state_array).any():
-                return False
-            if (np.abs(state_array) > 100).any():
-                return False
-            if not isinstance(state, np.ndarray):
-                return False
-            if len(state) != self.state_size:
-                return False
+        if not isinstance(state, (list, np.ndarray)):
+            return False
+        state_array = np.array(state)
+        if np.isnan(state_array).any() or np.isinf(state_array).any():
+            return False
+        if (np.abs(state_array) > 100).any():
+            return False
+        if state_array.size != self.state_size:  # Check total elements match state size
+            return False
         return True
 
     def get_action(self, state, lane_id=None):
@@ -480,6 +480,7 @@ class SmartTrafficController:
         return f'phase_{phase_idx}'
 
     def run_step(self):
+        
         try:
             self.step_count += 1
             current_time = traci.simulation.getTime()
@@ -496,7 +497,8 @@ class SmartTrafficController:
         """Collect comprehensive lane data with route information"""
         lane_data = {}
         try:
-            lanes = self.lane_id_list  # Already fetched
+            lanes = traci.lane.getIDList()
+            print(f"Collecting lane data for {len(lanes)} lanes")            
             edge_queues = np.zeros(self.num_lanes)
             edge_flows = np.zeros(self.num_lanes)
             route_queues = np.zeros(self.num_lanes)
@@ -650,7 +652,7 @@ class SmartTrafficController:
                 data = lane_data[lane]
                 
                 # Base score from lane scoring system
-                score = self.lane_scores.get(lane, 0)
+                score = self.lane_scores[self.lane_id_to_idx[lane]]
                 
                 # Normalized factors
                 queue_factor = (data['queue_length'] / max_queue) * 10
@@ -941,14 +943,19 @@ class SmartTrafficController:
         return 0
 
     def _process_rl_learning(self, lane_data, current_time):
+        print("---- PROCESS_RL_LEARNING CALLED ----")
+        print(f"Lane_data keys: {list(lane_data.keys())}")
+        print(f"Previous_states keys: {list(self.previous_states.keys())}")
+        print(f"Previous_actions keys: {list(self.previous_actions.keys())}")
+
         for lane_id, data in lane_data.items():
             print(f">> Checking lane_id {lane_id}")
             state = self._create_state_vector(lane_id, lane_data)
-            if not self.rl_agent.is_valid_state(state):
-                print(f"  Invalid state for lane {lane_id}, shape: {state.shape}, values: {state}")
-                continue
+            print(f"  State shape for {lane_id}: {state.shape}, values: {state}")
+            print(f"  Is valid state: {self.rl_agent.is_valid_state(state)}")
             action = self.rl_agent.get_action(state, lane_id=lane_id)
             print(f"  Got action {action} for lane {lane_id}")
+            print(f"  In previous_states: {lane_id in self.previous_states}, in previous_actions: {lane_id in self.previous_actions}")
             if lane_id in self.previous_states and lane_id in self.previous_actions:
                 # ADD THIS: Compute reward and reward_components
                 reward, reward_components, raw_reward = self._calculate_reward(
@@ -1009,9 +1016,8 @@ class SmartTrafficController:
             arrival_norm = min(data['arrival_rate'] / self.norm_bounds['arrival_rate'], 1.0)
 
             # Route-level metrics
-            route_queue_norm = min(data['queue_route'] / (self.norm_bounds['queue'] * 3), 1.0)
-            route_flow_norm = min(data['flow_route'] / (self.norm_bounds['flow'] * 3), 1.0)
-            
+            route_queue_norm = min(data.get('queue_route', 0) / (self.norm_bounds['queue'] * 3), 1.0)
+            route_flow_norm = min(data.get('flow_route', 0) / (self.norm_bounds['flow'] * 3), 1.0)    
             # Traffic light context
             current_phase = 0
             phase_norm = 0.0
@@ -1028,7 +1034,7 @@ class SmartTrafficController:
                     pass
             
             # Time since last green
-            last_green = self.last_green_time.get(lane_id, 0)
+            last_green = self.last_green_time[self.lane_id_to_idx[lane_id]]
             time_since_green = min((traci.simulation.getTime() - last_green) / 
                                  self.norm_bounds['time_since_green'], 1.0)
             
@@ -1044,7 +1050,8 @@ class SmartTrafficController:
                 phase_norm,
                 time_since_green,
                 float(data['ambulance']),
-                self.lane_scores.get(lane_id, 0) / 100, phase_efficiency  # Normalized lane score
+                self.lane_scores[self.lane_id_to_idx[lane_id]] / 100,
+                phase_efficiency  # Normalized lane score
             ])
             
             # Ensure no invalid values
@@ -1054,7 +1061,7 @@ class SmartTrafficController:
             
         except Exception as e:
             print(f"Error creating state vector for {lane_id}: {e}")
-            return np.zeros(13)  # Reduced state size
+            return np.zeros(self.rl_agent.state_size)  # Reduced state size
 
     def _calculate_reward(self, lane_id, lane_data, action_taken, current_time):
         """Calculate comprehensive reward signal with detailed components"""
@@ -1080,7 +1087,7 @@ class SmartTrafficController:
                     
             # Starvation prevention
             starvation_penalty = 0
-            last_green = self.last_green_time.get(lane_id, 0)
+            last_green = self.last_green_time[self.lane_id_to_idx[lane_id]]
             if current_time - last_green > self.adaptive_params['starvation_threshold']:
                 starvation_penalty = -min(30, (current_time - last_green - 
                                              self.adaptive_params['starvation_threshold']) * 0.5)
@@ -1180,6 +1187,19 @@ def start_enhanced_simulation(sumocfg_path, use_gui=True, max_steps=None, episod
             ]
             traci.start(sumo_cmd)
             controller.current_episode = episode + 1
+
+            controller.lane_id_list = traci.lane.getIDList()
+            controller.num_lanes = len(controller.lane_id_list)
+            controller.lane_id_to_idx = {lid: i for i, lid in enumerate(controller.lane_id_list)}
+            controller.idx_to_lane_id = {i: lid for i, lid in enumerate(controller.lane_id_list)}
+            controller.lane_scores = np.zeros(controller.num_lanes)
+            controller.lane_states = np.full(controller.num_lanes, "UNKNOWN", dtype=object)
+            controller.consecutive_states = np.zeros(controller.num_lanes, dtype=int)
+            controller.last_green_time = np.zeros(controller.num_lanes)
+            controller.last_arrival_time = np.zeros(controller.num_lanes)
+            controller.last_lane_vehicles = [set() for _ in range(controller.num_lanes)]
+            print(f"Collected lane data for {controller.num_lanes} lanes after simulation started.")
+
             step = 0
             while traci.simulation.getMinExpectedNumber() > 0:
                 if max_steps and step >= max_steps:
