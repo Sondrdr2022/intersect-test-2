@@ -15,16 +15,14 @@ warnings.filterwarnings('ignore')
 import traceback
 
 def subscribe_lanes(lane_id_list):
-    # Use the actual TraCI constants for subscription
     for lane_id in lane_id_list:
         traci.lane.subscribe(lane_id, [
             traci.constants.LAST_STEP_VEHICLE_NUMBER,
             traci.constants.LAST_STEP_MEAN_SPEED,
             traci.constants.LAST_STEP_VEHICLE_HALTING_NUMBER,
-            traci.constants.LAST_STEP_WAITING_TIME,
+            traci.constants.VAR_ACCUMULATED_WAITING_TIME,  # <- updated
             traci.constants.LENGTH,
         ])
-
 # Set SUMO_HOME environment variable
 if 'SUMO_HOME' not in os.environ:
     os.environ['SUMO_HOME'] = r'C:\Program Files (x86)\Eclipse\Sumo'
@@ -512,52 +510,74 @@ class SmartTrafficController:
             print(f"Error in run_step: {e}")
 
     def _collect_enhanced_lane_data(self):
-        """Collect comprehensive lane data with route information"""
+        """Collect comprehensive lane data for complex networks"""
         lane_data = {}
         try:
             lanes = self.lane_id_list
-            for idx, lane_id in enumerate(lanes):
+            for lane_id in lanes:
                 try:
                     results = traci.lane.getSubscriptionResults(lane_id)
                     if results is None:
                         continue
-                    
-                    # Access the subscribed variables using their constants
+
                     vehicle_count = results.get(traci.constants.LAST_STEP_VEHICLE_NUMBER, 0)
                     mean_speed = results.get(traci.constants.LAST_STEP_MEAN_SPEED, 0)
                     queue_length = results.get(traci.constants.LAST_STEP_VEHICLE_HALTING_NUMBER, 0)
-                    waiting_time = results.get(traci.constants.LAST_STEP_WAITING_TIME, 0)
-                    lane_length = results.get(traci.constants.LENGTH, 0)
-                    
-                    if lane_length <= 0:
-                        continue
-                        
+                    waiting_time = results.get(traci.constants.VAR_ACCUMULATED_WAITING_TIME, 0)
+                    lane_length = results.get(traci.constants.LENGTH, 1.0)  # Avoid division by zero
+
+                    density = vehicle_count / lane_length
+                    speed = max(mean_speed, 0.0)
+
                     edge_id = traci.lane.getEdgeID(lane_id)
                     route_id = self._get_route_for_lane(lane_id)
-                    ambulance_detected = self._detect_priority_vehicles(lane_id)
+
+                    vehicle_ids = traci.lane.getLastStepVehicleIDs(lane_id)
+                    class_counts = self._count_vehicle_classes(vehicle_ids)
+                    ambulance_detected = class_counts.get('emergency', 0) > 0
+
                     is_left_turn = lane_id in self.left_turn_lanes
                     is_right_turn = lane_id in self.right_turn_lanes
-                    
+
                     lane_data[lane_id] = {
                         'queue_length': queue_length,
                         'waiting_time': waiting_time,
-                        'density': vehicle_count / lane_length,
-                        'mean_speed': mean_speed,
+                        'density': density,
+                        'mean_speed': speed,
                         'flow': vehicle_count,
                         'lane_id': lane_id,
                         'edge_id': edge_id,
                         'route_id': route_id,
                         'ambulance': ambulance_detected,
+                        'vehicle_classes': class_counts,
                         'left_turn': is_left_turn,
                         'right_turn': is_right_turn,
                         'tl_id': self.lane_to_tl.get(lane_id, '')
                     }
+
                 except Exception as e:
-                    print(f"Error collecting data for lane {lane_id}: {e}")
+                    print(f"⚠️ Error collecting data for lane {lane_id}: {e}")
                     continue
+
         except Exception as e:
-            print(f"Error in _collect_enhanced_lane_data: {e}")
+            print(f"❌ Error in _collect_enhanced_lane_data: {e}")
+
         return lane_data
+
+    def _count_vehicle_classes(self, vehicle_ids):
+        """Count different types of vehicles (passenger, truck, emergency, etc.)"""
+        counts = defaultdict(int)
+        try:
+            for vid in vehicle_ids:
+                try:
+                    vclass = traci.vehicle.getVehicleClass(vid)
+                    counts[vclass] += 1
+                except:
+                    continue
+        except:
+            pass
+        return counts
+
     def _get_route_for_lane(self, lane_id):
         """Get route ID for vehicles in the lane"""
         try:
