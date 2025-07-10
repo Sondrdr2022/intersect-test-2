@@ -49,6 +49,7 @@ class EnhancedQLearningAgent:
                  q_table_file="enhanced_q_table.pkl", mode="train"):
         self.state_size = state_size
         self.action_size = action_size
+
         self.learning_rate = learning_rate
         self.discount_factor = discount_factor
         self.epsilon = epsilon
@@ -71,6 +72,8 @@ class EnhancedQLearningAgent:
         elif self.mode == "adaptive":
             self.epsilon = 0.01
 
+    
+    
     def is_valid_state(self, state):
         if not isinstance(state, (list, np.ndarray)):
             return False
@@ -113,13 +116,15 @@ class EnhancedQLearningAgent:
     def update_q_table(self, state, action, reward, next_state, lane_info=None):
         if self.mode == "eval":
             return
-        print(f"update_q_table called: state={state}, next_state={next_state}, action={action}, reward={reward}")
         if not self.is_valid_state(state) or not self.is_valid_state(next_state):
             print("Invalid state, skipping...")
             return
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
-        lane_id = lane_info['lane_id'] if lane_info and 'lane_id' in lane_info else None
+
+        if lane_info is None or not isinstance(lane_info, dict):
+            lane_info = {}
+        lane_id = lane_info.get('lane_id') if 'lane_id' in lane_info else None
         state_key = self._state_to_key(state, lane_id)
         next_state_key = self._state_to_key(next_state, lane_id)
         if state_key not in self.q_table:
@@ -335,18 +340,26 @@ class SmartTrafficController:
             print(f"Auto-detected left-turn lanes: {sorted(self.left_turn_lanes)}")
         except Exception as e:
             print(f"Error initializing left-turn lanes: {e}")
+    
     def _handle_protected_left_turn(self, tl_id, left_turn_lanes, lane_data, current_time):
-        """Handle protected left turn phase activation (exclusive left-turn green)"""
         try:
-            # Find the left turn lane with highest priority
+            # Convert lane IDs to indices for array access
+            try:
+                current_phase = traci.trafficlight.getPhase(tl_id)
+            except Exception as e:
+                print(f"Error getting current phase for {tl_id}: {e}")
+                return False
+            # Find the left turn lane with highest priority using indices
             left_turn_lanes.sort(key=lambda x: (
                 lane_data[x]['queue_length'],
                 lane_data[x]['waiting_time']
             ), reverse=True)
             
             target_lane = left_turn_lanes[0]
-            current_phase = traci.trafficlight.getPhase(tl_id)
-            logic = self._get_traffic_light_logic(tl_id)
+            target_idx = self.lane_id_to_idx[target_lane]  # Get integer index
+            
+            # Rest of the method remains the same but use target_idx for array access
+            self.last_green_time[target_idx] = current_time 
             
             # Find the best protected left-turn phase
             left_turn_phase = self._find_best_left_turn_phase(tl_id, target_lane, lane_data)
@@ -356,7 +369,8 @@ class SmartTrafficController:
                 queue_length = lane_data[target_lane]['queue_length']
                 waiting_time = lane_data[target_lane]['waiting_time']
                 base_duration = 5 + min(queue_length * 0.5, 10) + min(waiting_time * 0.1, 5)
-                
+                traci.trafficlight.setPhase(tl_id, left_turn_phase)
+                traci.trafficlight.setPhaseDuration(tl_id, duration)
                 # Apply adaptive parameters
                 duration = min(
                     max(base_duration, self.adaptive_params['min_green']),
@@ -380,6 +394,17 @@ class SmartTrafficController:
         except Exception as e:
             print(f"Error in _handle_protected_left_turn: {e}")
         return False
+    
+    def _normalize_lane_id(self, lane_id):
+        """Convert between different lane ID formats"""
+        if not lane_id:
+            return None
+        # Handle cases like E3_0_0 -> E3-0_0
+        parts = lane_id.split('_')
+        if len(parts) > 2 and '-' not in lane_id:
+            return f"{parts[0]}-{'_'.join(parts[1:])}"
+        return lane_id
+
 
     def _find_best_left_turn_phase(self, tl_id, left_turn_lane, lane_data):
         """
@@ -480,6 +505,9 @@ class SmartTrafficController:
         return f'phase_{phase_idx}'
 
     def run_step(self):
+
+        if self.step_count % 100 == 0:
+            self._initialize_lane_mappings()
         
         try:
             self.step_count += 1
@@ -498,7 +526,6 @@ class SmartTrafficController:
         lane_data = {}
         try:
             lanes = traci.lane.getIDList()
-            print(f"Collecting lane data for {len(lanes)} lanes")            
             edge_queues = np.zeros(self.num_lanes)
             edge_flows = np.zeros(self.num_lanes)
             route_queues = np.zeros(self.num_lanes)
@@ -626,73 +653,154 @@ class SmartTrafficController:
     
     def _select_target_lane(self, tl_id, controlled_lanes, lane_data, current_time):
         """Enhanced lane selection with multi-factor prioritization"""
-        candidate_lanes = []
-        max_queue = 0
-        max_wait = 0
-        max_arrival = 0
-        
-        # First pass: find maximum values for normalization
-        for lane in controlled_lanes:
-            if lane in lane_data:
-                data = lane_data[lane]
-                max_queue = max(max_queue, data['queue_length'])
-                max_wait = max(max_wait, data['waiting_time'])
-                # Estimate arrival rate if not available
-                if 'arrival_rate' not in data:
-                    data['arrival_rate'] = self._calculate_arrival_rate(lane)
-                max_arrival = max(max_arrival, data['arrival_rate'])
-        
-        # Avoid division by zero
-        max_queue = max(max_queue, 1)
-        max_wait = max(max_wait, 1)
-        max_arrival = max(max_arrival, 0.1)
-        
-        for lane in controlled_lanes:
-            if lane in lane_data:
-                data = lane_data[lane]
-                
-                # Base score from lane scoring system
-                score = self.lane_scores[self.lane_id_to_idx[lane]]
-                
-                # Normalized factors
-                queue_factor = (data['queue_length'] / max_queue) * 10
-                wait_factor = (data['waiting_time'] / max_wait) * 5
-                arrival_factor = (data.get('arrival_rate', 0) / max_arrival) * 8
-                
-                # Starvation prevention
-                starvation_factor = 0
-                last_green = self.last_green_time.get(lane, 0)
-                if current_time - last_green > self.adaptive_params['starvation_threshold']:
-                    starvation_factor = min(15, (current_time - last_green - 
-                                               self.adaptive_params['starvation_threshold']) * 0.3)
-                
-                # Emergency vehicle priority
-                emergency_boost = 20 if data['ambulance'] else 0
-                
-                # Phase efficiency consideration
-                current_phase = traci.trafficlight.getPhase(tl_id)
-                phase_efficiency = self._get_phase_efficiency(tl_id, current_phase)
-                
-                # Total priority score
-                total_score = (
-                    score + 
-                    queue_factor + 
-                    wait_factor + 
-                    arrival_factor + 
-                    starvation_factor + 
-                    emergency_boost +
-                    phase_efficiency * 5
-                )
-                
-                candidate_lanes.append((lane, total_score))
-        
-        if not candidate_lanes:
-            return None
+        controlled_lanes = [self._normalize_lane_id(l) for l in controlled_lanes]
+        lane_data = {self._normalize_lane_id(k): v for k, v in lane_data.items()}
+
+        try:
+            # Input validation
+            if not controlled_lanes or not lane_data:
+                print("DEBUG: No controlled lanes or lane data provided")
+                return None
+
+            # Debug initial state
+            print(f"DEBUG: Selecting target lane for TL {tl_id} with {len(controlled_lanes)} controlled lanes")
+            print(f"DEBUG: Current time: {current_time}")
             
-        # Select lane with highest priority
-        candidate_lanes.sort(key=lambda x: x[1], reverse=True)
-        return candidate_lanes[0][0]
-    
+            candidate_lanes = []
+            max_queue = 1  # Initialize to 1 to avoid division by zero
+            max_wait = 1
+            max_arrival = 0.1
+            
+            # First pass: find maximum values for normalization
+            for lane in controlled_lanes:
+                if lane in lane_data:
+                    data = lane_data[lane]
+                    
+                    # Validate required fields
+                    if not all(k in data for k in ['queue_length', 'waiting_time']):
+                        print(f"WARNING: Missing data for lane {lane}")
+                        continue
+                    
+                    max_queue = max(max_queue, data['queue_length'])
+                    max_wait = max(max_wait, data['waiting_time'])
+                    
+                    # Calculate arrival rate if not available
+                    if 'arrival_rate' not in data:
+                        try:
+                            data['arrival_rate'] = self._calculate_arrival_rate(lane)
+                        except Exception as e:
+                            print(f"Error calculating arrival rate for {lane}: {e}")
+                            data['arrival_rate'] = 0.1
+                    
+                    max_arrival = max(max_arrival, data['arrival_rate'])
+
+            # Debug normalization factors
+            print(f"DEBUG: Normalization factors - Max Queue: {max_queue}, Max Wait: {max_wait}, Max Arrival: {max_arrival}")
+            
+            # Second pass: calculate scores for each lane
+            for lane in controlled_lanes:
+                if lane in lane_data:
+                    data = lane_data[lane]
+                    
+                    # Verify lane exists in mapping
+                    if lane not in self.lane_id_to_idx:
+                        print(f"WARNING: Lane {lane} not in lane_id_to_idx")
+                        continue
+                    
+                    lane_idx = self.lane_id_to_idx[lane]
+                    
+                    # Base score from lane scoring system
+                    try:
+                        score = self.lane_scores[lane_idx]
+                    except IndexError:
+                        print(f"WARNING: Invalid index {lane_idx} for lane {lane}")
+                        score = 0
+                    
+                    # Normalized factors with safety checks
+                    queue_norm = data['queue_length'] / max_queue if max_queue > 0 else 0
+                    wait_norm = data['waiting_time'] / max_wait if max_wait > 0 else 0
+                    arrival_norm = data.get('arrival_rate', 0) / max_arrival if max_arrival > 0 else 0
+                    
+                    queue_factor = queue_norm * 10
+                    wait_factor = wait_norm * 5
+                    arrival_factor = arrival_norm * 8
+                    
+                    # Starvation prevention
+                    starvation_factor = 0
+                    try:
+                        last_green = self.last_green_time[lane_idx]
+                        if current_time - last_green > self.adaptive_params['starvation_threshold']:
+                            starvation_factor = min(15, (current_time - last_green - 
+                                                    self.adaptive_params['starvation_threshold']) * 0.3)
+                    except IndexError:
+                        print(f"WARNING: Invalid index {lane_idx} for last_green_time")
+                    
+                    # Emergency vehicle priority
+                    emergency_boost = 20 if data.get('ambulance', False) else 0
+                    
+                    # Phase efficiency consideration
+                    try:
+                        current_phase = traci.trafficlight.getPhase(tl_id)
+                        phase_efficiency = self._get_phase_efficiency(tl_id, current_phase)
+                    except Exception as e:
+                        print(f"Error getting phase efficiency: {e}")
+                        phase_efficiency = 0.5
+                    
+                    # Calculate total priority score
+                    total_score = (
+                        score + 
+                        queue_factor + 
+                        wait_factor + 
+                        arrival_factor + 
+                        starvation_factor + 
+                        emergency_boost +
+                        phase_efficiency * 5
+                    )
+                    
+                    # Debug individual lane scores
+                    print(f"DEBUG: Lane {lane} score breakdown:")
+                    print(f"  Base: {score:.1f}, Queue: {queue_factor:.1f}, Wait: {wait_factor:.1f}")
+                    print(f"  Arrival: {arrival_factor:.1f}, Starvation: {starvation_factor:.1f}")
+                    print(f"  Emergency: {emergency_boost:.1f}, Phase Eff: {phase_efficiency*5:.1f}")
+                    print(f"  TOTAL: {total_score:.1f}")
+                    
+                    candidate_lanes.append((lane, total_score))
+            
+            if not candidate_lanes:
+                print("DEBUG: No valid candidate lanes found")
+                return None
+                
+            # Remove duplicate lanes before sorting
+            unique_candidates = {}
+            for lane, score in candidate_lanes:
+                if lane not in unique_candidates or score > unique_candidates[lane]:
+                    unique_candidates[lane] = score
+            
+            # Convert back to list and sort
+            sorted_lanes = sorted(unique_candidates.items(), key=lambda x: x[1], reverse=True)
+            
+            if not sorted_lanes:
+                return None
+                
+            selected_lane = sorted_lanes[0][0]
+            
+            # Debug output
+            print(f"DEBUG: Selected lane {selected_lane} with score {sorted_lanes[0][1]:.1f}")
+            if len(sorted_lanes) > 1:
+                print(f"DEBUG: Runner-up lane {sorted_lanes[1][0]} with score {sorted_lanes[1][1]:.1f}")
+            
+            return selected_lane
+            
+        except Exception as e:
+            print(f"CRITICAL ERROR in _select_target_lane: {str(e)}")
+            print("Error details:")
+            print(f"- TL ID: {tl_id}")
+            print(f"- Controlled lanes: {controlled_lanes}")
+            print(f"- Current time: {current_time}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
     def _get_phase_efficiency(self, tl_id, phase_index):
         """Calculate phase efficiency based on historical utilization"""
         try:
@@ -815,93 +923,263 @@ class SmartTrafficController:
     def _perform_normal_control(self, tl_id, controlled_lanes, lane_data, current_time):
         """Perform normal RL-based traffic control"""
         try:
-            # Select target lane based on multiple factors
-            target_lane = self._select_target_lane(tl_id, controlled_lanes, lane_data, current_time)
+            print(f"DEBUG: Starting _perform_normal_control for tl_id: {tl_id}")
+            print(f"DEBUG: Original controlled lanes: {controlled_lanes}")
             
+            # Normalize and validate lanes
+            controlled_lanes = [str(lane).lstrip(':') for lane in controlled_lanes]
+            valid_lanes = [lane for lane in controlled_lanes 
+                        if lane in lane_data and 
+                        all(k in lane_data[lane] for k in ['queue_length', 'waiting_time'])]
+            
+            if not valid_lanes:
+                print("DEBUG: No valid lanes found after filtering")
+                return
+            
+            print(f"DEBUG: Valid controlled lanes: {valid_lanes}")
+            
+            # Select target lane with additional validation
+            target_lane = self._select_target_lane(tl_id, valid_lanes, lane_data, current_time)
             if not target_lane:
+                print("DEBUG: No target lane selected")
                 return
                 
-            # Get state and RL action
+            # Verify lane mapping exists
+            if target_lane not in self.lane_id_to_idx:
+                print(f"WARNING: Target lane {target_lane} not in lane_id_to_idx mapping")
+                print(f"Current lane mappings: {self.lane_id_to_idx}")
+                return
+                
+            print(f"DEBUG: Selected target lane: {target_lane} (index: {self.lane_id_to_idx[target_lane]})")
+            
+            # Create state vector
             state = self._create_state_vector(target_lane, lane_data)
             if not self.rl_agent.is_valid_state(state):
+                print(f"DEBUG: Invalid state for lane {target_lane}")
+                print(f"State vector: {state}")
                 return
                 
-            action = self.rl_agent.get_action(state, lane_id=target_lane)
+            print(f"DEBUG: Valid state created for {target_lane}")
             
-            # Execute action with minimum phase duration enforcement
-            if current_time - self.last_phase_change.get(tl_id, 0) >= 5:  # 5s minimum
+            # Get RL action
+            action = self.rl_agent.get_action(state, lane_id=target_lane)
+            print(f"DEBUG: Selected action: {action} ({self.rl_agent._get_action_name(action)})")
+            
+            # Check previous state/action
+            prev_state_info = "exists" if target_lane in self.previous_states else "does not exist"
+            prev_action_info = "exists" if target_lane in self.previous_actions else "does not exist"
+            print(f"DEBUG: Previous state {prev_state_info}, previous action {prev_action_info}")
+            
+            # Check phase timing
+            last_change = self.last_phase_change.get(tl_id, 0)
+            time_since_change = current_time - last_change
+            print(f"DEBUG: Last phase change was {time_since_change:.1f}s ago")
+            
+            if time_since_change >= 5:  # Minimum phase duration
+                print("DEBUG: Executing control action...")
                 self._execute_control_action(tl_id, target_lane, action, lane_data, current_time)
                 
+                # Store current state/action for next update
+                self.previous_states[target_lane] = state
+                self.previous_actions[target_lane] = action
+                self.last_phase_change[tl_id] = current_time
+                print("DEBUG: Control action executed and state updated")
+            else:
+                print(f"DEBUG: Skipping action - minimum phase duration not reached ({time_since_change:.1f}s < 5s)")
+                
         except Exception as e:
-            print(f"Error in _perform_normal_control: {e}")
+            print(f"CRITICAL ERROR in _perform_normal_control: {str(e)}")
+            print("Error details:")
+            print(f"- TL ID: {tl_id} (type: {type(tl_id)})")
+            print(f"- Target lane: {target_lane if 'target_lane' in locals() else 'undefined'}")
+            print(f"- Current time: {current_time}")
+            print("Traceback:")
+            import traceback
+            traceback.print_exc()
+
+    def _initialize_lane_mappings(self):
+        """Initialize or refresh lane mappings with proper normalization"""
+        try:
+            # Verify TraCI connection first
+            if not traci.isLoaded():
+                raise ConnectionError("TraCI is not connected to SUMO")
+            
+            current_lanes = traci.lane.getIDList()
+            if not current_lanes:
+                raise ValueError("No lanes found in simulation")
+                
+            self.lane_id_list = current_lanes
+            self.num_lanes = len(current_lanes)
+            
+            # Create new mappings with normalized IDs
+            new_mapping = {}
+            for idx, lane_id in enumerate(current_lanes):
+                # Normalize lane ID format (handle both E3_0_0 and E3-0_0 formats)
+                norm_id = self._normalize_lane_id(lane_id)
+                new_mapping[norm_id] = idx
+                
+            # Update mappings and arrays
+            self.lane_id_to_idx = new_mapping
+            self.idx_to_lane_id = {v: k for k, v in new_mapping.items()}
+            
+            # Resize tracking arrays
+            self._initialize_tracking_arrays()
+            
+            print(f"Successfully initialized mappings for {self.num_lanes} lanes")
+            print(f"Sample lane IDs: {list(new_mapping.keys())[:5]}...")
+            
+        except Exception as e:
+            print(f"CRITICAL: Failed to initialize lane mappings: {e}")
+            # Attempt to reconnect if this was called during normal operation
+            if hasattr(self, 'step_count') and self.step_count > 0:
+                print("Attempting to reconnect...")
+                try:
+                    traci.close()
+                    traci.init(port=8813)  # Use default SUMO port
+                    return self._initialize_lane_mappings()
+                except Exception as reconnect_error:
+                    print(f"Reconnection failed: {reconnect_error}")
+            raise
+
+    def _initialize_tracking_arrays(self):
+        """Initialize all lane tracking arrays"""
+        self.lane_scores = np.zeros(self.num_lanes)
+        self.lane_states = np.full(self.num_lanes, "UNKNOWN", dtype=object)
+        self.consecutive_states = np.zeros(self.num_lanes, dtype=int)
+        self.last_green_time = np.zeros(self.num_lanes)
+        self.last_arrival_time = np.zeros(self.num_lanes)
+        self.last_lane_vehicles = [set() for _ in range(self.num_lanes)]
+
 
     def _execute_control_action(self, tl_id, target_lane, action, lane_data, current_time):
-        """Execute the selected control action"""
+        """Execute the selected control action with robust error handling"""
+        target_lane = self._normalize_lane_id(target_lane)
+        if target_lane not in self.lane_id_to_idx:
+            print(f"WARNING: Refreshing mappings due to missing lane {target_lane}")
+        self._initialize_lane_mappings()
+        if target_lane not in self.lane_id_to_idx:
+            print(f"ERROR: Lane {target_lane} still not found after refresh")
+            return
         try:
-            # Ensure traffic light exists
-            if tl_id not in traci.trafficlight.getIDList():
-                print(f"⚠️ Traffic light {tl_id} not found")
+            # Validate inputs
+            if not tl_id or not target_lane:
+                print(f"ERROR: Invalid inputs - TL: {tl_id}, Lane: {target_lane}")
                 return
-            
-            # Get current phase and find target phase for the lane
-            current_phase = traci.trafficlight.getPhase(tl_id)
-            target_phase = self._find_phase_for_lane(tl_id, target_lane)
-            
-            if target_phase is None:
-                target_phase = current_phase  # Fallback to current phase
-                
+
+            # Debug initial state
+            print(f"DEBUG: Executing action {action} for TL {tl_id}, Lane {target_lane}")
+            print(f"DEBUG: Current time: {current_time}")
+
+            # Verify traffic light exists
+            if tl_id not in traci.trafficlight.getIDList():
+                print(f"ERROR: Traffic light {tl_id} not found")
+                return
+
+            # Verify lane exists in mapping
+            if target_lane not in self.lane_id_to_idx:
+                print(f"ERROR: Target lane {target_lane} not in lane_id_to_idx")
+                print(f"Available lanes: {list(self.lane_id_to_idx.keys())[:10]}...")
+                return
+
+            # Get current phase with validation
+            try:
+                current_phase = traci.trafficlight.getPhase(tl_id)
+                print(f"DEBUG: Current phase: {current_phase}")
+            except Exception as e:
+                print(f"ERROR: Could not get current phase: {e}")
+                return
+
+            # Handle each action type with specific validation
             if action == 0:  # Set green for target lane
+                target_phase = self._find_phase_for_lane(tl_id, target_lane)
+                if target_phase is None:
+                    print(f"WARNING: Could not find phase for lane {target_lane}")
+                    target_phase = current_phase
+
                 if current_phase != target_phase:
-                    green_time = self._calculate_dynamic_green(lane_data[target_lane])
-                    traci.trafficlight.setPhase(tl_id, target_phase)
-                    traci.trafficlight.setPhaseDuration(tl_id, green_time)
-                    self.last_phase_change[tl_id] = current_time
-                    self.last_green_time[target_lane] = current_time
-                    print(f"🟢 RL ACTION: Green for {target_lane} (duration={green_time}s)")
-                    
+                    try:
+                        green_time = self._calculate_dynamic_green(lane_data[target_lane])
+                        print(f"DEBUG: Setting green for {target_lane}, phase {target_phase}, duration {green_time}s")
+                        
+                        traci.trafficlight.setPhase(tl_id, target_phase)
+                        traci.trafficlight.setPhaseDuration(tl_id, green_time)
+                        
+                        # Update tracking variables
+                        self.last_phase_change[tl_id] = current_time
+                        self.last_green_time[self.lane_id_to_idx[target_lane]] = current_time
+                        print(f"SUCCESS: Green set for {target_lane}")
+                    except Exception as e:
+                        print(f"ERROR: Failed to set green phase: {e}")
+
             elif action == 1:  # Next phase
-                phase_count = self._get_phase_count(tl_id)
-                next_phase = (current_phase + 1) % phase_count
-                traci.trafficlight.setPhase(tl_id, next_phase)
-                traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
-                self.last_phase_change[tl_id] = current_time
-                print(f"⏭️ RL ACTION: Next phase ({next_phase})")
-                
+                try:
+                    phase_count = self._get_phase_count(tl_id)
+                    next_phase = (current_phase + 1) % phase_count
+                    print(f"DEBUG: Advancing to next phase {next_phase}")
+                    
+                    traci.trafficlight.setPhase(tl_id, next_phase)
+                    traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
+                    self.last_phase_change[tl_id] = current_time
+                except Exception as e:
+                    print(f"ERROR: Failed to advance phase: {e}")
+
             elif action == 2:  # Extend current phase
                 try:
                     remaining = traci.trafficlight.getNextSwitch(tl_id) - current_time
                     extension = min(15, self.adaptive_params['max_green'] - remaining)
-                    if extension > 0:
-                        traci.trafficlight.setPhaseDuration(tl_id, remaining + extension)
-                        print(f"⏱️ RL ACTION: Extended phase by {extension}s")
-                except Exception as e:
-                    print(f"Could not extend phase: {e}")
                     
+                    if extension > 0:
+                        print(f"DEBUG: Extending phase by {extension}s (remaining: {remaining}s)")
+                        traci.trafficlight.setPhaseDuration(tl_id, remaining + extension)
+                    else:
+                        print("DEBUG: Cannot extend - already at max duration")
+                except Exception as e:
+                    print(f"ERROR: Failed to extend phase: {e}")
+
             elif action == 3:  # Shorten current phase
                 try:
                     remaining = traci.trafficlight.getNextSwitch(tl_id) - current_time
-                    if remaining > self.adaptive_params['min_green'] + 5:
-                        reduction = min(5, remaining - self.adaptive_params['min_green'])
+                    min_duration = self.adaptive_params['min_green']
+                    
+                    if remaining > min_duration + 5:
+                        reduction = min(5, remaining - min_duration)
+                        print(f"DEBUG: Shortening phase by {reduction}s (remaining: {remaining}s)")
                         traci.trafficlight.setPhaseDuration(tl_id, remaining - reduction)
-                        print(f"⏳ RL ACTION: Shortened phase by {reduction}s")
+                    else:
+                        print("DEBUG: Cannot shorten - at minimum duration")
                 except Exception as e:
-                    print(f"Could not shorten phase: {e}")
-                    
-            elif action == 4:  # Balanced phase switch
-                balanced_phase = self._get_balanced_phase(tl_id, lane_data)
-                if balanced_phase != current_phase:
-                    traci.trafficlight.setPhase(tl_id, balanced_phase)
-                    traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
-                    self.last_phase_change[tl_id] = current_time
-                    print(f"⚖️ RL ACTION: Balanced phase ({balanced_phase})")
-                    
-            # Update phase utilization stats
-            new_phase = traci.trafficlight.getPhase(tl_id)
-            self.phase_utilization[(tl_id, new_phase)] += 1
-            
-        except Exception as e:
-            print(f"Error in _execute_control_action: {e}")
+                    print(f"ERROR: Failed to shorten phase: {e}")
 
+            elif action == 4:  # Balanced phase switch
+                try:
+                    balanced_phase = self._get_balanced_phase(tl_id, lane_data)
+                    if balanced_phase != current_phase:
+                        print(f"DEBUG: Switching to balanced phase {balanced_phase}")
+                        traci.trafficlight.setPhase(tl_id, balanced_phase)
+                        traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
+                        self.last_phase_change[tl_id] = current_time
+                    else:
+                        print("DEBUG: Already in balanced phase")
+                except Exception as e:
+                    print(f"ERROR: Failed to set balanced phase: {e}")
+
+            # Update phase utilization stats
+            try:
+                new_phase = traci.trafficlight.getPhase(tl_id)
+                self.phase_utilization[(tl_id, new_phase)] = self.phase_utilization.get((tl_id, new_phase), 0) + 1
+                print(f"DEBUG: Updated phase utilization for phase {new_phase}")
+            except Exception as e:
+                print(f"ERROR: Failed to update phase stats: {e}")
+
+        except Exception as e:
+            print(f"CRITICAL ERROR in _execute_control_action: {e}")
+            print("Error context:")
+            print(f"- TL: {tl_id}")
+            print(f"- Lane: {target_lane}")
+            print(f"- Action: {action}")
+            print(f"- Time: {current_time}")
+            import traceback
+            traceback.print_exc()
     def _get_balanced_phase(self, tl_id, lane_data):
         """Get phase that balances traffic flow"""
         try:
@@ -968,21 +1246,20 @@ class SmartTrafficController:
         return 0
 
     def _process_rl_learning(self, lane_data, current_time):
-        print("---- PROCESS_RL_LEARNING CALLED ----")
-        print(f"Lane_data keys: {list(lane_data.keys())}")
-        print(f"Previous_states keys: {list(self.previous_states.keys())}")
-        print(f"Previous_actions keys: {list(self.previous_actions.keys())}")
-
         for lane_id, data in lane_data.items():
-            print(f">> Checking lane_id {lane_id}")
+            lane_id = lane_id.lstrip(':')
+
+            if lane_id not in self.lane_id_to_idx:
+                    print(f"Warning: Lane {lane_id} not in lane_id_to_idx")
+                    continue
             state = self._create_state_vector(lane_id, lane_data)
-            print(f"  State shape for {lane_id}: {state.shape}, values: {state}")
-            print(f"  Is valid state: {self.rl_agent.is_valid_state(state)}")
+            print(f"DEBUG: Processing lane: {lane_id} (normalized)")
+
+            if not self.rl_agent.is_valid_state(state) or lane_id not in self.lane_id_to_idx:
+                continue
             action = self.rl_agent.get_action(state, lane_id=lane_id)
-            print(f"  Got action {action} for lane {lane_id}")
-            print(f"  In previous_states: {lane_id in self.previous_states}, in previous_actions: {lane_id in self.previous_actions}")
             if lane_id in self.previous_states and lane_id in self.previous_actions:
-                # ADD THIS: Compute reward and reward_components
+                print(f"DEBUG: Updating Q-table for normalized lane: {lane_id}")
                 reward, reward_components, raw_reward = self._calculate_reward(
                     lane_id, lane_data, self.previous_actions[lane_id], current_time
                 )
@@ -1199,31 +1476,27 @@ class SmartTrafficController:
 def start_enhanced_simulation(sumocfg_path, use_gui=True, max_steps=None, episodes=1, num_retries=1, retry_delay=1, mode="train"):
     controller = None
     try:
+        # Initialize controller WITHOUT lane mappings first
         controller = SmartTrafficController(sumocfg_path=sumocfg_path, mode=mode)
+        
         for episode in range(episodes):
             print(f"\n{'='*50}")
             print(f"🚦 STARTING ENHANCED EPISODE {episode + 1}/{episodes}")
             print(f"{'='*50}")
+            
             sumo_binary = "sumo-gui" if use_gui else "sumo"
             sumo_cmd = [
                 os.path.join(os.environ['SUMO_HOME'], 'bin', sumo_binary),
                 '-c', sumocfg_path,
                 '--start', '--quit-on-end'
             ]
+            
+            # Start SUMO connection
             traci.start(sumo_cmd)
+            
+            # NOW initialize lane mappings after traci is connected
+            controller._initialize_lane_mappings()
             controller.current_episode = episode + 1
-
-            controller.lane_id_list = traci.lane.getIDList()
-            controller.num_lanes = len(controller.lane_id_list)
-            controller.lane_id_to_idx = {lid: i for i, lid in enumerate(controller.lane_id_list)}
-            controller.idx_to_lane_id = {i: lid for i, lid in enumerate(controller.lane_id_list)}
-            controller.lane_scores = np.zeros(controller.num_lanes)
-            controller.lane_states = np.full(controller.num_lanes, "UNKNOWN", dtype=object)
-            controller.consecutive_states = np.zeros(controller.num_lanes, dtype=int)
-            controller.last_green_time = np.zeros(controller.num_lanes)
-            controller.last_arrival_time = np.zeros(controller.num_lanes)
-            controller.last_lane_vehicles = [set() for _ in range(controller.num_lanes)]
-            print(f"Collected lane data for {controller.num_lanes} lanes after simulation started.")
 
             step = 0
             while traci.simulation.getMinExpectedNumber() > 0:
@@ -1239,11 +1512,13 @@ def start_enhanced_simulation(sumocfg_path, use_gui=True, max_steps=None, episod
                 except Exception as e:
                     print(f"Error in simulation step {step}: {e}")
                     break
+                    
             print(f"Episode {episode + 1} completed after {step} steps")
             controller.end_episode()
             traci.close()
             if episode < episodes - 1:
                 time.sleep(2)
+                
         print(f"\n🎉 All {episodes} episodes completed!")
     except Exception as e:
         print(f"Error in enhanced simulation: {e}")
