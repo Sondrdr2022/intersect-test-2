@@ -46,7 +46,7 @@ def detect_turning_lanes_with_traci():
 class EnhancedQLearningAgent:
     def __init__(self, state_size, action_size, learning_rate=0.1, discount_factor=0.95, 
                  epsilon=0.1, epsilon_decay=0.995, min_epsilon=0.01, 
-                 q_table_file="enhanced_q_table.pkl", mode="train"):
+                 q_table_file="enhanced_q_table.pkl", mode="train", adaptive_params=None):
         self.state_size = state_size
         self.action_size = action_size
         self.learning_rate = learning_rate
@@ -66,10 +66,25 @@ class EnhancedQLearningAgent:
         self.max_no_improvement = 100
         self.mode = mode
 
+        # ADD THIS BLOCK:
+        self.adaptive_params = adaptive_params or {
+            'min_green': 30,
+            'max_green': 80,
+            'starvation_threshold': 40,
+            'reward_scale': 40,
+            'queue_weight': 0.6,
+            'wait_weight': 0.3,
+            'flow_weight': 0.5,
+            'speed_weight': 0.2,
+            'left_turn_priority': 1.2
+        }
+
         if self.mode == "eval":
             self.epsilon = 0.0
         elif self.mode == "adaptive":
             self.epsilon = 0.01
+            
+        print(f"AGENT INIT: mode={self.mode}, epsilon={self.epsilon}")
 
     def is_valid_state(self, state):
         if not isinstance(state, (list, np.ndarray)):
@@ -83,8 +98,8 @@ class EnhancedQLearningAgent:
             return False
         return True
 
-    def get_action(self, state, lane_id=None):
-        state_key = self._state_to_key(state, lane_id)
+    def get_action(self, state, tl_id=None):
+        state_key = self._state_to_key(state, tl_id)
         if state_key not in self.q_table:
             self.q_table[state_key] = np.zeros(self.action_size)
         if self.mode == "train":
@@ -95,7 +110,7 @@ class EnhancedQLearningAgent:
         else:
             return np.argmax(self.q_table[state_key])
 
-    def _state_to_key(self, state, lane_id=None):
+    def _state_to_key(self, state, tl_id=None):
         try:
             if isinstance(state, np.ndarray):
                 key = tuple(np.round(state, 2))
@@ -104,23 +119,22 @@ class EnhancedQLearningAgent:
                 key = tuple(state_array.tolist())
             else:
                 key = tuple(state) if hasattr(state, '__iter__') else (state,)
-            if lane_id is not None:
-                return (lane_id, key)
+            if tl_id is not None:
+                return (tl_id, key)
             return key
         except Exception:
-            return (lane_id, (0,)) if lane_id is not None else (0,)
+            return (tl_id, (0,)) if tl_id is not None else (0,)
         
-    def update_q_table(self, state, action, reward, next_state, lane_info=None):
+    def update_q_table(self, state, action, reward, next_state, tl_id=None, extra_info=None):
         if self.mode == "eval":
             return
         if not self.is_valid_state(state) or not self.is_valid_state(next_state):
-            print("Invalid state, skipping...")
             return
-        if np.isnan(reward) or np.isinf(reward):
+        if reward is None or np.isnan(reward) or np.isinf(reward):
             reward = 0.0
-        lane_id = lane_info['lane_id'] if lane_info and 'lane_id' in lane_info else None
-        state_key = self._state_to_key(state, lane_id)
-        next_state_key = self._state_to_key(next_state, lane_id)
+
+        state_key = self._state_to_key(state, tl_id)
+        next_state_key = self._state_to_key(next_state, tl_id)
         if state_key not in self.q_table:
             self.q_table[state_key] = np.zeros(self.action_size)
         if next_state_key not in self.q_table:
@@ -131,24 +145,27 @@ class EnhancedQLearningAgent:
         if np.isnan(new_q) or np.isinf(new_q):
             new_q = current_q
         self.q_table[state_key][action] = new_q
+
+        # Always ensure reward is present and not overwritten by extra_info
         entry = {
             'state': state.tolist() if isinstance(state, np.ndarray) else state,
             'action': action,
             'reward': reward,
-            'reward_components': lane_info.get('reward_components', {}) if lane_info else {},
             'next_state': next_state.tolist() if isinstance(next_state, np.ndarray) else next_state,
             'q_value': new_q,
             'timestamp': time.time(),
             'learning_rate': self.learning_rate,
             'epsilon': self.epsilon,
-            'lane_id': lane_id,
-            'action_name': self._get_action_name(action),
-            'raw_reward': lane_info.get('raw_reward', None) if lane_info else None
+            'tl_id': tl_id,
+            'adaptive_params': self.adaptive_params.copy()
         }
-        if lane_info:
-            entry.update(lane_info)
+        if extra_info:
+            # Prevent extra_info from overwriting a valid reward with None/missing
+            entry.update({k: v for k, v in extra_info.items() if k != "reward"})
+
         self.training_data.append(entry)
         self._update_adaptive_parameters(reward)
+
 
     def _get_action_name(self, action):
         action_names = {
@@ -160,12 +177,17 @@ class EnhancedQLearningAgent:
         }
         return action_names.get(action, f"Unknown Action {action}")
 
+
     def _update_adaptive_parameters(self, reward):
         self.reward_history.append(reward)
         if len(self.reward_history) > 100:
             self.reward_history.pop(0)
         if self.mode == "train":
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+        if reward < -20:
+            self.adaptive_params['min_green'] = min(self.adaptive_params['min_green'] + 1, self.adaptive_params['max_green'])
+        elif reward > -5:
+            self.adaptive_params['min_green'] = max(self.adaptive_params['min_green'] - 1, 5)
         if len(self.reward_history) >= 50:
             recent_avg = np.mean(self.reward_history[-50:])
             older_avg = np.mean(self.reward_history[-100:-50])
@@ -180,6 +202,9 @@ class EnhancedQLearningAgent:
     def load_model(self, filepath=None):
         if filepath is None:
             filepath = self.q_table_file
+        print("Attempting to load Q-table from:", filepath)
+        print("Absolute path:", os.path.abspath(filepath))
+        print("File exists?", os.path.exists(filepath))
         try:
             if os.path.exists(filepath):
                 with open(filepath, 'rb') as f:
@@ -192,8 +217,10 @@ class EnhancedQLearningAgent:
                 params = model_data.get('params', {})
                 self.learning_rate = params.get('learning_rate', self.learning_rate)
                 self.discount_factor = params.get('discount_factor', self.discount_factor)
-                self.epsilon = params.get('epsilon', self.epsilon)
+                #self.epsilon = params.get('epsilon', self.epsilon)
                 adaptive_params = model_data.get('adaptive_params', {})
+                print(f"After model load, epsilon={self.epsilon}")  # <--- Add this line here
+
                 print(f"Loaded Q-table with {len(self.q_table)} states from {filepath}")
                 if adaptive_params:
                     print(f"📋 Loaded adaptive parameters from previous run")
@@ -205,7 +232,7 @@ class EnhancedQLearningAgent:
             print(f"Error loading model: {e}")
             print("No existing Q-table, starting fresh")
             return False, {}
-
+        
     def save_model(self, filepath=None, adaptive_params=None):
         if filepath is None:
             filepath = self.q_table_file
@@ -235,7 +262,7 @@ class EnhancedQLearningAgent:
                 'metadata': {
                     'last_updated': datetime.datetime.now().isoformat(),
                     'training_count': len(self.training_data),
-                    'average_reward': np.mean([x['reward'] for x in self.training_data[-100:]]) if self.training_data else 0,
+                    'average_reward': np.mean([x.get('reward', 0) for x in self.training_data[-100:]]) if self.training_data else 0,
                     'reward_components': [x.get('reward_components', {}) for x in self.training_data[-100:]]
                 }
             }
@@ -254,75 +281,73 @@ class UniversalSmartTrafficController:
     def __init__(self, sumocfg_path=None, mode="train"):
         self.mode = mode
         self.step_count = 0
-        self.lane_id_list = traci.lane.getIDList() if traci.isLoaded() else []
-        self.num_lanes = len(self.lane_id_list)
-        self.lane_id_to_idx = {lid: i for i, lid in enumerate(self.lane_id_list)}
-        self.idx_to_lane_id = {i: lid for i, lid in enumerate(self.lane_id_list)}
-        self.lane_scores = np.zeros(self.num_lanes)
-        self.lane_states = np.full(self.num_lanes, "UNKNOWN", dtype=object)
-        self.consecutive_states = np.zeros(self.num_lanes, dtype=int)
-        self.last_green_time = np.zeros(self.num_lanes)
-        self.last_arrival_time = np.zeros(self.num_lanes)
-        self.last_lane_vehicles = [set() for _ in range(self.num_lanes)]
-        self.lane_to_tl = {}
-        self.edge_to_routes = {}
-        self.previous_states = {}
-        self.previous_actions = {}
-        self.current_episode = 0
-        self.last_phase_change = {}
-        self.phase_utilization = {}
-        self.priority_vehicles = {}
-        self.ambulance_active = {}
-        self.ambulance_start_time = {}
         self.left_turn_lanes = set()
         self.right_turn_lanes = set()
-        self.tl_logic_cache = {}
-        self.left_phase_counter = defaultdict(lambda: 0)
-        self.max_consecutive_left = 2  # Limit consecutive left-turns
+        self.ambulance_active = defaultdict(bool)
+        self.ambulance_start_time = defaultdict(float)
+        self.lane_id_list = []
+        self.lane_id_to_idx = {}
+        self.idx_to_lane_id = {}
+        self.intersection_data = {}  # Store intersection data
+        self.tl_logic_cache = {}     # Cache traffic light logic
+        self.lane_to_tl = {}         # Lane to traffic light mapping
+        self.phase_utilization = defaultdict(int)  # Phase tracking
+        self.lane_id_list = []       # You must initialize this in your code elsewhere
+        self.last_green_time = np.zeros(len(self.lane_id_list))  # Lane tracking
+        self.previous_states = {}
+        self.previous_actions = {}
+        self.step_count = 0
+          # Ensure reward history ex
+        self.last_phase_change = {}
+        self.intersection_data = {}  # Add this to store intersection data
+        self.tl_logic_cache = {}  # Add this for traffic light logic caching
+        self.lane_to_tl = {}  # Add this for lane to traffic light mapping
+        self.phase_utilization = defaultdict(int)  # Add this for phase tracking
+        self.last_green_time = np.zeros(len(self.lane_id_list))  # Add this for lane tracking
+        self.current_episode = 0
+        
 
-        default_adaptive_params = {
-            'min_green': 15,
-            'max_green': 45,
-            'starvation_threshold': 80,
-            'reward_scale': 50,
+        # Adaptive params for speed and fairness
+        self.adaptive_params = {
+            'min_green': 30,
+            'max_green': 80,
+            'starvation_threshold': 40,
+            'reward_scale': 40,
             'queue_weight': 0.6,
-            'wait_weight': 0.25,
-            'flow_weight': 0.8,
+            'wait_weight': 0.3,
+            'flow_weight': 0.5,
             'speed_weight': 0.2,
             'left_turn_priority': 1.2
         }
-        self.rl_agent = EnhancedQLearningAgent(state_size=12, action_size=5, mode=mode)
-        success, loaded_adaptive_params = self.rl_agent.load_model()
-        if success and loaded_adaptive_params:
-            self.adaptive_params = loaded_adaptive_params.copy()
-            print(f" Loaded adaptive parameters: {self.adaptive_params}")
-        else:
-            self.adaptive_params = default_adaptive_params.copy()
-            print(" Using default adaptive parameters")
-        self.norm_bounds = {
-            'queue': 16,
-            'wait': 100,
-            'density': 1.5,
-            'speed': 14,
-            'flow': 12,
-            'time_since_green': 80,
-            'arrival_rate': 8
-        }
-        if traci.isLoaded() and self.lane_id_list:
-            subscribe_lanes(self.lane_id_list)
-        if sumocfg_path is not None:
-            try:
-                left_lanes, right_lanes = detect_turning_lanes_with_traci()
-                self.left_turn_lanes = left_lanes
-                self.right_turn_lanes = right_lanes
-                print(f"Auto-detected left-turn lanes: {sorted(self.left_turn_lanes)}")
-                print(f"Auto-detected right-turn lanes: {sorted(self.right_turn_lanes)}")
-            except Exception as e:
-                print(f"Error detecting turning lanes: {e}")
-        else:
-            self.left_turn_lanes = set()
-            self.right_turn_lanes = set()
-            self._init_left_turn_lanes()
+
+        self.rl_agent = EnhancedQLearningAgent(state_size=10, action_size=8, mode=mode)
+        self.rl_agent.load_model()
+        
+        self.previous_states = {}
+        self.previous_actions = {}
+        self.left_phase_counter = defaultdict(lambda: 0)
+        self.max_consecutive_left = 1
+
+    def initialize(self):
+        # 1. Get the lane list from SUMO
+        self.lane_id_list = traci.lane.getIDList()
+
+        # 2. Set up lane index mappings
+        self.lane_id_to_idx = {lid: i for i, lid in enumerate(self.lane_id_list)}
+        self.idx_to_lane_id = {i: lid for i, lid in enumerate(self.lane_id_list)}
+
+        # 3. Initialize per-lane arrays
+        self.last_green_time = np.zeros(len(self.lane_id_list))
+
+        # 4. Subscribe to lane data (do this after you have the correct lane list)
+        subscribe_lanes(self.lane_id_list)
+
+        # 5. Detect left/right turn lanes if needed
+        self.left_turn_lanes, self.right_turn_lanes = detect_turning_lanes_with_traci()
+        print(f"Auto-detected left-turn lanes: {sorted(self.left_turn_lanes)}")
+        print(f"Auto-detected right-turn lanes: {sorted(self.right_turn_lanes)}")
+
+    # Remove any logic involving target_lane/current_time here!
     def _init_left_turn_lanes(self):
         try:
             self.left_turn_lanes.clear()
@@ -338,53 +363,79 @@ class UniversalSmartTrafficController:
             print(f"Error initializing left-turn lanes: {e}")
     
     
-    def _handle_protected_left_turn(self, tl_id, left_turn_lanes, lane_data, current_time):
-        """Handle protected left turn phase activation (exclusive left-turn green)"""
+    def _handle_protected_left_turn(self, tl_id, controlled_lanes, lane_data, current_time):
+        """
+        Scan all left-turn lanes at the intersection. 
+        If any left-turn lane has high queue/wait, serve it with a protected left phase and log both needed and triggered events.
+        """
         try:
-            # Find the left turn lane with highest priority
-            left_turn_lanes.sort(key=lambda x: (
-                lane_data[x]['queue_length'],
-                lane_data[x]['waiting_time']
-            ), reverse=True)
-            
+            # Identify left-turn lanes needing service
+            left_turn_lanes = [
+                lane for lane in controlled_lanes
+                if lane_data.get(lane, {}).get('left_turn', False)
+                and (
+                    lane_data[lane]['queue_length'] > 3 or
+                    lane_data[lane]['waiting_time'] > 10
+                )
+            ]
+            if not left_turn_lanes:
+                return False  # No protected left needed
+
+            # Pick lane with highest queue/wait time
+            left_turn_lanes.sort(
+                key=lambda x: (lane_data[x]['queue_length'], lane_data[x]['waiting_time']),
+                reverse=True
+            )
             target_lane = left_turn_lanes[0]
             current_phase = traci.trafficlight.getPhase(tl_id)
             logic = self._get_traffic_light_logic(tl_id)
-            
-            # Find the best protected left-turn phase
             left_turn_phase = self._find_best_left_turn_phase(tl_id, target_lane, lane_data)
-            
+
+            # Log that protected left was needed
+            self.rl_agent.training_data.append({
+                'event': 'protected_left_needed',
+                'lane_id': target_lane,
+                'tl_id': tl_id,
+                'phase': left_turn_phase,
+                'simulation_time': current_time,
+                'queue_length': lane_data[target_lane]['queue_length'],
+                'waiting_time': lane_data[target_lane]['waiting_time'],
+            })
+
             if left_turn_phase is not None and current_phase != left_turn_phase:
-                # Calculate duration based on queue and waiting time
+                # Compute adaptive green time
                 queue_length = lane_data[target_lane]['queue_length']
                 waiting_time = lane_data[target_lane]['waiting_time']
                 base_duration = 5 + min(queue_length * 0.5, 10) + min(waiting_time * 0.1, 5)
-                
-                # Apply adaptive parameters
                 duration = min(
                     max(base_duration, self.adaptive_params['min_green']),
                     self.adaptive_params['max_green']
                 )
-                
-                # Set the protected left-turn phase
                 traci.trafficlight.setPhase(tl_id, left_turn_phase)
                 traci.trafficlight.setPhaseDuration(tl_id, duration)
-                
-                #print(f"↩️ PROTECTED LEFT TURN: Activated for {target_lane} at {tl_id} "
-               #     f"(queue={queue_length}, wait={waiting_time:.1f}s, duration={duration:.1f}s)")
-                
-                # Update tracking variables
+                # Log that protected left was triggered
+                self.rl_agent.training_data.append({
+                    'event': 'protected_left_triggered',
+                    'lane_id': target_lane,
+                    'tl_id': tl_id,
+                    'phase': left_turn_phase,
+                    'simulation_time': current_time,
+                    'queue_length': lane_data[target_lane]['queue_length'],
+                    'waiting_time': lane_data[target_lane]['waiting_time'],
+                    'duration': duration,
+                })
+                # Update tracking
                 lane_idx = self.lane_id_to_idx[target_lane]
                 self.last_green_time[lane_idx] = current_time
                 self.last_phase_change[tl_id] = current_time
                 self.phase_utilization[(tl_id, left_turn_phase)] = self.phase_utilization.get((tl_id, left_turn_phase), 0) + 1
-                
-                return True  # Indicate that left turn was handled
-                
+                return True
+
+            return False
+
         except Exception as e:
             print(f"Error in _handle_protected_left_turn: {e}")
-        return False
-
+            return False
     def _find_best_left_turn_phase(self, tl_id, left_turn_lane, lane_data):
         """
         Finds the best phase for protected left turns, considering:
@@ -484,25 +535,71 @@ class UniversalSmartTrafficController:
         return f'phase_{phase_idx}'
 
     def run_step(self):
-        
         try:
             self.step_count += 1
             current_time = traci.simulation.getTime()
+            self.intersection_data = {}
+
+            # 1. Collect lane data once for the whole network
             lane_data = self._collect_enhanced_lane_data()
-            if not lane_data:
-                return
-            lane_status = self._update_lane_status_and_score(lane_data)
-            self._adjust_traffic_lights(lane_data, lane_status, current_time)
-            self._process_rl_learning(lane_data, current_time)
+
+            for tl_id in traci.trafficlight.getIDList():
+                controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
+
+                # 2. Emergency priority (ambulance) check
+                if self._handle_ambulance_priority(tl_id, controlled_lanes, lane_data, current_time):
+                    continue
+
+                # 3. Protected left turn check
+                if self._handle_protected_left_turn(tl_id, controlled_lanes, lane_data, current_time):
+                    continue
+
+                # 4. Gather intersection-level state
+                queues = [lane_data[l]['queue_length'] for l in controlled_lanes if l in lane_data]
+                waits = [lane_data[l]['waiting_time'] for l in controlled_lanes if l in lane_data]
+                speeds = [lane_data[l]['mean_speed'] for l in controlled_lanes if l in lane_data]
+
+                # Optionally, calculate left_q/right_q as sum/max for left/right turn lanes
+                left_q = sum(lane_data[l]['queue_length'] for l in controlled_lanes if l in self.left_turn_lanes and l in lane_data)
+                right_q = sum(lane_data[l]['queue_length'] for l in controlled_lanes if l in self.right_turn_lanes and l in lane_data)
+
+                n_phases = len(traci.trafficlight.getAllProgramLogics(tl_id)[0].phases)
+                current_phase = traci.trafficlight.getPhase(tl_id)
+                self.intersection_data[tl_id] = {
+                    'queues': queues,
+                    'waits': waits,
+                    'speeds': speeds,
+                    'left_q': left_q,
+                    'right_q': right_q,
+                    'n_phases': n_phases,
+                    'current_phase': current_phase
+                }
+
+                # 5. RL per-intersection phase selection
+                state = self._create_intersection_state_vector(tl_id, self.intersection_data)
+                action = self.rl_agent.get_action(state, tl_id)
+                last_change = self.last_phase_change.get(tl_id, -9999)
+                time_since_last_change = current_time - last_change
+
+                # 6. RL phase selection with min_green
+                if time_since_last_change >= self.adaptive_params['min_green'] and action != current_phase:
+                    traci.trafficlight.setPhase(tl_id, action)
+                    self.last_phase_change[tl_id] = current_time
+
+            # 7. RL learning step
+            self._process_rl_learning(self.intersection_data, current_time)
+
         except Exception as e:
             print(f"Error in run_step: {e}")
 
+
     def _collect_enhanced_lane_data(self):
-        """Collect comprehensive lane data for complex networks"""
+        """Collect comprehensive lane data for complex networks (per lane, not per intersection).
+        Returns a dictionary: lane_id -> lane_info_dict
+        """
         lane_data = {}
         try:
-            lanes = self.lane_id_list
-            for lane_id in lanes:
+            for lane_id in self.lane_id_list:
                 try:
                     results = traci.lane.getSubscriptionResults(lane_id)
                     if results is None:
@@ -512,7 +609,7 @@ class UniversalSmartTrafficController:
                     mean_speed = results.get(traci.constants.LAST_STEP_MEAN_SPEED, 0)
                     queue_length = results.get(traci.constants.LAST_STEP_VEHICLE_HALTING_NUMBER, 0)
                     waiting_time = results.get(traci.constants.VAR_ACCUMULATED_WAITING_TIME, 0)
-                    lane_length = traci.lane.getLength(lane_id)
+                    lane_length = traci.lane.getLength(lane_id) or 1.0  # avoid div by zero
                     density = vehicle_count / lane_length
                     speed = max(mean_speed, 0.0)
 
@@ -777,56 +874,62 @@ class UniversalSmartTrafficController:
             
         return False  # No left-turn priority logic
 
-    def _handle_ambulance_priority(self, tl_id, ambulance_lanes, current_time):
+    def _handle_ambulance_priority(self, tl_id, controlled_lanes, lane_data, current_time):
+        """
+        Scan all controlled lanes at the intersection for an emergency (ambulance/authority).
+        If found, immediately serve that lane with a priority phase and log the event.
+        """
         try:
-            # Only act if ambulance priority is not already active
-            if not self.ambulance_active.get(tl_id, False):
-                # Find closest emergency vehicle to the intersection
-                min_distance = float('inf')
-                target_lane = None
-                
-                for lane_id in ambulance_lanes:
-                    try:
-                        # Get emergency vehicles in lane
-                        vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
-                        for vid in vehicles:
-                            if traci.vehicle.getVehicleClass(vid) in ['emergency', 'authority']:
-                                # Calculate distance to end of lane (traffic light)
-                                lane_length = traci.lane.getLength(lane_id)
-                                vehicle_pos = traci.vehicle.getLanePosition(vid)
-                                distance = lane_length - vehicle_pos
-                                
-                                if distance < min_distance:
-                                    min_distance = distance
-                                    target_lane = lane_id
-                    except Exception as e:
-                        print(f"Error processing ambulance lane {lane_id}: {e}")
-                
-                if target_lane:
-                    phase_index = self._find_phase_for_lane(tl_id, target_lane)
-                    if phase_index is not None:
-                        # Set longer green time for high-priority emergency
-                        duration = 30 if min_distance < 30 else 20
-                        
-                        traci.trafficlight.setPhase(tl_id, phase_index)
-                        traci.trafficlight.setPhaseDuration(tl_id, duration)
-                        self.ambulance_active[tl_id] = True
-                        self.ambulance_start_time[tl_id] = current_time
-                        
-                        # Get direction from lane ID (last character)
-                        direction = target_lane[-1]
+            ambulance_lanes = [lane for lane in controlled_lanes if lane_data.get(lane, {}).get('ambulance', False)]
+            if not ambulance_lanes:
+                return False  # No ambulance to serve
 
-            else:
-                # Check if ambulance still present OR timeout
-                still_present = any(self._detect_priority_vehicles(lane) 
-                                for lane in ambulance_lanes)
-                timeout = (current_time - self.ambulance_start_time.get(tl_id, 0)) > 30
-                
-                if not still_present or timeout:
-                    self.ambulance_active[tl_id] = False
-                    
+            # Find the closest emergency vehicle to the intersection
+            min_distance = float('inf')
+            target_lane = None
+            for lane_id in ambulance_lanes:
+                try:
+                    vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
+                    for vid in vehicles:
+                        if traci.vehicle.getVehicleClass(vid) in ['emergency', 'authority']:
+                            lane_length = traci.lane.getLength(lane_id)
+                            vehicle_pos = traci.vehicle.getLanePosition(vid)
+                            distance = lane_length - vehicle_pos
+                            if distance < min_distance:
+                                min_distance = distance
+                                target_lane = lane_id
+                except Exception as e:
+                    print(f"Error processing ambulance lane {lane_id}: {e}")
+
+            if target_lane is None:
+                return False
+
+            # Find phase for target lane and set green
+            phase_index = self._find_phase_for_lane(tl_id, target_lane)
+            if phase_index is not None:
+                duration = 30 if min_distance < 30 else 20
+                traci.trafficlight.setPhase(tl_id, phase_index)
+                traci.trafficlight.setPhaseDuration(tl_id, duration)
+                self.ambulance_active[tl_id] = True
+                self.ambulance_start_time[tl_id] = current_time
+                # Log event
+                self.rl_agent.training_data.append({
+                    'event': 'ambulance_priority',
+                    'lane_id': target_lane,
+                    'tl_id': tl_id,
+                    'phase': phase_index,
+                    'simulation_time': current_time,
+                    'distance_to_stopline': min_distance,
+                    'duration': duration,
+                })
+                return True
+
+            return False
+
         except Exception as e:
             print(f"Error in _handle_ambulance_priority: {e}")
+            return False
+
     def _perform_normal_control(self, tl_id, controlled_lanes, lane_data, current_time):
         """Perform normal RL-based traffic control"""
         try:
@@ -1001,62 +1104,111 @@ class UniversalSmartTrafficController:
         except Exception as e:
             print(f"Error finding phase for lane {target_lane}: {e}")
         return 0
+    
+    def _create_intersection_state_vector(self, tl_id, intersection_data):
+        """Create a state vector for the intersection tl_id"""
+        data = intersection_data[tl_id]
+        queues = data.get('queues', [])
+        waits = data.get('waits', [])
+        speeds = data.get('speeds', [])
+        left_q = data.get('left_q', 0)
+        right_q = data.get('right_q', 0)
+        n_phases = data.get('n_phases', 4)
+        current_phase = data.get('current_phase', 0)
+        state = np.array([
+            np.max(queues) if queues else 0,
+            np.mean(queues) if queues else 0,
+            np.min(speeds) if speeds else 0,
+            np.mean(speeds) if speeds else 0,
+            np.max(waits) if waits else 0,
+            np.mean(waits) if waits else 0,
+            float(current_phase) / max(n_phases-1, 1),
+            float(n_phases),
+            left_q,
+            right_q
+        ])
+        return state
 
-    def _process_rl_learning(self, lane_data, current_time):
-        """Process RL learning for each lane"""
+    def _process_rl_learning(self, intersection_data, current_time):
+        """Process RL learning for each intersection (per-intersection RL)"""
         try:
+            for tl_id in traci.trafficlight.getIDList():
+                if tl_id not in intersection_data:
+                    continue
 
-            for lane_id, data in lane_data.items():
-                state = self._create_state_vector(lane_id, lane_data)
+                state = self._create_intersection_state_vector(tl_id, intersection_data)
                 if not self.rl_agent.is_valid_state(state):
                     continue
-                    
-                action = self.rl_agent.get_action(state, lane_id=lane_id)
-                reward = 0
-                reward_components = {}
-                if lane_id in self.previous_states and lane_id in self.previous_actions:
-                    reward, reward_components, raw_reward = self._calculate_reward(lane_id, lane_data, 
-                                                    self.previous_actions[lane_id], current_time)
-                if lane_id in self.previous_states and lane_id in self.previous_actions:
-                    reward, reward_components, raw_reward = self._calculate_reward(
-                        lane_id, lane_data, self.previous_actions[lane_id], current_time
+
+                data = intersection_data[tl_id]
+                queues = data.get('queues', [])
+                waits = data.get('waits', [])
+                speeds = data.get('speeds', [])
+                left_q = data.get('left_q', 0)
+                right_q = data.get('right_q', 0)
+                n_phases = data.get('n_phases', 0)
+                current_phase = data.get('current_phase', -1)
+                reward = -0.7 * sum(queues) - 0.3 * sum(waits)  # Simplified reward
+                raw_reward = reward  # If you have an unnormalized version, use it
+                reward_components = {
+                    "queue_penalty": -0.7 * sum(queues),
+                    "wait_penalty": -0.3 * sum(waits),
+                    "total_raw": reward,
+                    "normalized": reward,  # If you normalize, put here
+                }
+                # Update Q-table if previous state/action exist
+                if tl_id in self.previous_states and tl_id in self.previous_actions:
+                    prev_state = self.previous_states[tl_id]
+                    prev_action = self.previous_actions[tl_id]
+                    # Get q_value after update for logging
+                    state_key = self.rl_agent._state_to_key(prev_state, tl_id)
+                    q_value = (
+                        float(self.rl_agent.q_table[state_key][prev_action])
+                        if state_key in self.rl_agent.q_table else None
                     )
-                    
-                    
-                    # Update Q-table
+                    # Compose a rich log entry
+                    log_entry = {
+                        'episode': getattr(self, 'current_episode', 0),
+                        'simulation_time': current_time,
+                        'lane_id': "",  # For intersection RL, you may not have this
+                        'edge_id': "",
+                        'route_id': "",
+                        'action': prev_action,
+                        'action_name': self.rl_agent._get_action_name(prev_action),
+                        'reward': reward,
+                        'raw_reward': raw_reward,
+                        'q_value': q_value,
+                        'queue_length': max(queues) if queues else 0,
+                        'waiting_time': max(waits) if waits else 0,
+                        'density': "",  # Not available at intersection level unless you sum/avg lanes
+                        'mean_speed': np.mean(speeds) if speeds else 0,
+                        'flow': "",  # Not available unless you sum across lanes
+                        'queue_route': "",  # Not available
+                        'flow_route': "",  # Not available
+                        'ambulance': "",  # Not available unless you scan all lanes
+                        'left_turn': left_q,
+                        'right_turn': right_q,
+                        'tl_id': tl_id,
+                        'phase_id': current_phase,
+                        'epsilon': self.rl_agent.epsilon,
+                        'learning_rate': self.rl_agent.learning_rate,
+                        'reward_components': reward_components,
+                        'adaptive_params': self.adaptive_params.copy()
+                    }
+                    # Pass to update_q_table for logging
                     self.rl_agent.update_q_table(
-                        self.previous_states[lane_id],
-                        self.previous_actions[lane_id],
+                        prev_state,
+                        prev_action,
                         reward,
                         state,
-                        lane_info={
-                            'lane_id': lane_id,
-                            'edge_id': data['edge_id'],
-                            'route_id': data['route_id'],
-                            'queue_length': data['queue_length'],
-                            'waiting_time': data['waiting_time'],
-                            'density': data['density'],
-                            'mean_speed': data['mean_speed'],
-                            'flow': data['flow'],
-                            'queue_route': data.get('queue_route', 0),
-                            'flow_route': data.get('flow_route', 0),
-                            'ambulance': data['ambulance'],
-                            'tl_id': self.lane_to_tl.get(lane_id, ''),
-                            'phase_id': traci.trafficlight.getPhase(self.lane_to_tl.get(lane_id, '')) if lane_id in self.lane_to_tl else -1,
-                            'epsilon': self.rl_agent.epsilon,
-                            'learning_rate': self.rl_agent.learning_rate,
-                            'adaptive_params': self.adaptive_params.copy(),
-                            'simulation_time': current_time,
-                            'reward_components': reward_components,
-                            'raw_reward': int(round(raw_reward)),
-                            'left_turn': data.get('left_turn', False)
-                        }
+                        tl_id=tl_id,
+                        extra_info=log_entry
                     )
-                
-                # Store current state and action
-                self.previous_states[lane_id] = state
-                self.previous_actions[lane_id] = action
-                
+
+                # Store current state/action for next update
+                action = self.rl_agent.get_action(state, tl_id=tl_id)
+                self.previous_states[tl_id] = state
+                self.previous_actions[tl_id] = action
         except Exception as e:
             print(f"Error in _process_rl_learning: {e}")
     def _create_state_vector(self, lane_id, lane_data):
@@ -1206,22 +1358,30 @@ class UniversalSmartTrafficController:
             return 0.0, {}, 0.0
 
     def end_episode(self):
-        """Finalize episode and save data"""
-        try:
-            n_entries = len(self.rl_agent.training_data)  # <--- Save before clearing
-            self.rl_agent.save_model(adaptive_params=self.adaptive_params)
-            rewards = [entry['reward'] for entry in self.rl_agent.training_data if 'reward' in entry]
-            avg_reward = np.mean(rewards) if rewards else 0
-            performance_stats = {'avg_reward': avg_reward}
-            self._update_adaptive_parameters(performance_stats)
-            print(f"✅ Episode {self.current_episode} completed")
-            print(f"📊 Added {n_entries} training data entries this episode.")  # <--- Use the saved value
-            print(f"ℹ️  Average reward this episode: {avg_reward:.3f}")
-            # Reset episode-specific state
-            self.previous_states.clear()
-            self.previous_actions.clear()
-        except Exception as e:
-            print(f"Error ending episode: {e}")
+        # Update adaptive parameters based on recent reward history
+        if self.rl_agent.reward_history:
+            avg_reward = np.mean(self.rl_agent.reward_history)
+            print(f"Average reward this episode: {avg_reward:.2f}")
+            # Example adaptive parameter update logic:
+            if avg_reward < -10:  # High queues/waits (bad)
+                self.adaptive_params['min_green'] = min(self.adaptive_params['min_green'] + 1, self.adaptive_params['max_green'])
+                self.adaptive_params['max_green'] = min(self.adaptive_params['max_green'] + 5, 120)
+            elif avg_reward > -2:  # Low queues/waits (good)
+                self.adaptive_params['min_green'] = max(self.adaptive_params['min_green'] - 1, 5)
+                self.adaptive_params['max_green'] = max(self.adaptive_params['max_green'] - 5, 30)
+        else:
+            print("No reward history for adaptive param update.")
+        self.rl_agent.adaptive_params = self.adaptive_params.copy()
+
+        print("🔄 Updated adaptive parameters:", self.adaptive_params)
+        self.rl_agent.save_model(adaptive_params=self.adaptive_params)
+        print(f"🚦 Epsilon after training/episode: {self.rl_agent.epsilon}")  # <--- Add here
+
+        # Clear for next episode
+        self.previous_states.clear()
+        self.previous_actions.clear()
+        self.rl_agent.reward_history.clear()
+
     def _update_adaptive_parameters(self, performance_stats):
         """Dynamically adjust control parameters based on performance"""
         try:
@@ -1244,7 +1404,6 @@ class UniversalSmartTrafficController:
 def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episodes=1, num_retries=1, retry_delay=1, mode="train"):
     controller = None
     try:
-        controller = UniversalSmartTrafficController(sumocfg_path=sumocfg_path, mode=mode)
         for episode in range(episodes):
             print(f"\n{'='*50}")
             print(f"🚦 STARTING UNIVERSAL EPISODE {episode + 1}/{episodes}")
@@ -1256,34 +1415,20 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
                 '--start', '--quit-on-end'
             ]
             traci.start(sumo_cmd)
+            controller = UniversalSmartTrafficController(sumocfg_path=sumocfg_path, mode=mode)
+            controller.initialize()
             controller.current_episode = episode + 1
-
-            controller.lane_id_list = traci.lane.getIDList()
-            controller.num_lanes = len(controller.lane_id_list)
-            controller.lane_id_to_idx = {lid: i for i, lid in enumerate(controller.lane_id_list)}
-            controller.idx_to_lane_id = {i: lid for i, lid in enumerate(controller.lane_id_list)}
-            controller.lane_scores = np.zeros(controller.num_lanes)
-            controller.lane_states = np.full(controller.num_lanes, "UNKNOWN", dtype=object)
-            controller.consecutive_states = np.zeros(controller.num_lanes, dtype=int)
-            controller.last_green_time = np.zeros(controller.num_lanes)
-            controller.last_arrival_time = np.zeros(controller.num_lanes)
-            controller.last_lane_vehicles = [set() for _ in range(controller.num_lanes)]
-            print(f"Collected lane data for {controller.num_lanes} lanes after simulation started.")
-
             step = 0
+            tstart = time.time()
             while traci.simulation.getMinExpectedNumber() > 0:
                 if max_steps and step >= max_steps:
                     print(f"Reached max steps ({max_steps}), ending episode.")
                     break
-                try:
-                    traci.simulationStep()
-                    controller.run_step()
-                    step += 1
-                    if step % 200 == 0:
-                        print(f"Episode {episode + 1}: Step {step} completed")
-                except Exception as e:
-                    print(f"Error in simulation step {step}: {e}")
-                    break
+                controller.run_step()
+                traci.simulationStep()
+                step += 1
+                if step % 200 == 0:
+                    print(f"Episode {episode + 1}: Step {step} completed, elapsed: {time.time()-tstart:.2f}s")
             print(f"Episode {episode + 1} completed after {step} steps")
             controller.end_episode()
             traci.close()
