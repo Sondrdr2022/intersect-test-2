@@ -1,280 +1,183 @@
-import os
-import sys
-import traci
-import numpy as np
-import time
-import datetime
-import pickle
 from collections import defaultdict
-import warnings
+import os, sys, traci, warnings, time,traceback,pickle,datetime
+import pandas as np
 warnings.filterwarnings('ignore')
-import traceback
 
 # SUMO_HOME setup
-if 'SUMO_HOME' not in os.environ:
-    os.environ['SUMO_HOME'] = r'C:\Program Files (x86)\Eclipse\Sumo'
+os.environ.setdefault('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
 tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
-if tools not in sys.path:
-    sys.path.append(tools)
+if tools not in sys.path: sys.path.append(tools)
 
-def subscribe_lanes(lane_id_list):
-    for lane_id in lane_id_list:
-        traci.lane.subscribe(lane_id, [
+def subscribe_lanes(lane_ids):
+    for lid in lane_ids:
+        traci.lane.subscribe(lid, [
             traci.constants.LAST_STEP_VEHICLE_NUMBER,
             traci.constants.LAST_STEP_MEAN_SPEED,
             traci.constants.LAST_STEP_VEHICLE_HALTING_NUMBER,
         ])
 
 def detect_turning_lanes_with_traci():
-    left_turn_lanes = set()
-    right_turn_lanes = set()
-    for lane_id in traci.lane.getIDList():
-        links = traci.lane.getLinks(lane_id)
-        for conn in links:
-            if len(conn) > 6:
-                if conn[6] == 'l':
-                    left_turn_lanes.add(lane_id)
-                if conn[6] == 'r':
-                    right_turn_lanes.add(lane_id)
-            elif len(conn) > 3:
-                if conn[3] == 'l':
-                    left_turn_lanes.add(lane_id)
-                if conn[3] == 'r':
-                    right_turn_lanes.add(lane_id)
-    return left_turn_lanes, right_turn_lanes
-
+    left, right = set(), set()
+    for lid in traci.lane.getIDList():
+        for c in traci.lane.getLinks(lid):
+            idx = 6 if len(c)>6 else 3 if len(c)>3 else None
+            if idx and c[idx] == 'l': left.add(lid)
+            if idx and c[idx] == 'r': right.add(lid)
+    return left, right
 class EnhancedQLearningAgent:
     def __init__(self, state_size, action_size, learning_rate=0.1, discount_factor=0.95, 
                  epsilon=0.1, epsilon_decay=0.995, min_epsilon=0.01, 
                  q_table_file="enhanced_q_table.pkl", mode="train", adaptive_params=None):
-        self.state_size = state_size
-        self.action_size = action_size
-        self.learning_rate = learning_rate
-        self.discount_factor = discount_factor
-        self.epsilon = epsilon
-        self.epsilon_decay = epsilon_decay
-        self.min_epsilon = min_epsilon
-        self.q_table = {}
-        self.training_data = []
-        self.q_table_file = q_table_file
-        self._loaded_training_count = 0
-        self.reward_components = []
-        self.reward_history = []
-        self.learning_rate_decay = 0.999
-        self.min_learning_rate = 0.01
-        self.consecutive_no_improvement = 0
-        self.max_no_improvement = 100
+        self.state_size, self.action_size = state_size, action_size
+        self.learning_rate, self.discount_factor = learning_rate, discount_factor
+        self.epsilon, self.epsilon_decay, self.min_epsilon = epsilon, epsilon_decay, min_epsilon
+        self.q_table, self.training_data = {}, []
+        self.q_table_file, self._loaded_training_count = q_table_file, 0
+        self.reward_components, self.reward_history = [], []
+        self.learning_rate_decay, self.min_learning_rate = 0.999, 0.01
+        self.consecutive_no_improvement, self.max_no_improvement = 0, 100
         self.mode = mode
-
-        # ADD THIS BLOCK:
         self.adaptive_params = adaptive_params or {
-            'min_green': 30,
-            'max_green': 80,
-            'starvation_threshold': 40,
-            'reward_scale': 40,
-            'queue_weight': 0.6,
-            'wait_weight': 0.3,
-            'flow_weight': 0.5,
-            'speed_weight': 0.2,
-            'left_turn_priority': 1.2
+            'min_green': 30, 'max_green': 80, 'starvation_threshold': 40, 'reward_scale': 40,
+            'queue_weight': 0.6, 'wait_weight': 0.3, 'flow_weight': 0.5, 'speed_weight': 0.2, 'left_turn_priority': 1.2
         }
-
-        if self.mode == "eval":
-            self.epsilon = 0.0
-        elif self.mode == "adaptive":
-            self.epsilon = 0.01
-            
+        if mode == "eval": self.epsilon = 0.0
+        elif mode == "adaptive": self.epsilon = 0.01
         print(f"AGENT INIT: mode={self.mode}, epsilon={self.epsilon}")
 
     def is_valid_state(self, state):
-        if not isinstance(state, (list, np.ndarray)):
-            return False
-        state_array = np.array(state)
-        if np.isnan(state_array).any() or np.isinf(state_array).any():
-            return False
-        if (np.abs(state_array) > 100).any():
-            return False
-        if state_array.size != self.state_size:
-            return False
-        # Prevent all-zeros (likely dummy state)
-        if np.all(state_array == 0):
-            return False
-        return True
-
+        arr = np.array(state)
+        return (
+            isinstance(state, (list, np.ndarray))
+            and arr.size == self.state_size
+            and not (np.isnan(arr).any() or np.isinf(arr).any())
+            and (np.abs(arr) <= 100).all()
+            and not np.all(arr == 0)
+        )
     def get_action(self, state, tl_id=None, action_size=None):
-        state_key = self._state_to_key(state, tl_id)
-        if action_size is None:
-            action_size = self.action_size
-        state_key = self._state_to_key(state, tl_id)
-        if state_key not in self.q_table or len(self.q_table[state_key]) < action_size:
-            self.q_table[state_key] = np.zeros(action_size)
-        if self.mode == "train":
-            if np.random.rand() < self.epsilon:
-                return np.random.randint(0, action_size)
-            else:
-                return np.argmax(self.q_table[state_key][:action_size])
-        else:
-            return np.argmax(self.q_table[state_key][:action_size])
+        action_size = action_size or self.action_size
+        key = self._state_to_key(state, tl_id)
+        if key not in self.q_table or len(self.q_table[key]) < action_size:
+            self.q_table[key] = np.zeros(action_size)
+        qs = self.q_table[key][:action_size]
+        if self.mode == "train" and np.random.rand() < self.epsilon:
+            return np.random.randint(action_size)
+        return np.argmax(qs)
 
     def _state_to_key(self, state, tl_id=None):
         try:
-            if isinstance(state, np.ndarray):
-                key = tuple(np.round(state, 2))
-            elif isinstance(state, list):
-                state_array = np.round(np.array(state), 2)
-                key = tuple(state_array.tolist())
+            if isinstance(state, (np.ndarray, list)):
+                arr = np.round(np.array(state), 2)
+                key = tuple(arr.tolist())
             else:
                 key = tuple(state) if hasattr(state, '__iter__') else (state,)
-            if tl_id is not None:
-                return (tl_id, key)
-            return key
+            return (tl_id, key) if tl_id is not None else key
         except Exception:
             return (tl_id, (0,)) if tl_id is not None else (0,)
-        
+
     def update_q_table(self, state, action, reward, next_state, tl_id=None, extra_info=None, action_size=None):
-        if self.mode == "eval":
-            return
-        if not self.is_valid_state(state) or not self.is_valid_state(next_state):
+        if self.mode == "eval" or not self.is_valid_state(state) or not self.is_valid_state(next_state):
             return
         if reward is None or np.isnan(reward) or np.isinf(reward):
             return
-        
-        if action_size is None:
-            action_size = self.action_size
-        state_key = self._state_to_key(state, tl_id)
-        next_state_key = self._state_to_key(next_state, tl_id)
-        state_key = self._state_to_key(state, tl_id)
-        next_state_key = self._state_to_key(next_state, tl_id)
-        if state_key not in self.q_table or len(self.q_table[state_key]) < action_size:
-            self.q_table[state_key] = np.zeros(action_size)
-        if next_state_key not in self.q_table or len(self.q_table[next_state_key]) < action_size:
-            self.q_table[next_state_key] = np.zeros(action_size)
-        current_q = self.q_table[state_key][action]
-        max_next_q = np.max(self.q_table[next_state_key])
-        new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
-        if np.isnan(new_q) or np.isinf(new_q):
-            new_q = current_q
-        self.q_table[state_key][action] = new_q
+        action_size = action_size or self.action_size
+        sk, nsk = self._state_to_key(state, tl_id), self._state_to_key(next_state, tl_id)
+        for k in [sk, nsk]:
+            if k not in self.q_table or len(self.q_table[k]) < action_size:
+                self.q_table[k] = np.zeros(action_size)
+        q, nq = self.q_table[sk][action], np.max(self.q_table[nsk])
+        new_q = q + self.learning_rate * (reward + self.discount_factor * nq - q)
+        self.q_table[sk][action] = new_q if not (np.isnan(new_q) or np.isinf(new_q)) else q
 
-        # Always ensure reward is present and not overwritten by extra_info
         entry = {
             'state': state.tolist() if isinstance(state, np.ndarray) else state,
-            'action': action,
-            'reward': reward,
+            'action': action, 'reward': reward,
             'next_state': next_state.tolist() if isinstance(next_state, np.ndarray) else next_state,
-            'q_value': new_q,
-            'timestamp': time.time(),
-            'learning_rate': self.learning_rate,
-            'epsilon': self.epsilon,
-            'tl_id': tl_id,
-            'adaptive_params': self.adaptive_params.copy()
+            'q_value': self.q_table[sk][action], 'timestamp': time.time(),
+            'learning_rate': self.learning_rate, 'epsilon': self.epsilon,
+            'tl_id': tl_id, 'adaptive_params': self.adaptive_params.copy()
         }
         if extra_info:
-            # Prevent extra_info from overwriting a valid reward with None/missing
             entry.update({k: v for k, v in extra_info.items() if k != "reward"})
-
         self.training_data.append(entry)
         self._update_adaptive_parameters(reward)
 
-
     def _get_action_name(self, action):
-        action_names = {
-            0: "Set Green",
-            1: "Next Phase",
-            2: "Extend Phase",
-            3: "Shorten Phase",
-            4: "Balanced Phase"
-        }
-        return action_names.get(action, f"Unknown Action {action}")
-
+        return {
+            0: "Set Green", 1: "Next Phase", 2: "Extend Phase",
+            3: "Shorten Phase", 4: "Balanced Phase"
+        }.get(action, f"Unknown Action {action}")
 
     def _update_adaptive_parameters(self, reward):
         self.reward_history.append(reward)
         if len(self.reward_history) > 100:
             self.reward_history.pop(0)
+
         if self.mode == "train":
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+
         if reward < -20:
             self.adaptive_params['min_green'] = min(self.adaptive_params['min_green'] + 1, self.adaptive_params['max_green'])
         elif reward > -5:
             self.adaptive_params['min_green'] = max(self.adaptive_params['min_green'] - 1, 5)
+
         if len(self.reward_history) >= 50:
             recent_avg = np.mean(self.reward_history[-50:])
             older_avg = np.mean(self.reward_history[-100:-50])
-            if recent_avg <= older_avg:
-                self.consecutive_no_improvement += 1
-            else:
-                self.consecutive_no_improvement = 0
+            self.consecutive_no_improvement = (
+                self.consecutive_no_improvement + 1 if recent_avg <= older_avg else 0
+            )
             if self.consecutive_no_improvement > self.max_no_improvement:
                 self.learning_rate = max(self.min_learning_rate, self.learning_rate * self.learning_rate_decay)
                 self.consecutive_no_improvement = 0
 
     def load_model(self, filepath=None):
-        if filepath is None:
-            filepath = self.q_table_file
-        print("Attempting to load Q-table from:", filepath)
-        print("Absolute path:", os.path.abspath(filepath))
-        print("File exists?", os.path.exists(filepath))
+        filepath = filepath or self.q_table_file
+        print(f"Attempting to load Q-table from: {filepath}\nAbsolute path: {os.path.abspath(filepath)}\nFile exists? {os.path.exists(filepath)}")
         try:
             if os.path.exists(filepath):
                 with open(filepath, 'rb') as f:
-                    model_data = pickle.load(f)
-                self.q_table = {}
-                loaded_q_table = model_data.get('q_table', {})
-                for k, v in loaded_q_table.items():
-                    self.q_table[k] = np.array(v)
-                self._loaded_training_count = len(model_data.get('training_data', []))
-                params = model_data.get('params', {})
+                    data = pickle.load(f)
+                self.q_table = {k: np.array(v) for k, v in data.get('q_table', {}).items()}
+                self._loaded_training_count = len(data.get('training_data', []))
+                params = data.get('params', {})
                 self.learning_rate = params.get('learning_rate', self.learning_rate)
                 self.discount_factor = params.get('discount_factor', self.discount_factor)
-                #self.epsilon = params.get('epsilon', self.epsilon)
-                adaptive_params = model_data.get('adaptive_params', {})
-                print(f"After model load, epsilon={self.epsilon}")  # <--- Add this line here
-
+                adaptive_params = data.get('adaptive_params', {})
+                print(f"After model load, epsilon={self.epsilon}")
                 print(f"Loaded Q-table with {len(self.q_table)} states from {filepath}")
-                if adaptive_params:
-                    print(f"📋 Loaded adaptive parameters from previous run")
+                if adaptive_params: print("📋 Loaded adaptive parameters from previous run")
                 return True, adaptive_params
-            else:
-                print("No existing Q-table, starting fresh")
-                return False, {}
-        except Exception as e:
-            print(f"Error loading model: {e}")
             print("No existing Q-table, starting fresh")
             return False, {}
-        
+        except Exception as e:
+            print(f"Error loading model: {e}\nNo existing Q-table, starting fresh")
+            return False, {}
+
     def save_model(self, filepath=None, adaptive_params=None):
-        if filepath is None:
-            filepath = self.q_table_file
+        filepath = filepath or self.q_table_file
         try:
             if os.path.exists(filepath):
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_path = f"{filepath}.bak_{timestamp}"
+                backup = f"{filepath}.bak_{datetime.datetime.now():%Y%m%d_%H%M%S}"
                 for _ in range(3):
                     try:
-                        os.rename(filepath, backup_path)
+                        os.rename(filepath, backup)
                         break
                     except Exception as e:
                         print(f"Retrying backup: {e}")
                         time.sleep(0.5)
+            meta = {
+                'last_updated': datetime.datetime.now().isoformat(),
+                'training_count': len(self.training_data),
+                'average_reward': np.mean([x.get('reward', 0) for x in self.training_data[-100:]]) if self.training_data else 0,
+                'reward_components': [x.get('reward_components', {}) for x in self.training_data[-100:]]
+            }
+            params = {k: getattr(self, k) for k in ['state_size','action_size','learning_rate','discount_factor','epsilon','epsilon_decay','min_epsilon']}
             model_data = {
                 'q_table': {k: v.tolist() for k, v in self.q_table.items()},
                 'training_data': self.training_data,
-                'params': {
-                    'state_size': self.state_size,
-                    'action_size': self.action_size,
-                    'learning_rate': self.learning_rate,
-                    'discount_factor': self.discount_factor,
-                    'epsilon': self.epsilon,
-                    'epsilon_decay': self.epsilon_decay,
-                    'min_epsilon': self.min_epsilon
-                },
-                'metadata': {
-                    'last_updated': datetime.datetime.now().isoformat(),
-                    'training_count': len(self.training_data),
-                    'average_reward': np.mean([x.get('reward', 0) for x in self.training_data[-100:]]) if self.training_data else 0,
-                    'reward_components': [x.get('reward_components', {}) for x in self.training_data[-100:]]
-                }
+                'params': params,
+                'metadata': meta
             }
             if adaptive_params:
                 model_data['adaptive_params'] = adaptive_params.copy()
@@ -287,39 +190,46 @@ class EnhancedQLearningAgent:
             print(f"Error saving model: {e}")
 
 # Universal Smart Traffic Controller using full logic from SmartTrafficController
+from collections import defaultdict
+import numpy as np
+
 class UniversalSmartTrafficController:
     DILEMMA_ZONE_THRESHOLD = 12.0  # meters
 
     def __init__(self, sumocfg_path=None, mode="train"):
         self.mode = mode
-        self.tl_action_sizes = {}
         self.step_count = 0
+        self.current_episode = 0
+        self.max_consecutive_left = 1
 
+        # Lane and intersection management
         self.left_turn_lanes = set()
         self.right_turn_lanes = set()
-        self.ambulance_active = defaultdict(bool)
-        self.ambulance_start_time = defaultdict(float)
+        self.lane_id_list = []  # Initialize appropriately elsewhere
         self.lane_id_to_idx = {}
         self.idx_to_lane_id = {}
-        self.intersection_data = {}  # Store intersection data
-        self.tl_logic_cache = {}     # Cache traffic light logic
-        self.lane_to_tl = {}         # Lane to traffic light mapping
-        self.phase_utilization = defaultdict(int)  # Phase tracking
-        self.lane_id_list = []       # You must initialize this in your code elsewhere
-        self.last_green_time = np.zeros(len(self.lane_id_list))  # Lane tracking
+        self.lane_to_tl = {}
+        self.tl_action_sizes = {}
+        self.last_green_time = np.zeros(len(self.lane_id_list))
+
+        # Traffic light and intersection data
+        self.intersection_data = {}
+        self.tl_logic_cache = {}
+        self.phase_utilization = defaultdict(int)
+        self.last_phase_change = {}
+
+        # Ambulance and phase tracking
+        self.ambulance_active = defaultdict(bool)
+        self.ambulance_start_time = defaultdict(float)
+        self.left_phase_counter = defaultdict(int)
+
+        # RL agent & memory
         self.previous_states = {}
         self.previous_actions = {}
-        self.step_count = 0
-          # Ensure reward history ex
-        self.last_phase_change = {}
-        self.intersection_data = {}  # Add this to store intersection data
-        self.tl_logic_cache = {}  # Add this for traffic light logic caching
-        self.lane_to_tl = {}  # Add this for lane to traffic light mapping
-        self.phase_utilization = defaultdict(int)  # Add this for phase tracking
-        self.current_episode = 0
-        
+        self.rl_agent = EnhancedQLearningAgent(state_size=10, action_size=8, mode=mode)
+        self.rl_agent.load_model()
 
-        # Adaptive params for speed and fairness
+        # Adaptive parameters
         self.adaptive_params = {
             'min_green': 30,
             'max_green': 80,
@@ -331,15 +241,6 @@ class UniversalSmartTrafficController:
             'speed_weight': 0.2,
             'left_turn_priority': 1.2
         }
-
-        self.rl_agent = EnhancedQLearningAgent(state_size=10, action_size=8, mode=mode)
-        self.rl_agent.load_model()
-        
-        self.previous_states = {}
-        self.previous_actions = {}
-        self.left_phase_counter = defaultdict(lambda: 0)
-        self.max_consecutive_left = 1
-
     def initialize(self):
         # 1. Get the lane list from SUMO
         self.lane_id_list = traci.lane.getIDList()
@@ -364,6 +265,29 @@ class UniversalSmartTrafficController:
         print(f"Auto-detected right-turn lanes: {sorted(self.right_turn_lanes)}")
 
     # Remove any logic involving target_lane/current_time here!
+    def _switch_phase_with_yellow(self, tl_id, target_phase, current_phase, logic):
+        """
+        Switch from current_phase to target_phase, ensuring yellow phase is inserted if needed.
+        """
+        current_state = logic.phases[current_phase].state
+        next_state = logic.phases[target_phase].state
+        # Check for any green-to-red transitions
+        for i, (c, n) in enumerate(zip(current_state, next_state)):
+            if c.upper() == 'G' and n.upper() == 'R':
+                # Look for a yellow phase matching this transition
+                for idx, phase in enumerate(logic.phases):
+                    if (phase.state[i].upper() == 'Y' and
+                        current_state[i].upper() == 'G' and
+                        next_state[i].upper() == 'R'):
+                        # Found yellow phase
+                        traci.trafficlight.setPhase(tl_id, idx)
+                        # Use the phase's duration or a default (say, 3s)
+                        dur = getattr(phase, 'duration', 3)
+                        traci.trafficlight.setPhaseDuration(tl_id, dur)
+                        self.last_phase_change[tl_id] = traci.simulation.getTime()
+                        print(f"Inserted yellow phase at {tl_id} before switching to phase {target_phase}")
+                        return True  # Yellow phase inserted; must wait before switching to target_phase
+        return False  # No yellow needed
     def _init_left_turn_lanes(self):
         try:
             self.left_turn_lanes.clear()
@@ -586,25 +510,23 @@ class UniversalSmartTrafficController:
             current_time = traci.simulation.getTime()
             self.intersection_data = {}
 
-            # 1. Collect lane data once for the whole network
             lane_data = self._collect_enhanced_lane_data()
 
             for tl_id in traci.trafficlight.getIDList():
                 controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
 
-                # 2. Emergency priority (ambulance) check
+                # Emergency priority (ambulance) check
                 if self._handle_ambulance_priority(tl_id, controlled_lanes, lane_data, current_time):
                     continue
 
-                # 3. Protected left turn check
+                # Protected left turn check
                 if self._handle_protected_left_turn(tl_id, controlled_lanes, lane_data, current_time):
                     continue
 
-                # 4. Gather intersection-level state
+                # Gather intersection-level state
                 queues = [lane_data[l]['queue_length'] for l in controlled_lanes if l in lane_data]
                 waits = [lane_data[l]['waiting_time'] for l in controlled_lanes if l in lane_data]
                 speeds = [lane_data[l]['mean_speed'] for l in controlled_lanes if l in lane_data]
-
                 left_q = sum(lane_data[l]['queue_length'] for l in controlled_lanes if l in self.left_turn_lanes and l in lane_data)
                 right_q = sum(lane_data[l]['queue_length'] for l in controlled_lanes if l in self.right_turn_lanes and l in lane_data)
 
@@ -620,61 +542,46 @@ class UniversalSmartTrafficController:
                     'current_phase': current_phase
                 }
 
-                # 5. Hard starvation prevention: force green if any lane is starved
-                starved_lane = None
-                max_starve = 0
+                # Starvation prevention: force green if any lane is starved
+                most_starved_lane = None
+                max_starve_time = 0
                 for lane in controlled_lanes:
                     idx = self.lane_id_to_idx.get(lane, None)
                     if idx is not None:
-                        starve = current_time - self.last_green_time[idx]
-                        if starve > self.adaptive_params['starvation_threshold'] and starve > max_starve:
-                            starved_lane = lane
-                            max_starve = starve
-                if starved_lane:
-                    starved_phase = self._find_phase_for_lane(tl_id, starved_lane)
+                        time_since_green = current_time - self.last_green_time[idx]
+                        if time_since_green > self.adaptive_params['starvation_threshold'] and time_since_green > max_starve_time:
+                            most_starved_lane = lane
+                            max_starve_time = time_since_green
+                if most_starved_lane:
+                    starved_phase = self._find_phase_for_lane(tl_id, most_starved_lane)
                     if current_phase != starved_phase:
-                        # Only switch if not in dilemma zone
-                        if not self._is_in_dilemma_zone(tl_id, controlled_lanes, lane_data):
-                            traci.trafficlight.setPhase(tl_id, starved_phase)
-                            traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
-                            self.last_phase_change[tl_id] = current_time
-                    continue  # skip RL for this intersection this step
+                        traci.trafficlight.setPhase(tl_id, starved_phase)
+                        traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
+                        self.last_phase_change[tl_id] = current_time
+                        print(f"[{current_time:.1f}s] Force green for starved lane {most_starved_lane} at intersection {tl_id}, waited {max_starve_time:.1f}s")
+                    self.last_green_time[self.lane_id_to_idx[most_starved_lane]] = current_time
+                    continue
 
-                # 6. RL per-intersection phase selection
+                # RL per-intersection phase selection
+                logic = self._get_traffic_light_logic(tl_id)
                 state = self._create_intersection_state_vector(tl_id, self.intersection_data)
                 action = self.rl_agent.get_action(state, tl_id, action_size=n_phases)
                 last_change = self.last_phase_change.get(tl_id, -9999)
                 time_since_last_change = current_time - last_change
 
-                # 7. Dilemma zone and yellow phase enforcement
+                # Only switch if min_green has elapsed and not already in target phase
                 if time_since_last_change >= self.adaptive_params['min_green'] and action != current_phase:
+                    # Dilemma zone check
                     if not self._is_in_dilemma_zone(tl_id, controlled_lanes, lane_data):
-                        logic = self._get_traffic_light_logic(tl_id)
                         yellow_inserted = False
                         if logic:
-                            next_phase_state = logic.phases[action].state
-                            for i, (cur_sig, next_sig) in enumerate(zip(logic.phases[current_phase].state, next_phase_state)):
-                                if cur_sig.upper() == 'G' and next_sig.upper() == 'R':
-                                    # Find yellow phase (if present) for this transition
-                                    yellow_phase = None
-                                    for idx, phase in enumerate(logic.phases):
-                                        if (phase.state[i].upper() == 'Y' and
-                                            logic.phases[current_phase].state[i].upper() == 'G' and
-                                            next_phase_state[i].upper() == 'R'):
-                                            yellow_phase = idx
-                                            break
-                                    if yellow_phase is not None and yellow_phase != current_phase:
-                                        traci.trafficlight.setPhase(tl_id, yellow_phase)
-                                        traci.trafficlight.setPhaseDuration(tl_id, 3)  # 3s yellow
-                                        self.last_phase_change[tl_id] = current_time
-                                        yellow_inserted = True
-                                        break
+                            yellow_inserted = self._switch_phase_with_yellow(tl_id, action, current_phase, logic)
                         if not yellow_inserted:
                             traci.trafficlight.setPhase(tl_id, action)
                             traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
                             self.last_phase_change[tl_id] = current_time
 
-            # 8. RL learning step
+            # RL learning step
             self._process_rl_learning(self.intersection_data, current_time)
 
         except Exception as e:
