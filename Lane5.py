@@ -96,19 +96,25 @@ class EnhancedQLearningAgent:
             return False
         if state_array.size != self.state_size:
             return False
+        # Prevent all-zeros (likely dummy state)
+        if np.all(state_array == 0):
+            return False
         return True
 
-    def get_action(self, state, tl_id=None):
+    def get_action(self, state, tl_id=None, action_size=None):
         state_key = self._state_to_key(state, tl_id)
-        if state_key not in self.q_table:
-            self.q_table[state_key] = np.zeros(self.action_size)
+        if action_size is None:
+            action_size = self.action_size
+        state_key = self._state_to_key(state, tl_id)
+        if state_key not in self.q_table or len(self.q_table[state_key]) < action_size:
+            self.q_table[state_key] = np.zeros(action_size)
         if self.mode == "train":
             if np.random.rand() < self.epsilon:
-                return np.random.randint(0, self.action_size)
+                return np.random.randint(0, action_size)
             else:
-                return np.argmax(self.q_table[state_key])
+                return np.argmax(self.q_table[state_key][:action_size])
         else:
-            return np.argmax(self.q_table[state_key])
+            return np.argmax(self.q_table[state_key][:action_size])
 
     def _state_to_key(self, state, tl_id=None):
         try:
@@ -125,20 +131,24 @@ class EnhancedQLearningAgent:
         except Exception:
             return (tl_id, (0,)) if tl_id is not None else (0,)
         
-    def update_q_table(self, state, action, reward, next_state, tl_id=None, extra_info=None):
+    def update_q_table(self, state, action, reward, next_state, tl_id=None, extra_info=None, action_size=None):
         if self.mode == "eval":
             return
         if not self.is_valid_state(state) or not self.is_valid_state(next_state):
             return
         if reward is None or np.isnan(reward) or np.isinf(reward):
-            reward = 0.0
-
+            return
+        
+        if action_size is None:
+            action_size = self.action_size
         state_key = self._state_to_key(state, tl_id)
         next_state_key = self._state_to_key(next_state, tl_id)
-        if state_key not in self.q_table:
-            self.q_table[state_key] = np.zeros(self.action_size)
-        if next_state_key not in self.q_table:
-            self.q_table[next_state_key] = np.zeros(self.action_size)
+        state_key = self._state_to_key(state, tl_id)
+        next_state_key = self._state_to_key(next_state, tl_id)
+        if state_key not in self.q_table or len(self.q_table[state_key]) < action_size:
+            self.q_table[state_key] = np.zeros(action_size)
+        if next_state_key not in self.q_table or len(self.q_table[next_state_key]) < action_size:
+            self.q_table[next_state_key] = np.zeros(action_size)
         current_q = self.q_table[state_key][action]
         max_next_q = np.max(self.q_table[next_state_key])
         new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
@@ -278,14 +288,17 @@ class EnhancedQLearningAgent:
 
 # Universal Smart Traffic Controller using full logic from SmartTrafficController
 class UniversalSmartTrafficController:
+    DILEMMA_ZONE_THRESHOLD = 12.0  # meters
+
     def __init__(self, sumocfg_path=None, mode="train"):
         self.mode = mode
+        self.tl_action_sizes = {}
         self.step_count = 0
+
         self.left_turn_lanes = set()
         self.right_turn_lanes = set()
         self.ambulance_active = defaultdict(bool)
         self.ambulance_start_time = defaultdict(float)
-        self.lane_id_list = []
         self.lane_id_to_idx = {}
         self.idx_to_lane_id = {}
         self.intersection_data = {}  # Store intersection data
@@ -303,7 +316,6 @@ class UniversalSmartTrafficController:
         self.tl_logic_cache = {}  # Add this for traffic light logic caching
         self.lane_to_tl = {}  # Add this for lane to traffic light mapping
         self.phase_utilization = defaultdict(int)  # Add this for phase tracking
-        self.last_green_time = np.zeros(len(self.lane_id_list))  # Add this for lane tracking
         self.current_episode = 0
         
 
@@ -331,6 +343,10 @@ class UniversalSmartTrafficController:
     def initialize(self):
         # 1. Get the lane list from SUMO
         self.lane_id_list = traci.lane.getIDList()
+        self.tl_action_sizes = {
+            tl_id: len(traci.trafficlight.getAllProgramLogics(tl_id)[0].phases)
+            for tl_id in traci.trafficlight.getIDList()
+        }
 
         # 2. Set up lane index mappings
         self.lane_id_to_idx = {lid: i for i, lid in enumerate(self.lane_id_list)}
@@ -362,6 +378,36 @@ class UniversalSmartTrafficController:
         except Exception as e:
             print(f"Error initializing left-turn lanes: {e}")
     
+    def _is_in_dilemma_zone(self, tl_id, controlled_lanes, lane_data):
+        """Check if any vehicle is in the dilemma zone for lanes about to switch from green to red."""
+        try:
+            logic = self._get_traffic_light_logic(tl_id)
+            if not logic:
+                return False
+            current_phase = traci.trafficlight.getPhase(tl_id)
+            state = logic.phases[current_phase].state
+            for lane_idx, lane in enumerate(controlled_lanes):
+                # Only check lanes with green signal
+                if lane_idx < len(state) and state[lane_idx].upper() == 'G':
+                    vehicle_ids = traci.lane.getLastStepVehicleIDs(lane)
+                    for vid in vehicle_ids:
+                        lane_pos = traci.vehicle.getLanePosition(vid)
+                        lane_length = traci.lane.getLength(lane)
+                        distance_to_stop = lane_length - lane_pos
+                        if 0 < distance_to_stop <= self.DILEMMA_ZONE_THRESHOLD:
+                            return True
+            return False
+        except Exception as e:
+            print(f"Error in _is_in_dilemma_zone: {e}")
+            return False
+
+    def _find_starved_lane(self, controlled_lanes, current_time):
+        """Find lane that is starved past the starvation threshold."""
+        for lane in controlled_lanes:
+            idx = self.lane_id_to_idx.get(lane, None)
+            if idx is not None and current_time - self.last_green_time[idx] > self.adaptive_params['starvation_threshold']:
+                return lane
+        return None
     
     def _handle_protected_left_turn(self, tl_id, controlled_lanes, lane_data, current_time):
         """
@@ -559,11 +605,10 @@ class UniversalSmartTrafficController:
                 waits = [lane_data[l]['waiting_time'] for l in controlled_lanes if l in lane_data]
                 speeds = [lane_data[l]['mean_speed'] for l in controlled_lanes if l in lane_data]
 
-                # Optionally, calculate left_q/right_q as sum/max for left/right turn lanes
                 left_q = sum(lane_data[l]['queue_length'] for l in controlled_lanes if l in self.left_turn_lanes and l in lane_data)
                 right_q = sum(lane_data[l]['queue_length'] for l in controlled_lanes if l in self.right_turn_lanes and l in lane_data)
 
-                n_phases = len(traci.trafficlight.getAllProgramLogics(tl_id)[0].phases)
+                n_phases = self.tl_action_sizes[tl_id]
                 current_phase = traci.trafficlight.getPhase(tl_id)
                 self.intersection_data[tl_id] = {
                     'queues': queues,
@@ -575,24 +620,65 @@ class UniversalSmartTrafficController:
                     'current_phase': current_phase
                 }
 
-                # 5. RL per-intersection phase selection
+                # 5. Hard starvation prevention: force green if any lane is starved
+                starved_lane = None
+                max_starve = 0
+                for lane in controlled_lanes:
+                    idx = self.lane_id_to_idx.get(lane, None)
+                    if idx is not None:
+                        starve = current_time - self.last_green_time[idx]
+                        if starve > self.adaptive_params['starvation_threshold'] and starve > max_starve:
+                            starved_lane = lane
+                            max_starve = starve
+                if starved_lane:
+                    starved_phase = self._find_phase_for_lane(tl_id, starved_lane)
+                    if current_phase != starved_phase:
+                        # Only switch if not in dilemma zone
+                        if not self._is_in_dilemma_zone(tl_id, controlled_lanes, lane_data):
+                            traci.trafficlight.setPhase(tl_id, starved_phase)
+                            traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
+                            self.last_phase_change[tl_id] = current_time
+                    continue  # skip RL for this intersection this step
+
+                # 6. RL per-intersection phase selection
                 state = self._create_intersection_state_vector(tl_id, self.intersection_data)
-                action = self.rl_agent.get_action(state, tl_id)
+                action = self.rl_agent.get_action(state, tl_id, action_size=n_phases)
                 last_change = self.last_phase_change.get(tl_id, -9999)
                 time_since_last_change = current_time - last_change
 
-                # 6. RL phase selection with min_green
+                # 7. Dilemma zone and yellow phase enforcement
                 if time_since_last_change >= self.adaptive_params['min_green'] and action != current_phase:
-                    traci.trafficlight.setPhase(tl_id, action)
-                    self.last_phase_change[tl_id] = current_time
+                    if not self._is_in_dilemma_zone(tl_id, controlled_lanes, lane_data):
+                        logic = self._get_traffic_light_logic(tl_id)
+                        yellow_inserted = False
+                        if logic:
+                            next_phase_state = logic.phases[action].state
+                            for i, (cur_sig, next_sig) in enumerate(zip(logic.phases[current_phase].state, next_phase_state)):
+                                if cur_sig.upper() == 'G' and next_sig.upper() == 'R':
+                                    # Find yellow phase (if present) for this transition
+                                    yellow_phase = None
+                                    for idx, phase in enumerate(logic.phases):
+                                        if (phase.state[i].upper() == 'Y' and
+                                            logic.phases[current_phase].state[i].upper() == 'G' and
+                                            next_phase_state[i].upper() == 'R'):
+                                            yellow_phase = idx
+                                            break
+                                    if yellow_phase is not None and yellow_phase != current_phase:
+                                        traci.trafficlight.setPhase(tl_id, yellow_phase)
+                                        traci.trafficlight.setPhaseDuration(tl_id, 3)  # 3s yellow
+                                        self.last_phase_change[tl_id] = current_time
+                                        yellow_inserted = True
+                                        break
+                        if not yellow_inserted:
+                            traci.trafficlight.setPhase(tl_id, action)
+                            traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
+                            self.last_phase_change[tl_id] = current_time
 
-            # 7. RL learning step
+            # 8. RL learning step
             self._process_rl_learning(self.intersection_data, current_time)
 
         except Exception as e:
             print(f"Error in run_step: {e}")
-
-
     def _collect_enhanced_lane_data(self):
         """Collect comprehensive lane data for complex networks (per lane, not per intersection).
         Returns a dictionary: lane_id -> lane_info_dict
@@ -1136,11 +1222,12 @@ class UniversalSmartTrafficController:
                 if tl_id not in intersection_data:
                     continue
 
+                # Extract intersection-level data
+                data = intersection_data[tl_id]
                 state = self._create_intersection_state_vector(tl_id, intersection_data)
                 if not self.rl_agent.is_valid_state(state):
                     continue
 
-                data = intersection_data[tl_id]
                 queues = data.get('queues', [])
                 waits = data.get('waits', [])
                 speeds = data.get('speeds', [])
@@ -1148,29 +1235,29 @@ class UniversalSmartTrafficController:
                 right_q = data.get('right_q', 0)
                 n_phases = data.get('n_phases', 0)
                 current_phase = data.get('current_phase', -1)
+
                 reward = -0.7 * sum(queues) - 0.3 * sum(waits)  # Simplified reward
-                raw_reward = reward  # If you have an unnormalized version, use it
+                raw_reward = reward
                 reward_components = {
                     "queue_penalty": -0.7 * sum(queues),
                     "wait_penalty": -0.3 * sum(waits),
                     "total_raw": reward,
-                    "normalized": reward,  # If you normalize, put here
+                    "normalized": reward,
                 }
+
                 # Update Q-table if previous state/action exist
                 if tl_id in self.previous_states and tl_id in self.previous_actions:
                     prev_state = self.previous_states[tl_id]
                     prev_action = self.previous_actions[tl_id]
-                    # Get q_value after update for logging
                     state_key = self.rl_agent._state_to_key(prev_state, tl_id)
                     q_value = (
                         float(self.rl_agent.q_table[state_key][prev_action])
                         if state_key in self.rl_agent.q_table else None
                     )
-                    # Compose a rich log entry
                     log_entry = {
                         'episode': getattr(self, 'current_episode', 0),
                         'simulation_time': current_time,
-                        'lane_id': "",  # For intersection RL, you may not have this
+                        'lane_id': "",
                         'edge_id': "",
                         'route_id': "",
                         'action': prev_action,
@@ -1180,12 +1267,12 @@ class UniversalSmartTrafficController:
                         'q_value': q_value,
                         'queue_length': max(queues) if queues else 0,
                         'waiting_time': max(waits) if waits else 0,
-                        'density': "",  # Not available at intersection level unless you sum/avg lanes
+                        'density': "",
                         'mean_speed': np.mean(speeds) if speeds else 0,
-                        'flow': "",  # Not available unless you sum across lanes
-                        'queue_route': "",  # Not available
-                        'flow_route': "",  # Not available
-                        'ambulance': "",  # Not available unless you scan all lanes
+                        'flow': "",
+                        'queue_route': "",
+                        'flow_route': "",
+                        'ambulance': "",
                         'left_turn': left_q,
                         'right_turn': right_q,
                         'tl_id': tl_id,
@@ -1195,14 +1282,14 @@ class UniversalSmartTrafficController:
                         'reward_components': reward_components,
                         'adaptive_params': self.adaptive_params.copy()
                     }
-                    # Pass to update_q_table for logging
                     self.rl_agent.update_q_table(
                         prev_state,
                         prev_action,
                         reward,
                         state,
                         tl_id=tl_id,
-                        extra_info=log_entry
+                        extra_info=log_entry,
+                        action_size=n_phases
                     )
 
                 # Store current state/action for next update
@@ -1211,6 +1298,7 @@ class UniversalSmartTrafficController:
                 self.previous_actions[tl_id] = action
         except Exception as e:
             print(f"Error in _process_rl_learning: {e}")
+            traceback.print_exc()
     def _create_state_vector(self, lane_id, lane_data):
         """Create comprehensive state vector"""
         try:
