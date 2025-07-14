@@ -3,7 +3,41 @@ import os, sys, traci, warnings,time,argparse,traceback,pickle,datetime
 import numpy as np
 from pyinstrument import Profiler
 warnings.filterwarnings('ignore')
+from flask import Flask, request, jsonify
 
+# === Flask app defined at module/global level ===
+app = Flask(__name__)
+controller = None  # global reference for the API
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'ok'})
+
+@app.route('/api/agent_params', methods=['GET'])
+def get_agent_params():
+    global controller
+    try:
+        if controller is None:
+            return jsonify({'error': 'Controller not initialized'}), 503
+        params = controller.rl_agent.adaptive_params
+        return jsonify(params)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/epsilon', methods=['GET'])
+def get_epsilon():
+    global controller
+    try:
+        if controller is None:
+            return jsonify({'error': 'Controller not initialized'}), 503
+        return jsonify({'epsilon': controller.rl_agent.epsilon})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/run_episode', methods=['POST'])
+def run_episode():
+    # Placeholder: You'd want to trigger an episode run here
+    return jsonify({'message': 'Episode run (not implemented in placeholder)'})
 
 # SUMO_HOME setup
 os.environ.setdefault('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
@@ -530,7 +564,7 @@ class UniversalSmartTrafficController:
                     continue
                 
                 # Normal RL control
-                queues = [lane_data[l]['queue_length'] for l in controlled_lanes if l in lane_data]
+                queues = np.array([lane_data[l]['queue_length'] for l in controlled_lanes if l in lane_data])
                 waits = [lane_data[l]['waiting_time'] for l in controlled_lanes if l in lane_data]
                 speeds = [lane_data[l]['mean_speed'] for l in controlled_lanes if l in lane_data]
                 left_q = sum(lane_data[l]['queue_length'] for l in controlled_lanes 
@@ -616,57 +650,74 @@ class UniversalSmartTrafficController:
         return None
 
     def _collect_enhanced_lane_data(self, vehicle_classes, all_vehicles):
-        lane_vehicle_ids = {}
         lane_data = {}
-        for lane_id in self.lane_id_list:
-            results = traci.lane.getSubscriptionResults(lane_id)
-            vehicle_ids = results.get(traci.constants.LAST_STEP_VEHICLE_ID_LIST, [])
-            vehicle_ids = [vid for vid in vehicle_ids if vid in all_vehicles]
+        lane_vehicle_ids = {}
+        lane_ids = self.lane_id_list
+
+        # Batch subscription results for all lanes
+        results_dict = {lid: traci.lane.getSubscriptionResults(lid) for lid in lane_ids}
+
+        # Preallocate numpy arrays for bulk stats
+        vehicle_count = np.zeros(len(lane_ids), dtype=np.float32)
+        mean_speed = np.zeros(len(lane_ids), dtype=np.float32)
+        queue_length = np.zeros(len(lane_ids), dtype=np.float32)
+        waiting_time = np.zeros(len(lane_ids), dtype=np.float32)
+        lane_length = np.array([self.lane_lengths.get(lid, 1.0) for lid in lane_ids], dtype=np.float32)
+        ambulance_mask = np.zeros(len(lane_ids), dtype=bool)
+
+        # Prepare vehicle ids array for all lanes
+        vehicle_ids_arr = []
+
+        # Gather all lane stats at once, vectorized where possible
+        for idx, lane_id in enumerate(lane_ids):
+            results = results_dict[lane_id]
             if not results:
+                vehicle_ids_arr.append([])
                 continue
-            try:
-                vehicle_count = results.get(traci.constants.LAST_STEP_VEHICLE_NUMBER, 0)
-                mean_speed = max(results.get(traci.constants.LAST_STEP_MEAN_SPEED, 0), 0.0)
-                queue_length = results.get(traci.constants.LAST_STEP_VEHICLE_HALTING_NUMBER, 0)
-                waiting_time = results.get(traci.constants.VAR_ACCUMULATED_WAITING_TIME, 0)
-                lane_length = self.lane_lengths[lane_id] 
-                if lane_length is None:
-                    continue 
 
-                def safe_count_classes(vehicle_ids):
-                    from collections import defaultdict
-                    counts = defaultdict(int)
-                    for vid in vehicle_ids:
-                        vclass = vehicle_classes.get(vid)
-                        if vclass: counts[vclass] += 1
-                    return counts
+            vids = results.get(traci.constants.LAST_STEP_VEHICLE_ID_LIST, [])
+            vids = [vid for vid in vids if vid in all_vehicles]
+            vehicle_ids_arr.append(vids)
+            vehicle_count[idx] = results.get(traci.constants.LAST_STEP_VEHICLE_NUMBER, 0)
+            mean_speed[idx] = max(results.get(traci.constants.LAST_STEP_MEAN_SPEED, 0), 0.0)
+            queue_length[idx] = results.get(traci.constants.LAST_STEP_VEHICLE_HALTING_NUMBER, 0)
+            waiting_time[idx] = results.get(traci.constants.VAR_ACCUMULATED_WAITING_TIME, 0)
+            ambulance_mask[idx] = any(vehicle_classes.get(vid) == 'emergency' for vid in vids)
 
-                lane_data[lane_id] = {
-                    'queue_length': queue_length,
-                    'waiting_time': waiting_time,
-                    'density': vehicle_count / lane_length,
-                    'mean_speed': mean_speed,
-                    'vehicle_ids': vehicle_ids,
-                    'flow': vehicle_count,
-                    'lane_id': lane_id,
-                    'edge_id': self.lane_edge_ids[lane_id],
-                    'route_id': self._get_route_for_lane(lane_id, all_vehicles),
-                    'ambulance': any(vehicle_classes.get(vid) == 'emergency' for vid in vehicle_ids),
-                    'vehicle_classes': safe_count_classes(vehicle_ids),
-                    'left_turn': lane_id in self.left_turn_lanes,
-                    'right_turn': lane_id in self.right_turn_lanes,
-                    'tl_id': self.lane_to_tl.get(lane_id, '')
-                }
-                #if vehicle_count > 0:
-                #    print(f"[DEBUG] Lane {lane_id} has {vehicle_count} vehicles: {vehicle_ids}")
-                #else:
-                #    print(f"[DEBUG] Lane {lane_id} is empty.")
-                # ---- END DEBUG ----
-            except Exception as e:
-                print(f"⚠️ Error collecting data for lane {lane_id}: {e}")
-        self.lane_vehicle_ids = lane_vehicle_ids # Store for later
+        densities = np.divide(vehicle_count, lane_length, out=np.zeros_like(vehicle_count), where=lane_length > 0)
+        left_turn_mask = np.array([lid in self.left_turn_lanes for lid in lane_ids])
+        right_turn_mask = np.array([lid in self.right_turn_lanes for lid in lane_ids])
+
+        # Batch fill lane_data dicts
+        for idx, lane_id in enumerate(lane_ids):
+            vids = vehicle_ids_arr[idx]
+            def safe_count_classes(vids):
+                from collections import defaultdict
+                counts = defaultdict(int)
+                for vid in vids:
+                    vclass = vehicle_classes.get(vid)
+                    if vclass: counts[vclass] += 1
+                return counts
+
+            lane_data[lane_id] = {
+                'queue_length': float(queue_length[idx]),
+                'waiting_time': float(waiting_time[idx]),
+                'density': float(densities[idx]),
+                'mean_speed': float(mean_speed[idx]),
+                'vehicle_ids': vids,
+                'flow': float(vehicle_count[idx]),
+                'lane_id': lane_id,
+                'edge_id': self.lane_edge_ids.get(lane_id, ""),
+                'route_id': self._get_route_for_lane(lane_id, all_vehicles),
+                'ambulance': bool(ambulance_mask[idx]),
+                'vehicle_classes': safe_count_classes(vids),
+                'left_turn': bool(left_turn_mask[idx]),
+                'right_turn': bool(right_turn_mask[idx]),
+                'tl_id': self.lane_to_tl.get(lane_id, '')
+            }
+
+        self.lane_vehicle_ids = lane_vehicle_ids  # Store for later if needed
         return lane_data
-
     def _get_route_for_lane(self, lane_id, all_vehicles):
         try:
             vehicles = [vid for vid in self.lane_vehicle_ids.get(lane_id, []) if vid in all_vehicles]
@@ -963,14 +1014,21 @@ class UniversalSmartTrafficController:
         
     def _create_intersection_state_vector(self, tl_id, intersection_data):
         d = intersection_data[tl_id]
-        queues, waits, speeds = d.get('queues', []), d.get('waits', []), d.get('speeds', [])
-        n_phases, current_phase = d.get('n_phases', 4), d.get('current_phase', 0)
+        queues = np.array(d.get('queues', []), dtype=float)
+        waits = np.array(d.get('waits', []), dtype=float)
+        speeds = np.array(d.get('speeds', []), dtype=float)
+        n_phases = float(d.get('n_phases', 4))
+        current_phase = float(d.get('current_phase', 0))
         state = np.array([
-            max(queues) if queues else 0, np.mean(queues) if queues else 0,
-            min(speeds) if speeds else 0, np.mean(speeds) if speeds else 0,
-            max(waits) if waits else 0, np.mean(waits) if waits else 0,
-            float(current_phase) / max(n_phases-1, 1), float(n_phases),
-            d.get('left_q', 0), d.get('right_q', 0)
+            queues.max() if queues.size else 0,
+            queues.mean() if queues.size else 0,
+            speeds.min() if speeds.size else 0,
+            speeds.mean() if speeds.size else 0,
+            waits.max() if waits.size else 0,
+            waits.mean() if waits.size else 0,
+            current_phase / max(n_phases - 1, 1), n_phases,
+            float(d.get('left_q', 0)),
+            float(d.get('right_q', 0))
         ])
         return state
 
@@ -1021,6 +1079,7 @@ class UniversalSmartTrafficController:
                     - only_empty_green_penalty  # strong penalty!
                     + congestion_bonus
                 )
+                self.rl_agent.reward_history.append(reward)
                 reward_components = {
                     "queue_penalty": -self.adaptive_params['queue_weight'] * sum(queues),
                     "wait_penalty": -self.adaptive_params['wait_weight'] * sum(waits),
@@ -1114,7 +1173,7 @@ class UniversalSmartTrafficController:
             return 0.0, {}, 0.0
 
     def end_episode(self):
-        # Update adaptive parameters based on average reward
+    # Update adaptive parameters based on average reward
         if self.rl_agent.reward_history:
             avg_reward = np.mean(self.rl_agent.reward_history)
             print(f"Average reward this episode: {avg_reward:.2f}")
@@ -1129,10 +1188,16 @@ class UniversalSmartTrafficController:
         self.rl_agent.adaptive_params = self.adaptive_params.copy()
         print("🔄 Updated adaptive parameters:", self.adaptive_params)
         self.rl_agent.save_model(adaptive_params=self.adaptive_params)
-        print(f"🚦 Epsilon after training/episode: {self.rl_agent.epsilon}")
+
+        # --- Epsilon decay: add this line ---
+        old_epsilon = self.rl_agent.epsilon
+        self.rl_agent.epsilon = max(self.rl_agent.epsilon * self.rl_agent.epsilon_decay, self.rl_agent.min_epsilon)
+        print(f"🚦 Epsilon after training/episode: {old_epsilon} -> {self.rl_agent.epsilon}")
+
         self.previous_states.clear()
         self.previous_actions.clear()
         self.rl_agent.reward_history.clear()
+        
 
     def _update_adaptive_parameters(self, performance_stats):
         try:
@@ -1147,7 +1212,9 @@ class UniversalSmartTrafficController:
         except Exception as e:
             print(f"Error updating adaptive parameters: {e}")
 
+
 def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episodes=1, num_retries=1, retry_delay=1, mode="train"):
+    global controller  # Only if you want to set the top-level controller for API
     try:
         for episode in range(episodes):
             print(f"\n{'='*50}\n🚦 STARTING UNIVERSAL EPISODE {episode + 1}/{episodes}\n{'='*50}")
@@ -1168,6 +1235,7 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
             controller.end_episode(); traci.close()
             if episode < episodes - 1: time.sleep(2)
         print(f"\n🎉 All {episodes} episodes completed!")
+        return controller  # Return the last controller
     except Exception as e:
         print(f"Error in universal simulation: {e}")
     finally:
@@ -1175,7 +1243,10 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
         except: pass
         print("Simulation resources cleaned up")
 
+# ... [Flask API placeholder code unchanged, do not use global at top-level] ...
+
 def main():
+    global controller  # <-- only inside main
     parser = argparse.ArgumentParser(description="Run universal SUMO RL traffic simulation")
     parser.add_argument('--sumo', required=True, help='Path to SUMO config file')
     parser.add_argument('--gui', action='store_true', help='Use SUMO GUI')
@@ -1185,13 +1256,20 @@ def main():
     parser.add_argument('--retry-delay', type=int, default=1, help='Delay in seconds between retries')
     parser.add_argument('--mode', choices=['train', 'eval', 'adaptive'], default='train',
                         help='Controller mode: train (explore+learn), eval (exploit only), adaptive (exploit+learn)')
+    parser.add_argument('--api', action='store_true', help='Start API server instead of simulation')
     args = parser.parse_args()
+
+    if args.api:
+        print("Starting API server...")
+        controller = None  # Or load/init as needed for API
+        app.run(port=5000, debug=True)
+        return
 
     profiler = Profiler()
     profiler.start()
 
-    # Start your simulation
-    start_universal_simulation(args.sumo, args.gui, args.max_steps, args.episodes, args.num_retries, args.retry_delay, mode=args.mode)
+    # Start your simulation and set global controller for API use
+    controller = start_universal_simulation(args.sumo, args.gui, args.max_steps, args.episodes, args.num_retries, args.retry_delay, mode=args.mode)
 
     profiler.stop()
     profiler.open_in_browser() 
