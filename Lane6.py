@@ -57,6 +57,7 @@ class AdaptivePhaseController:
         self.r_base = r_base
         self.r_adjust = r_adjust
         self.severe_congestion_threshold = severe_congestion_threshold
+        self.severe_congestion_cooldown = {}  # <-- FIX: Initialize here!
         self.large_delta_t = large_delta_t
         self.reward_history = []
         self.R_target = r_base
@@ -64,6 +65,9 @@ class AdaptivePhaseController:
         self.weight_history = []
         self.metric_history = []  # Store metrics for weight adaptation
         self.phase_count = 0
+        self.severe_congestion_cooldown = {}
+        self.last_served_phase = None
+        self.last_phase_switch_time = 0
 
     def get_lane_stats(self, lane_id):
         queue = traci.lane.getLastStepHaltingNumber(lane_id)
@@ -97,14 +101,19 @@ class AdaptivePhaseController:
         print(f"  - New: {new_duration:.2f}s (Range: {self.min_green}-{self.max_green}s)")
         print(f"  - State: {traci.trafficlight.getRedYellowGreenState(self.tls_id)}")
         return new_duration
-
+    
     def check_special_events(self):
-        """Detect special events with improved priority vehicle detection"""
+        """Detect special events with congestion cooldown"""
+        now = traci.simulation.getTime()
         for lane_id in self.lane_ids:
+            # ENFORCE COOLDOWN
+            if now - self.severe_congestion_cooldown.get(lane_id, -9999) < self.min_green:
+                continue
             queue, _, _, _ = self.get_lane_stats(lane_id)
             if queue > self.severe_congestion_threshold * 10:
                 print(f"\n[SPECIAL EVENT] Severe congestion on {lane_id}")
                 print(f"  - Queue: {queue} > {self.severe_congestion_threshold * 10:.1f}")
+                self.severe_congestion_cooldown[lane_id] = now  # Set cooldown!
                 return 'severe_congestion', lane_id
             
             # Improved priority vehicle detection
@@ -275,13 +284,21 @@ class AdaptivePhaseController:
         delta_t = self.calculate_delta_t(R)
         
         # 5. Check and handle special events
+        now = traci.simulation.getTime()
+        # Only allow switching phase if min_green has passed since last switch
+        if self.last_phase_switch_time and now - self.last_phase_switch_time < self.min_green:
+            # Not enough time has passed, let current phase run!
+            return
+
         event_type, event_lane = self.check_special_events()
         if event_type:
             print(f"\n[HANDLING] {event_type} on {event_lane}")
             self.reorganize_or_create_phase(event_lane, event_type)
+            self.last_phase_switch_time = now
+            self.last_served_phase = event_lane
         else:
-            # 6. Apply phase adjustment
-            self.adjust_phase_duration(delta_t)
+            # 6. Apply phase adjustment as before
+            self.adjust_phase_duration(self.calculate_delta_t(R))
 
 
 def subscribe_vehicles(vehicle_ids):
@@ -726,7 +743,7 @@ class UniversalSmartTrafficController:
             return 3.0
     
     def _add_new_green_phase_for_lane(self, tl_id, lane_id, min_green=None, yellow=3):
-        """Creates and appends a new green+yellow phase for a specific lane, pushes to TraCI, and returns the new phase index."""
+        """Creates and appends a new green+yellow phase for a specific lane, pushes to TraCI, updates caches, and returns the new phase index."""
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(tl_id)[0]
         phases = list(logic.getPhases())
         controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
@@ -748,14 +765,21 @@ class UniversalSmartTrafficController:
         # Add both phases to the end
         phases.append(new_green_phase)
         phases.append(new_yellow_phase)
-        # Update logic
+        # Update logic and push to SUMO
         new_logic = traci.trafficlight.Logic(
             logic.programID, logic.type, len(phases) - 2, phases
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(tl_id, new_logic)
-        print(f"[NEW PHASE] Added new green+yellow phase for lane {lane_id} at {tl_id}")
+        print(f"[NEW PHASE] Added green+yellow phase for lane {lane_id} at {tl_id}")
+
+        # Force update of phase logic cache
+        self.tl_logic_cache[tl_id] = traci.trafficlight.getAllProgramLogics(tl_id)[0]
+        # Update action space for RL agent and controller
+        self.tl_action_sizes[tl_id] = len(self.tl_logic_cache[tl_id].phases)
+        self.rl_agent.action_size = max(self.tl_action_sizes.values())
+        print(f"[ACTION SPACE] tl_id={tl_id} now n_phases={self.tl_action_sizes[tl_id]}")
         return len(phases) - 2  # return index of new green phase
-    
+
     def run_step(self):
         try:
             self.step_count += 1
@@ -811,15 +835,15 @@ class UniversalSmartTrafficController:
                         time_since_green = current_time - self.last_green_time[idx]
                         if time_since_green > self.adaptive_params['starvation_threshold']:
                             starved_lanes.append((lane, time_since_green))
-                
                 if starved_lanes:
                     most_starved_lane = max(starved_lanes, key=lambda x: x[1])[0]
                     starved_phase = self._find_phase_for_lane(tl_id, most_starved_lane)
                     if starved_phase is None:
-                        # ------ THIS IS THE KEY PATCH ------
-                        # No phase serves this lane. Create new phase and switch to it!
+                        # PATCH: Actually create new phase and update agent/controller
                         starved_phase = self._add_new_green_phase_for_lane(
                             tl_id, most_starved_lane, min_green=self.adaptive_params['min_green'], yellow=3)
+                        # After adding, update local logic variable to be current
+                        logic = self._get_traffic_light_logic(tl_id)
                     if starved_phase is not None and current_phase != starved_phase:
                         switched = self._switch_phase_with_yellow_if_needed(
                             tl_id, current_phase, starved_phase, logic, controlled_lanes, lane_data, current_time)
@@ -832,24 +856,24 @@ class UniversalSmartTrafficController:
                     continue
                 
                 # Normal RL control
+                self.tl_action_sizes[tl_id] = len(logic.phases)
+                self.rl_agent.action_size = max(self.tl_action_sizes.values())
+
                 queues = np.array([lane_data[l]['queue_length'] for l in controlled_lanes if l in lane_data])
                 waits = [lane_data[l]['waiting_time'] for l in controlled_lanes if l in lane_data]
                 speeds = [lane_data[l]['mean_speed'] for l in controlled_lanes if l in lane_data]
-                left_q = sum(lane_data[l]['queue_length'] for l in controlled_lanes 
+                left_q = sum(lane_data[l]['queue_length'] for l in controlled_lanes
                             if l in self.left_turn_lanes and l in lane_data)
-                right_q = sum(lane_data[l]['queue_length'] for l in controlled_lanes 
+                right_q = sum(lane_data[l]['queue_length'] for l in controlled_lanes
                             if l in self.right_turn_lanes and l in lane_data)
-                
                 self.intersection_data[tl_id] = {
                     'queues': queues, 'waits': waits, 'speeds': speeds,
                     'left_q': left_q, 'right_q': right_q,
                     'n_phases': self.tl_action_sizes[tl_id],
                     'current_phase': current_phase
                 }
-                
                 state = self._create_intersection_state_vector(tl_id, self.intersection_data)
                 action = self.rl_agent.get_action(state, tl_id, action_size=self.tl_action_sizes[tl_id])
-                
                 # Only switch if minimum green time has passed and no dilemma zone vehicles
                 last_change = self.last_phase_change.get(tl_id, -9999)
                 if (current_time - last_change >= self.adaptive_params['min_green'] and 
@@ -1049,6 +1073,12 @@ class UniversalSmartTrafficController:
         try:
             idx = self.lane_id_to_idx[lane_id]
             now = traci.simulation.getTime()
+            lane_last_green = self.last_green_time.get(lane_id, 0)
+            if now - lane_last_green < self.min_green:
+                # This lane was just served, skip special event for now
+                return None, None
+            # Else, handle congestion and update last green time
+            self.last_green_time[lane_id] = now
             curr = set(traci.lane.getLastStepVehicleIDs(lane_id))
             arrivals = curr - self.last_lane_vehicles[idx]
             delta_time = max(1e-3, now - self.last_arrival_time[idx])
