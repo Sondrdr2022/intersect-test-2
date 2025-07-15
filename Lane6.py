@@ -46,7 +46,6 @@ def log_phase_adjustment(action_type, phase, old_duration, new_duration):
     print(f"[LOG] {action_type} phase {phase}: {old_duration} -> {new_duration}")
 
 class AdaptivePhaseController:
-
     def __init__(self, lane_ids, tls_id, alpha=1.0, min_green=10, max_green=60,
                  r_base=0.5, r_adjust=0.1, severe_congestion_threshold=0.8, large_delta_t=20):
         self.lane_ids = lane_ids
@@ -68,6 +67,11 @@ class AdaptivePhaseController:
         self.severe_congestion_cooldown = {}
         self.last_served_phase = None
         self.last_phase_switch_time = 0
+        self.severe_congestion_global_cooldown = 0
+        self.severe_congestion_global_cooldown_time = 30  # seconds between interventions
+        self.special_event_history = defaultdict(int)
+        self.max_special_event_repeats = 2  # serve a lane up to N times before skipping
+        self.last_special_event_lane = None
 
     def get_lane_stats(self, lane_id):
         queue = traci.lane.getLastStepHaltingNumber(lane_id)
@@ -103,20 +107,46 @@ class AdaptivePhaseController:
         return new_duration
     
     def check_special_events(self):
-        """Detect special events with congestion cooldown"""
+        """Detect special events with improved congestion fairness and cooldown."""
         now = traci.simulation.getTime()
+        # Global cooldown: block special event if recently triggered anywhere
+        if now - self.severe_congestion_global_cooldown < self.severe_congestion_global_cooldown_time:
+            return None, None
+
+        lanes_over_threshold = []
         for lane_id in self.lane_ids:
-            # ENFORCE COOLDOWN
+            # Per-lane cooldown
             if now - self.severe_congestion_cooldown.get(lane_id, -9999) < self.min_green:
                 continue
             queue, _, _, _ = self.get_lane_stats(lane_id)
             if queue > self.severe_congestion_threshold * 10:
+                lanes_over_threshold.append((lane_id, queue))
+
+        if lanes_over_threshold:
+            # Sort by queue length (descending)
+            lanes_over_threshold.sort(key=lambda x: -x[1])
+            for lane_id, queue in lanes_over_threshold:
+                # Limit how often we serve the same lane
+                if self.last_special_event_lane == lane_id:
+                    self.special_event_history[lane_id] += 1
+                else:
+                    self.special_event_history[lane_id] = 1
+                    self.last_special_event_lane = lane_id
+
+                if self.special_event_history[lane_id] > self.max_special_event_repeats:
+                    continue  # skip this lane for now
+
                 print(f"\n[SPECIAL EVENT] Severe congestion on {lane_id}")
                 print(f"  - Queue: {queue} > {self.severe_congestion_threshold * 10:.1f}")
-                self.severe_congestion_cooldown[lane_id] = now  # Set cooldown!
+                self.severe_congestion_cooldown[lane_id] = now  # Set per-lane cooldown
+                self.severe_congestion_global_cooldown = now    # Set global cooldown
                 return 'severe_congestion', lane_id
-            
-            # Improved priority vehicle detection
+        # Reset special event history if nothing eligible
+        self.special_event_history.clear()
+        self.last_special_event_lane = None
+
+        # Priority vehicle detection unchanged
+        for lane_id in self.lane_ids:
             vehs = traci.lane.getLastStepVehicleIDs(lane_id)
             for v in vehs:
                 try:
@@ -128,7 +158,6 @@ class AdaptivePhaseController:
                 except Exception:
                     continue
         return None, None
-
     def add_new_phase_for_lane(self, lane_id, green_duration=20, yellow_duration=3):
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         phases = list(logic.getPhases())
@@ -1568,11 +1597,11 @@ def main():
         controller = None  # Or load/init as needed for API
         app.run(port=5000, debug=True)
         return
-    profiler = Profiler()
-    profiler.start()
+    #profiler = Profiler()
+    #profiler.start()
 # Start your simulation and set global controller for API use
     controller = start_universal_simulation(args.sumo, args.gui, args.max_steps, args.episodes, args.num_retries, args.retry_delay, mode=args.mode)
-    profiler.stop()
-    profiler.open_in_browser() 
+    #profiler.stop()
+    #profiler.open_in_browser() 
 if __name__ == "__main__":
     main()
