@@ -56,45 +56,51 @@ class AdaptivePhaseController:
         self.r_base = r_base
         self.r_adjust = r_adjust
         self.severe_congestion_threshold = severe_congestion_threshold
-        self.severe_congestion_cooldown = {}  # <-- FIX: Initialize here!
+        self.severe_congestion_cooldown = {}
         self.large_delta_t = large_delta_t
         self.reward_history = []
         self.R_target = r_base
-        self.weights = [0.25, 0.25, 0.25, 0.25]  # Initial weights
+        # Initial weights (will be adapted)
+        self.weights = [0.25, 0.25, 0.25, 0.25]
         self.weight_history = []
-        self.metric_history = []  # Store metrics for weight adaptation
+        self.metric_history = []
         self.phase_count = 0
         self.severe_congestion_cooldown = {}
         self.last_served_phase = None
         self.last_phase_switch_time = 0
         self.severe_congestion_global_cooldown = 0
-        self.severe_congestion_global_cooldown_time = 30  # seconds between interventions
+        self.severe_congestion_global_cooldown_time = 30
         self.special_event_history = defaultdict(int)
-        self.max_special_event_repeats = 2  # serve a lane up to N times before skipping
+        self.max_special_event_repeats = 2
         self.last_special_event_lane = None
 
     def get_lane_stats(self, lane_id):
         queue = traci.lane.getLastStepHaltingNumber(lane_id)
         waiting_time = traci.lane.getWaitingTime(lane_id)
-        delay = traci.lane.getWaitingTime(lane_id)  # Placeholder for delay
-        saturation = traci.lane.getLastStepOccupancy(lane_id) / 100
-        return queue, waiting_time, delay, saturation
-
+        mean_speed = traci.lane.getLastStepMeanSpeed(lane_id)
+        density = traci.lane.getLastStepVehicleNumber(lane_id) / traci.lane.getLength(lane_id)
+        return queue, waiting_time, mean_speed, density
+    
     def adjust_weights(self):
-        """Automatically adjust weights based on traffic conditions"""
-        if len(self.metric_history) < 5:  # Need sufficient data
+        """Adapt reward weights based on recent traffic conditions."""
+        # Only adapt if we have enough recent data
+        if len(self.metric_history) < 10:
             return
-        
-        # Calculate average metrics
-        avg_metrics = np.mean(self.metric_history[-5:], axis=0)
-        total = sum(avg_metrics)
-        
-        if total > 0:
-            # Normalize and update weights
-            self.weights = [m/total for m in avg_metrics]
-            print(f"\n[WEIGHT ADJUSTMENT] New weights: Q={self.weights[0]:.3f}, "
-                  f"W={self.weights[1]:.3f}, D={self.weights[2]:.3f}, S={self.weights[3]:.3f}")
 
+        # Calculate recent averages
+        recent = np.mean(self.metric_history[-10:], axis=0)  # [density, speed, wait, queue]
+
+        # Invert speed: high speed is good, so its "problem" value is (1 - speed)
+        density, speed, wait, queue = recent
+        speed_importance = 1 - speed
+
+        # Compose and normalize weights
+        values = np.array([density, speed_importance, wait, queue])
+        total = np.sum(values)
+        if total > 0:
+            weights = values / total
+        else:
+            weights = np.ones(4) / 4
     def adjust_phase_duration(self, delta_t):
         current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
         new_duration = max(self.min_green, min(self.max_green, current_duration + delta_t))
@@ -239,33 +245,50 @@ class AdaptivePhaseController:
         return bonus, penalty
 
     def calculate_reward(self, bonus=0, penalty=0):
-        w_q, w_w, w_d, w_s = self.weights
-        Q, W, D, S = 0, 0, 0, 0
+        total_density = 0
+        total_speed = 0
+        total_wait = 0
+        total_queue = 0
         n = len(self.lane_ids)
-        
+        MAX_DENSITY = 0.2
+        MAX_SPEED = 13.89
+        MAX_WAIT = 300
+        MAX_QUEUE = 50
+
         for lane_id in self.lane_ids:
-            q, w, d, s = self.get_lane_stats(lane_id)
-            Q += min(q, 50)   # Cap at 50 vehicles
-            W += min(w, 300)  # Cap at 300 seconds
-            D += min(d, 300)  # Cap at 300 seconds
-            S += s
-            
-        # Averages
-        Q, W, D, S = Q/n, W/n, D/n, S/n
-        
+            q, w, v, dens = self.get_lane_stats(lane_id)
+            total_density += min(dens, MAX_DENSITY) / MAX_DENSITY
+            total_speed += min(v, MAX_SPEED) / MAX_SPEED
+            total_wait += min(w, MAX_WAIT) / MAX_WAIT
+            total_queue += min(q, MAX_QUEUE) / MAX_QUEUE
+
+        avg_density = total_density / n
+        avg_speed = total_speed / n
+        avg_wait = total_wait / n
+        avg_queue = total_queue / n
+
         # Store metrics for weight adjustment
-        self.metric_history.append([Q, W, D, 1-S])
-        
-        # Calculate reward
-        R = w_q * Q + w_w * W + w_d * D + w_s * (1 - S)
-        R += bonus - penalty
-        R = min(R, 100)  # Cap reward
-        
+        # For speed, store normalized (positive), but in adjust_weights we invert it
+        self.metric_history.append([avg_density, avg_speed, avg_wait, avg_queue])
+
+        # Use adaptive weights
+        w_dens, w_spd, w_wait, w_q = self.weights
+
+        # Reward: negative for "bad" metrics, positive for speed (but weight is already inverted in adjust_weights)
+        R = (
+            -w_dens * avg_density
+            + w_spd * avg_speed
+            - w_wait * avg_wait
+            - w_q * avg_queue
+            + bonus - penalty
+        ) * 100
+
         print(f"\n[REWARD] Phase {traci.trafficlight.getPhase(self.tls_id)}")
-        print(f"  - Queue: {Q:.2f} (w={w_q:.3f}) | Wait: {W:.2f} (w={w_w:.3f})")
-        print(f"  - Delay: {D:.2f} (w={w_d:.3f}) | Sat: {S:.2f} (w={w_s:.3f})")
+        print(f"  - Density: {avg_density:.2f} (w={w_dens:.2f}) | Speed: {avg_speed:.2f} (w={w_spd:.2f})")
+        print(f"  - Wait: {avg_wait:.2f} (w={w_wait:.2f}) | Queue: {avg_queue:.2f} (w={w_q:.2f})")
         print(f"  - Bonus/Penalty: {bonus}/{penalty} | R: {R:.2f}")
-        
+
+        R = max(min(R, 100), -100)
         return R
 
     def calculate_delta_t(self, R):
