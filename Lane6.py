@@ -45,16 +45,13 @@ if tools not in sys.path: sys.path.append(tools)
 def log_phase_adjustment(action_type, phase, old_duration, new_duration):
     print(f"[LOG] {action_type} phase {phase}: {old_duration} -> {new_duration}")
 
-import os
-import pickle
-from collections import defaultdict
-import numpy as np
-import traci
+
+
 
 class AdaptivePhaseController:
     """
-    AdaptivePhaseController manages adaptive signal phase durations and dynamic phase creation
-    for a SUMO-controlled traffic light, with logging of all actions that push data into SUMO.
+    Enhanced traffic light controller with adaptive phase durations, dynamic phase creation,
+    and comprehensive logging for SUMO simulations.
     """
 
     def __init__(self, lane_ids, tls_id, alpha=1.0, min_green=10, max_green=60,
@@ -69,12 +66,16 @@ class AdaptivePhaseController:
         self.r_adjust = r_adjust
         self.severe_congestion_threshold = severe_congestion_threshold
         self.large_delta_t = large_delta_t
+
+        # State management
         self.reward_history = []
         self.R_target = r_base
-        self.weights = [0.25, 0.25, 0.25, 0.25]
+        self.weights = np.array([0.25, 0.25, 0.25, 0.25])
         self.weight_history = []
         self.metric_history = []
         self.phase_count = 0
+
+        # Event handling
         self.severe_congestion_cooldown = {}
         self.last_served_phase = None
         self.last_phase_switch_time = 0
@@ -84,400 +85,537 @@ class AdaptivePhaseController:
         self.max_special_event_repeats = 2
         self.last_special_event_lane = None
 
-        # APC logging and state persistence
+        # Flicker prevention
+        self.last_phase_idx = None
+        self.last_phase_switch_sim_time = 0
+
+        # Persistence
         self.apc_data_file = apc_data_file or f"apc_{tls_id}.pkl"
         self.apc_state = {"events": []}
         self._load_apc_state()
 
     def _load_apc_state(self):
-        if self.apc_data_file and os.path.exists(self.apc_data_file):
-            try:
-                with open(self.apc_data_file, "rb") as f:
-                    self.apc_state = pickle.load(f)
-                print(f"[APC] Loaded APC state from {self.apc_data_file}")
-            except Exception as e:
-                print(f"[APC] Failed to load APC state: {e}")
+        if not self.apc_data_file or not os.path.exists(self.apc_data_file):
+            return
+
+        try:
+            with open(self.apc_data_file, "rb") as f:
+                self.apc_state = pickle.load(f)
+            print(f"[APC] Loaded state from {self.apc_data_file}")
+        except Exception as e:
+            print(f"[APC] State load failed: {e}")
 
     def _save_apc_state(self):
-        if self.apc_data_file:
-            try:
-                with open(self.apc_data_file, "wb") as f:
-                    pickle.dump(self.apc_state, f)
-            except Exception as e:
-                print(f"[APC] Failed to save APC state: {e}")
+        if not self.apc_data_file:
+            return
+
+        try:
+            with open(self.apc_data_file, "wb") as f:
+                pickle.dump(self.apc_state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            print(f"[APC] State save failed: {e}")
 
     def _log_apc_event(self, event):
-        self.apc_state.setdefault("events", []).append(event)
+        """Log structured event with timestamp and simulation context"""
+        event["timestamp"] = datetime.datetime.now().isoformat()
+        event["sim_time"] = traci.simulation.getTime()
+        event["tls_id"] = self.tls_id
+        event["weights"] = self.weights.tolist()
+        event["bonus"] = getattr(self, "last_bonus", 0)
+        event["penalty"] = getattr(self, "last_penalty", 0)
+        self.apc_state["events"].append(event)
         self._save_apc_state()
 
     def get_lane_stats(self, lane_id):
-        queue = traci.lane.getLastStepHaltingNumber(lane_id)
-        waiting_time = traci.lane.getWaitingTime(lane_id)
-        mean_speed = traci.lane.getLastStepMeanSpeed(lane_id)
-        length = max(1.0, traci.lane.getLength(lane_id))
-        density = traci.lane.getLastStepVehicleNumber(lane_id) / length
-        return queue, waiting_time, mean_speed, density
+        """Get comprehensive lane metrics with error handling"""
+        try:
+            queue = traci.lane.getLastStepHaltingNumber(lane_id)
+            waiting_time = traci.lane.getWaitingTime(lane_id)
+            mean_speed = traci.lane.getLastStepMeanSpeed(lane_id)
+            length = max(1.0, traci.lane.getLength(lane_id))
+            density = traci.lane.getLastStepVehicleNumber(lane_id) / length
+            return queue, waiting_time, mean_speed, density
+        except traci.TraCIException:
+            return 0, 0, 0, 0
 
-    def adjust_weights(self):
-        if len(self.metric_history) < 10:
+    def adjust_weights(self, window=10):
+        """Dynamically adjust metric weights based on recent performance"""
+        # PATCH: Use all available metric_history if less than window
+        available = len(self.metric_history)
+        if available == 0:
+            # Default weights if no metrics yet
+            self.weights = np.array([0.25] * 4)
             return
-        recent = np.mean(self.metric_history[-10:], axis=0)
+        use_win = min(window, available)
+        recent = np.mean(self.metric_history[-use_win:], axis=0)
         density, speed, wait, queue = recent
-        speed_importance = 1 - speed
-        values = np.array([density, speed_importance, wait, queue])
+
+        speed_importance = 1 - min(speed, 1.0)
+        values = np.array([
+            min(density, 1.0),
+            speed_importance,
+            min(wait, 1.0),
+            min(queue, 1.0)
+        ])
+
         total = np.sum(values)
-        if total > 0:
-            self.weights = (values / total).tolist()
+        # Prevent weights from being all zeros
+        if total == 0:
+            self.weights = np.array([0.25] * 4)
         else:
-            self.weights = [0.25, 0.25, 0.25, 0.25]
-        self.weight_history.append(list(self.weights))
+            self.weights = values / total
+
+        self.weight_history.append(self.weights.copy())
+        print(f"[ADAPTIVE WEIGHTS] {self.tls_id}: {self.weights}")
+    def log_phase_switch(self, new_phase_idx):
+        """Safely switch phases with comprehensive logging and prevent flicker"""
+        try:
+            old_phase = traci.trafficlight.getPhase(self.tls_id)
+            old_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
+            current_sim_time = traci.simulation.getTime()
+
+            # Flicker prevention: if switching to same phase or too quickly, skip
+            if self.last_phase_idx == new_phase_idx and current_sim_time - self.last_phase_switch_sim_time < self.min_green:
+                print(f"[PHASE SWITCH BLOCKED] Flicker prevention triggered for {self.tls_id}")
+                return False
+
+            traci.trafficlight.setPhase(self.tls_id, new_phase_idx)
+            traci.trafficlight.setPhaseDuration(self.tls_id, self.max_green)
+
+            new_phase = traci.trafficlight.getPhase(self.tls_id)
+            new_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
+
+            self.last_phase_idx = new_phase_idx
+            self.last_phase_switch_sim_time = current_sim_time
+
+            event = {
+                "action": "phase_switch",
+                "old_phase": old_phase,
+                "new_phase": new_phase,
+                "old_state": old_state,
+                "new_state": new_state,
+                "reward": getattr(self, "last_R", None),
+                "weights": self.weights.tolist(),
+                "bonus": getattr(self, "last_bonus", 0),
+                "penalty": getattr(self, "last_penalty", 0)
+            }
+            self._log_apc_event(event)
+
+            print(f"\n[PHASE SWITCH] {self.tls_id}: {old_phase}→{new_phase}")
+            print(f"  Old: {old_state}\n  New: {new_state}")
+            print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
+            return True
+        except traci.TraCIException as e:
+            print(f"[ERROR] Phase switch failed: {e}")
+            return False
 
     def adjust_phase_duration(self, delta_t):
-        current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
-        new_duration = max(self.min_green, min(self.max_green, current_duration + delta_t))
-        traci.trafficlight.setPhaseDuration(self.tls_id, new_duration)
-        phase = traci.trafficlight.getPhase(self.tls_id)
-        state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
-        event = {
-            "action": "adjust_phase_duration",
-            "sim_time": traci.simulation.getTime(),
-            "tls_id": self.tls_id,
-            "phase": phase,
-            "old_duration": current_duration,
-            "delta_t": delta_t,
-            "new_duration": new_duration,
-            "state": state,
-            "reward": getattr(self, "last_R", None),
-        }
-        self._log_apc_event(event)
-        print(f"\n[PHASE ADJUSTMENT] Phase {phase}")
-        print(f"  - Current: {current_duration:.2f}s, Δt: {delta_t:.2f}s")
-        print(f"  - New: {new_duration:.2f}s (Range: {self.min_green}-{self.max_green}s)")
-        print(f"  - State: {state}")
-        return new_duration
+        """Adjust current phase duration with bounds checking"""
+        try:
+            old_phase = traci.trafficlight.getPhase(self.tls_id)
+            current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
+
+            # Calculate new duration with bounds
+            new_duration = np.clip(
+                current_duration + delta_t,
+                self.min_green,
+                self.max_green
+            )
+
+            traci.trafficlight.setPhaseDuration(self.tls_id, new_duration)
+
+            event = {
+                "action": "adjust_phase_duration",
+                "phase": old_phase,
+                "delta_t": delta_t,
+                "old_duration": current_duration,
+                "new_duration": new_duration,
+                "reward": self.last_R,
+                "weights": self.weights.tolist(),
+                "bonus": getattr(self, "last_bonus", 0),
+                "penalty": getattr(self, "last_penalty", 0)
+            }
+            self._log_apc_event(event)
+
+            print(f"\n[PHASE ADJUST] Phase {old_phase}: {current_duration:.1f}s → {new_duration:.1f}s")
+            print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
+            return new_duration
+        except traci.TraCIException as e:
+            print(f"[ERROR] Duration adjustment failed: {e}")
+            return current_duration
+
+    def create_phase_state(self, green_lanes=None, yellow_lanes=None, red_lanes=None):
+        """Create phase state string from lane specifications, always include yellow transition"""
+        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+        state = ['r'] * len(controlled_lanes)
+
+        def set_lanes(lanes, state_char):
+            if not lanes:
+                return
+            for lane in lanes:
+                if lane in controlled_lanes:
+                    idx = controlled_lanes.index(lane)
+                    state[idx] = state_char
+
+        set_lanes(green_lanes, 'G')
+        set_lanes(yellow_lanes, 'y')
+        set_lanes(red_lanes, 'r')
+
+        # Ensure yellow appears in the phase for green lanes if transitioning from green to red
+        if green_lanes:
+            for lane in green_lanes:
+                if lane in controlled_lanes:
+                    idx = controlled_lanes.index(lane)
+                    if state[idx] == 'r':
+                        state[idx] = 'y'
+
+        return "".join(state)
+
+    def add_new_phase(self, green_lanes, green_duration=20, yellow_duration=3, yellow_lanes=None):
+        """Add new phase program to traffic light, enforce yellow"""
+        try:
+            logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+            phases = list(logic.getPhases())
+
+            green_state = self.create_phase_state(green_lanes=green_lanes)
+            # Default yellow lanes: green lanes, make sure yellow is present for every green
+            yellow_lanes_final = yellow_lanes if yellow_lanes is not None else green_lanes
+            yellow_state = self.create_phase_state(yellow_lanes=yellow_lanes_final)
+
+            new_green = traci.trafficlight.Phase(green_duration, green_state)
+            new_yellow = traci.trafficlight.Phase(yellow_duration, yellow_state)
+
+            phases.extend([new_green, new_yellow])
+            new_logic = traci.trafficlight.Logic(
+                logic.programID,
+                logic.type,
+                min(logic.currentPhaseIndex, len(phases)-1),
+                phases
+            )
+
+            traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
+
+            event = {
+                "action": "add_new_phase",
+                "green_lanes": green_lanes,
+                "yellow_lanes": yellow_lanes_final,
+                "green_duration": green_duration,
+                "yellow_duration": yellow_duration,
+                "new_phase_idx": len(phases)-2,
+                "green_state": green_state,
+                "yellow_state": yellow_state,
+                "weights": self.weights.tolist(),
+                "bonus": getattr(self, "last_bonus", 0),
+                "penalty": getattr(self, "last_penalty", 0)
+            }
+            self._log_apc_event(event)
+
+            print(f"[NEW PHASE] Added for lanes {green_lanes} at {self.tls_id}")
+            print(f"  Green state: {green_state}\n  Yellow state: {yellow_state}")
+            print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
+            return len(phases)-2
+        except Exception as e:
+            print(f"[ERROR] Phase creation failed: {e}")
+            return None
 
     def check_special_events(self):
+        """Detect special conditions requiring immediate response"""
         now = traci.simulation.getTime()
+
+        # Global cooldown check
         if now - self.severe_congestion_global_cooldown < self.severe_congestion_global_cooldown_time:
             return None, None
 
-        lanes_over_threshold = []
+        congested_lanes = []
         for lane_id in self.lane_ids:
-            if now - self.severe_congestion_cooldown.get(lane_id, -9999) < self.min_green:
+            if now - self.severe_congestion_cooldown.get(lane_id, 0) < self.min_green:
                 continue
+
             queue, _, _, _ = self.get_lane_stats(lane_id)
-            if queue > self.severe_congestion_threshold * 10:
-                lanes_over_threshold.append((lane_id, queue))
-        if lanes_over_threshold:
-            lanes_over_threshold.sort(key=lambda x: -x[1])
-            for lane_id, queue in lanes_over_threshold:
-                if self.last_special_event_lane == lane_id:
-                    self.special_event_history[lane_id] += 1
-                else:
-                    self.special_event_history[lane_id] = 1
-                    self.last_special_event_lane = lane_id
-                if self.special_event_history[lane_id] > self.max_special_event_repeats:
+            if queue >= self.severe_congestion_threshold * 10:
+                congested_lanes.append((lane_id, queue))
+
+        if congested_lanes:
+            lane_id, queue = max(congested_lanes, key=lambda x: x[1])
+            repeat_count = self.special_event_history[lane_id] + 1
+            if repeat_count > self.max_special_event_repeats:
+                return None, None
+
+            self.special_event_history[lane_id] = repeat_count
+            self.last_special_event_lane = lane_id
+            self.severe_congestion_cooldown[lane_id] = now
+            self.severe_congestion_global_cooldown = now
+
+            print(f"\n[CONGESTION] Lane {lane_id}: queue={queue}")
+            self._log_apc_event({
+                "action": "special_event_severe_congestion",
+                "lane_id": lane_id,
+                "queue": queue,
+                "weights": self.weights.tolist(),
+                "bonus": getattr(self, "last_bonus", 0),
+                "penalty": getattr(self, "last_penalty", 0)
+            })
+            return 'severe_congestion', lane_id
+
+        for lane_id in self.lane_ids:
+            for vid in traci.lane.getLastStepVehicleIDs(lane_id):
+                try:
+                    v_type = traci.vehicle.getTypeID(vid)
+                    if 'emergency' in v_type or 'priority' in v_type:
+                        print(f"\n[PRIORITY] {v_type} on {lane_id}")
+                        self._log_apc_event({
+                            "action": "special_event_priority_vehicle",
+                            "lane_id": lane_id,
+                            "vehicle_id": vid,
+                            "vehicle_type": v_type,
+                            "weights": self.weights.tolist(),
+                            "bonus": getattr(self, "last_bonus", 0),
+                            "penalty": getattr(self, "last_penalty", 0)
+                        })
+                        return 'priority_vehicle', lane_id
+                except traci.TraCIException:
                     continue
-                print(f"\n[SPECIAL EVENT] Severe congestion on {lane_id}")
-                print(f"  - Queue: {queue} > {self.severe_congestion_threshold * 10:.1f}")
-                self.severe_congestion_cooldown[lane_id] = now
-                self.severe_congestion_global_cooldown = now
-                event = {
-                    "action": "special_event_severe_congestion",
-                    "sim_time": now,
-                    "tls_id": self.tls_id,
-                    "lane_id": lane_id,
-                    "queue": queue,
-                    "reward": getattr(self, "last_R", None),
-                }
-                self._log_apc_event(event)
-                return 'severe_congestion', lane_id
+
         self.special_event_history.clear()
         self.last_special_event_lane = None
-
-        for lane_id in self.lane_ids:
-            vehs = traci.lane.getLastStepVehicleIDs(lane_id)
-            for v in vehs:
-                try:
-                    v_type = traci.vehicle.getTypeID(v)
-                    if 'emergency' in v_type or 'priority' in v_type or 'vip' in v_type:
-                        print(f"\n[SPECIAL EVENT] Priority vehicle on {lane_id}")
-                        print(f"  - Vehicle: {v} ({v_type})")
-                        event = {
-                            "action": "special_event_priority_vehicle",
-                            "sim_time": now,
-                            "tls_id": self.tls_id,
-                            "lane_id": lane_id,
-                            "vehicle_id": v,
-                            "vehicle_type": v_type,
-                            "reward": getattr(self, "last_R", None),
-                        }
-                        self._log_apc_event(event)
-                        return 'priority_vehicle', lane_id
-                except Exception:
-                    continue
         return None, None
 
-    def add_new_phase_for_lane(self, lane_id, green_duration=20, yellow_duration=3):
-        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
-        phases = list(logic.getPhases())
-        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
-        phase_state = ['r'] * len(controlled_lanes)
-        try:
-            lane_idx = controlled_lanes.index(lane_id)
-        except ValueError:
-            print(f"[ERROR] Lane {lane_id} not in controlled lanes for {self.tls_id}")
-            return
-        phase_state[lane_idx] = 'G'
-        new_green_phase = traci.trafficlight.Phase(green_duration, "".join(phase_state), 0, 0)
-        phase_state[lane_idx] = 'y'
-        new_yellow_phase = traci.trafficlight.Phase(yellow_duration, "".join(phase_state), 0, 0)
-        phase_state[lane_idx] = 'r'
-        phases.append(new_green_phase)
-        phases.append(new_yellow_phase)
-        current_phase = min(logic.currentPhaseIndex, len(phases) - 1)
-        new_logic = traci.trafficlight.Logic(logic.programID, logic.type, current_phase, phases)
-        traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
-        event = {
-            "action": "add_new_phase_for_lane",
-            "sim_time": traci.simulation.getTime(),
-            "tls_id": self.tls_id,
-            "lane_id": lane_id,
-            "green_duration": green_duration,
-            "yellow_duration": yellow_duration,
-            "phases_len": len(phases),
-            "reward": getattr(self, "last_R", None),
-        }
-        self._log_apc_event(event)
-        print(f"[NEW PHASE] Added new green+yellow phase for lane {lane_id} at TLS {self.tls_id}")
-
     def reorganize_or_create_phase(self, lane_id, event_type):
-        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
-        phases = logic.getPhases()
-        current_phase = traci.trafficlight.getPhase(self.tls_id)
-        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+        """Ensure a phase exists for the specified lane"""
         try:
-            lane_idx = controlled_lanes.index(lane_id)
-        except ValueError:
-            print(f"[ERROR] Lane {lane_id} not in controlled lanes for {self.tls_id}")
-            return
-        target_phase = None
-        for idx, phase in enumerate(phases):
-            if lane_idx < len(phase.state) and phase.state[lane_idx].upper() == 'G':
-                target_phase = idx
-                break
-        if target_phase is None:
-            print(f"[INFO] No phase found for lane {lane_id}. Creating new phase...")
-            self.add_new_phase_for_lane(lane_id, green_duration=self.max_green)
+            controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+            if lane_id not in controlled_lanes:
+                print(f"[ERROR] Lane {lane_id} not controlled")
+                return
+
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
-            phases = logic.getPhases()
-            target_phase = len(phases) - 2
-        traci.trafficlight.setPhase(self.tls_id, target_phase)
-        traci.trafficlight.setPhaseDuration(self.tls_id, self.max_green)
-        event = {
-            "action": "reorganize_or_create_phase",
-            "sim_time": traci.simulation.getTime(),
-            "tls_id": self.tls_id,
-            "lane_id": lane_id,
-            "event_type": event_type,
-            "new_phase": target_phase,
-            "new_duration": self.max_green,
-            "reward": getattr(self, "last_R", None),
-        }
-        self._log_apc_event(event)
+            target_phase = None
+
+            for idx, phase in enumerate(logic.getPhases()):
+                lane_idx = controlled_lanes.index(lane_id)
+                if lane_idx < len(phase.state) and phase.state[lane_idx] in 'Gg':
+                    target_phase = idx
+                    break
+
+            if target_phase is None:
+                print(f"[INFO] Creating new phase for {lane_id}")
+                target_phase = self.add_new_phase_for_lane(lane_id)
+
+            if target_phase is not None:
+                self.log_phase_switch(target_phase)
+                self._log_apc_event({
+                    "action": "reorganize_phase",
+                    "lane_id": lane_id,
+                    "event_type": event_type,
+                    "phase": target_phase,
+                    "weights": self.weights.tolist(),
+                    "bonus": getattr(self, "last_bonus", 0),
+                    "penalty": getattr(self, "last_penalty", 0)
+                })
+
+        except Exception as e:
+            print(f"[ERROR] Phase reorganization failed: {e}")
 
     def compute_status_and_bonus_penalty(self, status_threshold=5):
+        """Compute system status and bonus/penalty signals, log values."""
         status_score = 0
-        for lane_id in self.lane_ids:
-            queue, wtime, delay, _ = self.get_lane_stats(lane_id)
-            status_score += min(queue, 50)/10 + min(wtime, 300)/60
-        avg_status = status_score / len(self.lane_ids)
-        bonus, penalty = 0, 0
-        if avg_status > status_threshold * 1.5:
-            penalty = 2
-            print(f"\n[STATUS PENALTY] {avg_status:.2f} > {status_threshold*1.5:.2f}")
-        elif avg_status < status_threshold / 3:
-            bonus = 1
-            print(f"\n[STATUS BONUS] {avg_status:.2f} < {status_threshold/3:.2f}")
-        return bonus, penalty
+        valid_lanes = 0
 
+        for lane_id in self.lane_ids:
+            queue, wtime, _, _ = self.get_lane_stats(lane_id)
+            if queue < 0 or wtime < 0:
+                continue
+
+            status_score += min(queue, 50)/10 + min(wtime, 300)/60
+            valid_lanes += 1
+
+        if valid_lanes == 0:
+            self.last_bonus = 0
+            self.last_penalty = 0
+            return 0, 0
+
+        avg_status = status_score / valid_lanes
+        # PATCH: Make thresholds more responsive
+        bonus, penalty = 0, 0
+
+        # PATCH: Use <= and >= for stricter boundaries and allow more frequent changes
+        if avg_status >= status_threshold * 1.25:
+            penalty = 2
+            print(f"\n[PENALTY] Status={avg_status:.2f}")
+        elif avg_status <= status_threshold / 2:
+            bonus = 1
+            print(f"\n[BONUS] Status={avg_status:.2f}")
+
+        print(f"[BONUS/PENALTY] {self.tls_id}: Bonus={bonus}, Penalty={penalty}, AvgStatus={avg_status:.2f}")
+        self.last_bonus = bonus
+        self.last_penalty = penalty
+        return bonus, penalty
+    
     def calculate_reward(self, bonus=0, penalty=0):
-        total_density = 0
-        total_speed = 0
-        total_wait = 0
-        total_queue = 0
-        n = max(1, len(self.lane_ids))
-        MAX_DENSITY = 0.2
-        MAX_SPEED = 13.89
-        MAX_WAIT = 300
-        MAX_QUEUE = 50
+        """Calculate reward based on multi-metric performance, log weights/bonus/penalty."""
+        metrics = np.zeros(4)  # density, speed, wait, queue
+        valid_lanes = 0
+        MAX_VALUES = [0.2, 13.89, 300, 50]
+
         for lane_id in self.lane_ids:
             q, w, v, dens = self.get_lane_stats(lane_id)
-            total_density += min(dens, MAX_DENSITY) / MAX_DENSITY
-            total_speed += min(v, MAX_SPEED) / MAX_SPEED
-            total_wait += min(w, MAX_WAIT) / MAX_WAIT
-            total_queue += min(q, MAX_QUEUE) / MAX_QUEUE
-        avg_density = total_density / n
-        avg_speed = total_speed / n
-        avg_wait = total_wait / n
-        avg_queue = total_queue / n
-        self.metric_history.append([avg_density, avg_speed, avg_wait, avg_queue])
-        w_dens, w_spd, w_wait, w_q = self.weights
-        R = (
-            -w_dens * avg_density
-            + w_spd * avg_speed
-            - w_wait * avg_wait
-            - w_q * avg_queue
-            + bonus - penalty
-        ) * 100
-        print(f"\n[REWARD] Phase {traci.trafficlight.getPhase(self.tls_id)}")
-        print(f"  - Density: {avg_density:.2f} (w={w_dens:.2f}) | Speed: {avg_speed:.2f} (w={w_spd:.2f})")
-        print(f"  - Wait: {avg_wait:.2f} (w={w_wait:.2f}) | Queue: {avg_queue:.2f} (w={w_q:.2f})")
-        print(f"  - Bonus/Penalty: {bonus}/{penalty} | R: {R:.2f}")
-        R = max(min(R, 100), -100)
-        self.last_R = R  # For logging
-        return R
+
+            if any(val < 0 for val in (q, w, v, dens)):
+                continue
+
+            metrics += [
+                min(dens, MAX_VALUES[0]) / MAX_VALUES[0],
+                min(v, MAX_VALUES[1]) / MAX_VALUES[1],
+                min(w, MAX_VALUES[2]) / MAX_VALUES[2],
+                min(q, MAX_VALUES[3]) / MAX_VALUES[3]
+            ]
+            valid_lanes += 1
+
+        if valid_lanes == 0:
+            self.last_R = 0
+            return 0
+
+        avg_metrics = metrics / valid_lanes
+        self.metric_history.append(avg_metrics)
+        # PATCH: Always adjust weights before calculating reward for true adaptivity
+        self.adjust_weights()
+
+        R = 100 * (
+            -self.weights[0] * avg_metrics[0] +
+            self.weights[1] * avg_metrics[1] -
+            self.weights[2] * avg_metrics[2] -
+            self.weights[3] * avg_metrics[3] +
+            bonus - penalty
+        )
+
+        self.last_R = np.clip(R, -100, 100)
+
+        print(f"[REWARD] {self.tls_id}: R={self.last_R:.2f} (dens={avg_metrics[0]:.2f}, spd={avg_metrics[1]:.2f}, wait={avg_metrics[2]:.2f}, queue={avg_metrics[3]:.2f})")
+        print(f"  Weights: {self.weights}, Bonus: {bonus}, Penalty: {penalty}")
+        return self.last_R
 
     def calculate_delta_t(self, R):
+        """Calculate adaptive time adjustment with smoothing"""
         raw_delta_t = self.alpha * (R - self.R_target)
         delta_t = 10 * np.tanh(raw_delta_t / 20)
-        print(f"  - Raw Δt: {raw_delta_t:.2f}s | Scaled Δt: {delta_t:.2f}s")
-        print(f"\n[DELTA_T]")
-        print(f"  - R: {R:.2f} | R_target: {self.R_target:.2f}")
-        print(f"  - Alpha: {self.alpha} | Δt: {delta_t:.2f}s")
-        self.last_delta_t = delta_t
-        return delta_t
+        print(f"[DELTA_T] R={R:.2f}, R_target={self.R_target:.2f}, Δt={delta_t:.2f}")
+        return np.clip(delta_t, -10, 10)
 
-    def update_R_target(self):
-        if len(self.reward_history) >= 10:
-            avg_R = np.mean(self.reward_history[-10:])
-            self.R_target = self.r_base + self.r_adjust * (avg_R - self.r_base)
-            print(f"\n[R_TARGET UPDATE]")
-            print(f"  - Last 10 R: {self.reward_history[-10:]}")
-            print(f"  - Avg R: {avg_R:.2f} | New R_target: {self.R_target:.2f}")
+    def update_R_target(self, window=10):
+        """Update target reward based on historical performance"""
+        if len(self.reward_history) < window:
+            return
 
-    def create_new_protected_left_phase(self, lane_id):
-        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
-        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
-        phases = list(logic.getPhases())
-        try:
-            lane_idx = controlled_lanes.index(lane_id)
-        except ValueError:
-            print(f"[ERROR] Lane {lane_id} not in controlled lanes for {self.tls_id}")
-            return None
-        phase_state = ['r'] * len(controlled_lanes)
-        phase_state[lane_idx] = 'G'
-        new_protected_left_green = traci.trafficlight.Phase(self.max_green, "".join(phase_state), 0, 0)
-        phase_state[lane_idx] = 'y'
-        new_protected_left_yellow = traci.trafficlight.Phase(3, "".join(phase_state), 0, 0)
-        phases.append(new_protected_left_green)
-        phases.append(new_protected_left_yellow)
-        new_logic = traci.trafficlight.Logic(
-            logic.programID, logic.type, len(phases) - 2, phases
+        avg_R = np.mean(self.reward_history[-window:])
+        self.R_target = self.r_base + self.r_adjust * (avg_R - self.r_base)
+        print(f"\n[TARGET UPDATE] R_target={self.R_target:.2f} (avg={avg_R:.2f})")
+
+    def add_new_phase_for_lane(self, lane_id, green_duration=None, yellow_duration=3):
+        """Create phase for single lane"""
+        return self.add_new_phase(
+            green_lanes=[lane_id],
+            green_duration=green_duration or self.max_green,
+            yellow_duration=yellow_duration
         )
-        traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
-        event = {
-            "action": "create_protected_left_phase",
-            "sim_time": traci.simulation.getTime(),
-            "tls_id": self.tls_id,
-            "lane_id": lane_id,
-            "green_duration": self.max_green,
-            "yellow_duration": 3,
-            "phases_len": len(phases),
-            "reward": getattr(self, "last_R", None),
-        }
-        self._log_apc_event(event)
-        print(f"[NEW PHASE] Added protected left turn phase for lane {lane_id} at TLS {self.tls_id}")
-        return len(phases) - 2
 
     def trigger_protected_left_if_blocked(self):
-        tls_id = self.tls_id
-        controlled_lanes = traci.trafficlight.getControlledLanes(tls_id)
-        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(tls_id)[0]
-        current_phase = traci.trafficlight.getPhase(tls_id)
-        phase_state = logic.getPhases()[current_phase].state.upper()
-        for lane_idx, lane_id in enumerate(controlled_lanes):
-            if lane_idx < len(phase_state) and phase_state[lane_idx] == 'G' and lane_id in self.lane_ids:
-                vehs = traci.lane.getLastStepVehicleIDs(lane_id)
-                if not vehs:
+        """Detect and handle blocked left turns"""
+        try:
+            controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+            current_phase = traci.trafficlight.getPhase(self.tls_id)
+            current_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
+
+            for lane_idx, lane_id in enumerate(controlled_lanes):
+                if lane_idx >= len(current_state) or current_state[lane_idx] not in 'Gg':
                     continue
-                front_vid = vehs[0]
-                try:
-                    links = traci.lane.getLinks(lane_id)
-                    is_left_turn = any(len(link) > 6 and link[6] == 'l' for link in links)
-                    is_halted = traci.vehicle.getSpeed(front_vid) < 0.1
-                    if is_left_turn and is_halted:
-                        left_phase = None
-                        for idx, phase in enumerate(logic.getPhases()):
-                            state = phase.state.upper()
-                            if lane_idx < len(state) and state[lane_idx] == 'G':
-                                if all((c == 'R' or i == lane_idx) for i, c in enumerate(state)):
-                                    left_phase = idx
-                                    break
-                        if left_phase is None:
-                            left_phase = self.create_new_protected_left_phase(lane_id)
-                        if left_phase is not None and current_phase != left_phase:
-                            print(f"[PATCH] Activating protected left phase for lane {lane_id} due to blocked left-turn vehicle {front_vid}")
-                            traci.trafficlight.setPhase(tls_id, left_phase)
-                            traci.trafficlight.setPhaseDuration(tls_id, self.max_green)
-                            self.last_phase_switch_time = traci.simulation.getTime()
-                            self.last_served_phase = lane_id
-                            event = {
-                                "action": "activate_protected_left_phase",
-                                "sim_time": traci.simulation.getTime(),
-                                "tls_id": self.tls_id,
-                                "lane_id": lane_id,
-                                "phase": left_phase,
-                                "vehicle_id": front_vid,
-                                "reward": getattr(self, "last_R", None),
-                            }
-                            self._log_apc_event(event)
-                            return True
-                except Exception as e:
-                    print(f"[PATCH] Error while checking/creating protected left: {e}")
+
+                if not any(link[6] == 'l' for link in traci.lane.getLinks(lane_id)):
+                    continue
+
+                vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
+                if not vehicles:
+                    continue
+
+                front_veh = vehicles[0]
+                if traci.vehicle.getSpeed(front_veh) > 0.1:
+                    continue
+
+                left_phase = self.create_new_protected_left_phase(lane_id)
+                if left_phase is None or left_phase == current_phase:
+                    continue
+
+                self.log_phase_switch(left_phase)
+                self._log_apc_event({
+                    "action": "activate_protected_left",
+                    "lane_id": lane_id,
+                    "vehicle_id": front_veh,
+                    "phase": left_phase,
+                    "weights": self.weights.tolist(),
+                    "bonus": getattr(self, "last_bonus", 0),
+                    "penalty": getattr(self, "last_penalty", 0)
+                })
+                return True
+
+        except traci.TraCIException as e:
+            print(f"[ERROR] Protected left check failed: {e}")
+
         return False
 
+    def create_new_protected_left_phase(self, lane_id):
+        """Create dedicated left turn phase"""
+        try:
+            controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+            if lane_id not in controlled_lanes:
+                return None
+
+            return self.add_new_phase(
+                green_lanes=[lane_id],
+                green_duration=self.max_green,
+                yellow_duration=3
+            )
+        except Exception as e:
+            print(f"[ERROR] Protected left creation failed: {e}")
+            return None
+
     def control_step(self):
+        """Main control logic executed each simulation step"""
         self.phase_count += 1
-        now = traci.simulation.getTime()
+        current_time = traci.simulation.getTime()
+
+        # PATCH: Always call adjust_weights before calculating reward
+        # 1. Calculate reward
         bonus, penalty = self.compute_status_and_bonus_penalty()
+        self.adjust_weights()  # <-- ensure weights update every step
         R = self.calculate_reward(bonus, penalty)
         self.reward_history.append(R)
-        if self.phase_count % 5 == 0:
-            self.adjust_weights()
+
+        # 2. Periodic adjustments
         if self.phase_count % 10 == 0:
             self.update_R_target()
+
+        # 3. Calculate time adjustment
         delta_t = self.calculate_delta_t(R)
 
-        # --- ENFORCE MINIMUM GREEN ---
-        if self.last_phase_switch_time and now - self.last_phase_switch_time < self.min_green:
-            # Optionally, allow protected left, but only one change per step!
-            if self.trigger_protected_left_if_blocked():
-                self.last_phase_switch_time = now
-                return
-            # No further changes allowed
+        # 4. Enforce minimum green time
+        elapsed_green = current_time - self.last_phase_switch_time
+        if elapsed_green < self.min_green:
             return
 
-        # --- PRIORITY: Protected left ---
+        # 5. Handle priority actions
         if self.trigger_protected_left_if_blocked():
-            self.last_phase_switch_time = now
+            self.last_phase_switch_time = current_time
             return
 
-        # --- PRIORITY: Special events ---
+        # 6. Handle special events
         event_type, event_lane = self.check_special_events()
         if event_type:
-            print(f"\n[HANDLING] {event_type} on {event_lane}")
             self.reorganize_or_create_phase(event_lane, event_type)
-            self.last_phase_switch_time = now
-            self.last_served_phase = event_lane
+            self.last_phase_switch_time = current_time
             return
 
-        # --- Normal phase adjustment ---
+        # 7. Normal phase adjustment
         self.adjust_phase_duration(delta_t)
-        self.last_phase_switch_time = now
-        # Only one phase change per step!
-        return
-    
+        self.last_phase_switch_time = current_time
 def subscribe_vehicles(vehicle_ids):
     """Subscribe to vehicle class for all vehicles once per step."""
     for vid in vehicle_ids:
