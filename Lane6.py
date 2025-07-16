@@ -990,15 +990,31 @@ class UniversalSmartTrafficController:
                 # Handle pending phase transitions
                 if tl_id in self.pending_next_phase:
                     pending_phase, set_time = self.pending_next_phase[tl_id]
-                    if logic and 0 <= current_phase < len(logic.phases):
+                    n_phases = len(logic.phases) if logic else 0
+                    # Defensive: check bounds of current_phase
+                    if logic and 0 <= current_phase < n_phases:
                         phase_duration = logic.phases[current_phase].duration
                     else:
-                        phase_duration = 3                    
+                        phase_duration = 3
+
+                    # Defensive: ensure pending_phase is valid!
+                    if n_phases == 0 or pending_phase >= n_phases or pending_phase < 0:
+                        print(f"[WARNING] Pending phase {pending_phase} for {tl_id} is out of bounds (n_phases={n_phases}), setting to 0")
+                        pending_phase = 0
+
+                    # Defensive: perform phase switch only if enough time has passed
                     if current_time - set_time >= phase_duration - 0.1:
                         traci.trafficlight.setPhase(tl_id, pending_phase)
                         traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
                         self.last_phase_change[tl_id] = current_time
                         del self.pending_next_phase[tl_id]
+                        # Defensive: after switching, ensure the phase is valid
+                        # (sometimes SUMO does not update immediately)
+                        logic = self._get_traffic_light_logic(tl_id)
+                        n_phases = len(logic.phases) if logic else 0
+                        current_phase = traci.trafficlight.getPhase(tl_id)
+                        if n_phases == 0 or current_phase >= n_phases or current_phase < 0:
+                            traci.trafficlight.setPhase(tl_id, max(0, n_phases - 1))
                     continue
                 
                 # Priority handling
@@ -1027,6 +1043,11 @@ class UniversalSmartTrafficController:
                     if starved_phase is not None and current_phase != starved_phase:
                         switched = self._switch_phase_with_yellow_if_needed(
                             tl_id, current_phase, starved_phase, logic, controlled_lanes, lane_data, current_time)
+                        logic = self._get_traffic_light_logic(tl_id)
+                        n_phases = len(logic.phases) if logic else 1
+                        current_phase = traci.trafficlight.getPhase(tl_id)
+                        if current_phase >= n_phases:
+                            traci.trafficlight.setPhase(tl_id, n_phases - 1)
                         if not switched:
                             traci.trafficlight.setPhase(tl_id, starved_phase)
                             traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
@@ -1099,7 +1120,9 @@ class UniversalSmartTrafficController:
         Find a yellow (amber) phase between two phases.
         Returns the yellow phase index if found, else None.
         """
-        if not logic or from_idx == to_idx:
+        # Defensive: check bounds!
+        n_phases = len(logic.phases) if logic else 0
+        if not logic or from_idx == to_idx or from_idx >= n_phases or to_idx >= n_phases or from_idx < 0 or to_idx < 0:
             return None
         current = logic.phases[from_idx].state.upper()
         target = logic.phases[to_idx].state.upper()
