@@ -439,6 +439,7 @@ class AdaptivePhaseController:
 
     def control_step(self):
         self.phase_count += 1
+        now = traci.simulation.getTime()
         bonus, penalty = self.compute_status_and_bonus_penalty()
         R = self.calculate_reward(bonus, penalty)
         self.reward_history.append(R)
@@ -447,21 +448,36 @@ class AdaptivePhaseController:
         if self.phase_count % 10 == 0:
             self.update_R_target()
         delta_t = self.calculate_delta_t(R)
-        now = traci.simulation.getTime()
+
+        # --- ENFORCE MINIMUM GREEN ---
         if self.last_phase_switch_time and now - self.last_phase_switch_time < self.min_green:
+            # Optionally, allow protected left, but only one change per step!
             if self.trigger_protected_left_if_blocked():
+                self.last_phase_switch_time = now
                 return
+            # No further changes allowed
             return
+
+        # --- PRIORITY: Protected left ---
         if self.trigger_protected_left_if_blocked():
+            self.last_phase_switch_time = now
             return
+
+        # --- PRIORITY: Special events ---
         event_type, event_lane = self.check_special_events()
         if event_type:
             print(f"\n[HANDLING] {event_type} on {event_lane}")
             self.reorganize_or_create_phase(event_lane, event_type)
             self.last_phase_switch_time = now
             self.last_served_phase = event_lane
-        else:
-            self.adjust_phase_duration(self.calculate_delta_t(R))
+            return
+
+        # --- Normal phase adjustment ---
+        self.adjust_phase_duration(delta_t)
+        self.last_phase_switch_time = now
+        # Only one phase change per step!
+        return
+    
 def subscribe_vehicles(vehicle_ids):
     """Subscribe to vehicle class for all vehicles once per step."""
     for vid in vehicle_ids:
@@ -974,7 +990,10 @@ class UniversalSmartTrafficController:
                 # Handle pending phase transitions
                 if tl_id in self.pending_next_phase:
                     pending_phase, set_time = self.pending_next_phase[tl_id]
-                    phase_duration = logic.phases[current_phase].duration if logic else 3
+                    if logic and 0 <= current_phase < len(logic.phases):
+                        phase_duration = logic.phases[current_phase].duration
+                    else:
+                        phase_duration = 3                    
                     if current_time - set_time >= phase_duration - 0.1:
                         traci.trafficlight.setPhase(tl_id, pending_phase)
                         traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
