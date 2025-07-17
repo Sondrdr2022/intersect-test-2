@@ -18,7 +18,7 @@ def get_agent_params():
     try:
         if controller is None:
             return jsonify({'error': 'Controller not initialized'}), 503
-        params = controller.rl_agent.adaptive_params
+        params = controller.agent.adaptive_params
         return jsonify(params)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -29,7 +29,7 @@ def get_epsilon():
     try:
         if controller is None:
             return jsonify({'error': 'Controller not initialized'}), 503
-        return jsonify({'epsilon': controller.rl_agent.epsilon})
+        return jsonify({'epsilon': controller.agent.epsilon})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -240,7 +240,46 @@ class UniversalAdaptiveRLAgent:
             return
         avg_R = np.mean(self.reward_history[-window:])
         self.R_target = self.r_base + self.r_adjust * (avg_R - self.r_base)
-
+    
+    def create_new_phase(self, tls_id, lane_ids, min_green, yellow):
+        """
+        Create and return a new phase object for SUMO, and log to APC state.
+        """
+        # Build a phase logic object (SUMO expects a phase string, e.g., 'GrGr' for green/red)
+        phase_str = self._build_phase_string(lane_ids)
+        phase_obj = {
+            "phase_str": phase_str,
+            "min_green": min_green,
+            "yellow": yellow
+        }
+        # Save to APC state
+        self.apc_state.setdefault("phases", {})[tls_id] = phase_obj
+        self._save_apc_state()
+        return phase_obj
+    
+    def extend_current_phase(self, tls_id, delta_t):
+        """
+        Extend the duration of the current phase by delta_t seconds.
+        """
+        # Load the current phase from APC state
+        curr_phase = self.apc_state.get("phases", {}).get(tls_id)
+        if curr_phase:
+            new_green = max(curr_phase["min_green"] + delta_t, self.min_green)
+            curr_phase["min_green"] = new_green
+            self._save_apc_state()
+            return curr_phase
+        return None
+    def push_phase_to_sumo(self, tls_id, phase_obj):
+        """
+        Push the given phase object (from APC state) to SUMO via traci.
+        """
+        phase_str = phase_obj["phase_str"]
+        min_green = phase_obj["min_green"]
+        yellow = phase_obj["yellow"]
+    # Compose a SUMO phase logic and set it
+    # This example assumes a single phase update; for more, build a full program
+        traci.trafficlight.setRedYellowGreenState(tls_id, phase_str)
+        traci.trafficlight.setPhaseDuration(tls_id, min_green)
     # --- RL logic ---
     def is_valid_state(self, state):
         arr = np.array(state)
@@ -358,21 +397,43 @@ class UniversalAdaptiveRLAgent:
         Unified control step:
         - Calculates reward using adaptive logic
         - Selects RL action
-        - Executes SUMO phase manipulation as RL action
+        - Executes SUMO phase manipulation as RL action (including adaptive phase creation/extension)
         - Updates Q-table
         """
         self.phase_count += 1
+
+        # Select RL action
+        action = self.get_action(state, tl_id=tl_id, action_size=self.action_size)
+        delta_t = self.calculate_delta_t(self.last_R)
         bonus, penalty = self.compute_status_and_bonus_penalty()
         reward = self.calculate_reward(bonus, penalty)
-        action = self.get_action(state, tl_id=tl_id, action_size=self.action_size)
-        # Here, implement RL actions: phase switching, phase creation, adjust durations, etc.
-        # After action, get new state and update Q-table
-        next_state = self._get_next_state_after_action(tl_id)
+
+        # Adaptive phase logic: create or extend phases if needed
+        if self.need_new_phase(state):
+            phase_obj = self.create_new_phase(tl_id, self.lane_ids, self.min_green, yellow=3)
+            self.push_phase_to_sumo(tl_id, phase_obj)
+            # It's important to observe the new state after pushing a new phase
+            next_state = self._get_next_state_after_action(tl_id)
+        elif self.need_extend_phase(state):
+            phase_obj = self.extend_current_phase(tl_id, delta_t)
+            if phase_obj:
+                self.push_phase_to_sumo(tl_id, phase_obj)
+                next_state = self._get_next_state_after_action(tl_id)
+            else:
+                next_state = self._get_next_state_after_action(tl_id)
+        else:
+            # Standard RL phase switching
+            traci.trafficlight.setPhase(tl_id, action)
+            traci.trafficlight.setPhaseDuration(tl_id, self.min_green)
+            next_state = self._get_next_state_after_action(tl_id)
+
+        # Q-learning update
         self.update_q_table(state, action, reward, next_state, tl_id=tl_id)
         self.reward_history.append(reward)
         if self.phase_count % 10 == 0:
             self.update_R_target()
-        # Optionally log event
+
+        # Optionally log event for debugging/analysis
         self._log_apc_event({
             "action": "control_step",
             "selected_action": action,
@@ -398,6 +459,7 @@ class UniversalAdaptiveRLAgent:
         return arr
 
     # Add more adaptive logic and RL action implementations as needed
+
 class UniversalSmartTrafficController:
     DILEMMA_ZONE_THRESHOLD = 12.0  # meters
     def __init__(self, sumocfg_path=None, mode="train"):
@@ -434,8 +496,8 @@ class UniversalSmartTrafficController:
             'time_since_green': 120
         }
         # REMOVE this line:
-        # self.rl_agent = UniversalAdaptiveRLAgent(state_size=12, action_size=8, mode=mode)
-        # self.rl_agent.load_model()
+        # self.agent = UniversalAdaptiveRLAgent(state_size=12, action_size=8, mode=mode)
+        # self.agent.load_model()
         self.adaptive_params = {
             'min_green': 30, 'max_green': 80, 'starvation_threshold': 40,
             'reward_scale': 40, 'queue_weight': 0.6, 'wait_weight': 0.3,
@@ -608,7 +670,7 @@ class UniversalSmartTrafficController:
             self.last_phase_change[tl_id] = current_time
             self.phase_utilization[(tl_id, phase_idx)] = self.phase_utilization.get((tl_id, phase_idx), 0) + 1
             print(f"[PROTECTED LEFT] Served at {tl_id} for lane {target} (phase {phase_idx})")
-            self.rl_agent.training_data.append({
+            self.agent.training_data.append({
                 'event': 'protected_left_served',
                 'lane_id': target,
                 'tl_id': tl_id,
@@ -741,7 +803,7 @@ class UniversalSmartTrafficController:
         self.tl_logic_cache[tl_id] = traci.trafficlight.getAllProgramLogics(tl_id)[0]
         # Update action space for RL agent and controller
         self.tl_action_sizes[tl_id] = len(self.tl_logic_cache[tl_id].phases)
-        self.rl_agent.action_size = max(self.tl_action_sizes.values())
+        self.agent.action_size = max(self.tl_action_sizes.values())
         print(f"[ACTION SPACE] tl_id={tl_id} now n_phases={self.tl_action_sizes[tl_id]}")
         return len(phases) - 2  # return index of new green phase
 
@@ -1087,7 +1149,7 @@ class UniversalSmartTrafficController:
                 traci.trafficlight.setPhaseDuration(tl_id, dur)
                 self.ambulance_active[tl_id] = True
                 self.ambulance_start_time[tl_id] = current_time
-                self.rl_agent.training_data.append({'event':'ambulance_priority','lane_id':target,'tl_id':tl_id,
+                self.agent.training_data.append({'event':'ambulance_priority','lane_id':target,'tl_id':tl_id,
                     'phase':phase,'simulation_time':current_time,'distance_to_stopline':min_dist,'duration':dur})
                 return True
             return False
@@ -1104,8 +1166,8 @@ class UniversalSmartTrafficController:
             target = self._select_target_lane(tl_id, controlled_lanes, lane_data, current_time)
             if not target: return
             state = self._create_state_vector(target, lane_data)
-            if not self.rl_agent.is_valid_state(state): return
-            action = self.rl_agent.get_action(state, lane_id=target)
+            if not self.agent.is_valid_state(state): return
+            action = self.agent.get_action(state, lane_id=target)
             last_time = self.last_phase_change[tl_id] if isinstance(self.last_phase_change, dict) else 0
             if current_time - last_time >= 5:
                 self._execute_control_action(tl_id, target, action, lane_data, current_time)
@@ -1253,7 +1315,7 @@ class UniversalSmartTrafficController:
                     
                 d = intersection_data[tl_id]
                 state = self._create_intersection_state_vector(tl_id, intersection_data)
-                if not self.rl_agent.is_valid_state(state): 
+                if not self.agent.is_valid_state(state): 
                     continue
                     
                 queues, waits = d['queues'], d['waits']
@@ -1295,7 +1357,7 @@ class UniversalSmartTrafficController:
                     - only_empty_green_penalty  # strong penalty!
                     + congestion_bonus
                 )
-                self.rl_agent.reward_history.append(reward)
+                self.agent.reward_history.append(reward)
                 reward_components = {
                     "queue_penalty": -self.adaptive_params['queue_weight'] * sum(queues),
                     "wait_penalty": -self.adaptive_params['wait_weight'] * sum(waits),
@@ -1312,14 +1374,14 @@ class UniversalSmartTrafficController:
                 # Update Q-table if we have previous state
                 if tl_id in self.previous_states and tl_id in self.previous_actions:
                     prev_state, prev_action = self.previous_states[tl_id], self.previous_actions[tl_id]
-                    self.rl_agent.update_q_table(
+                    self.agent.update_q_table(
                         prev_state, prev_action, reward, state, 
                         tl_id=tl_id, 
                         extra_info={
                             **reward_components,
                             'episode': self.current_episode,
                             'simulation_time': current_time,
-                            'action_name': self.rl_agent._get_action_name(prev_action),
+                            'action_name': self.agent._get_action_name(prev_action),
                             'queue_length': max(queues) if queues else 0,
                             'waiting_time': max(waits) if waits else 0,
                             'mean_speed': np.mean(d['speeds']) if d['speeds'] else 0,
@@ -1330,7 +1392,7 @@ class UniversalSmartTrafficController:
                     )
                 
                 # Store current state/action for next step
-                action = self.rl_agent.get_action(state, tl_id=tl_id)
+                action = self.agent.get_action(state, tl_id=tl_id)
                 self.previous_states[tl_id], self.previous_actions[tl_id] = state, action
                 
         except Exception as e:
@@ -1340,7 +1402,7 @@ class UniversalSmartTrafficController:
     def _create_state_vector(self, lane_id, lane_data):
         try:
             if not (isinstance(lane_data, dict) and lane_id in lane_data):
-                return np.zeros(self.rl_agent.state_size)
+                return np.zeros(self.agent.state_size)
             d = lane_data[lane_id]
             tl_id = self.lane_to_tl.get(lane_id, "")
             norm = lambda x, b: min(x / b, 1.0)
@@ -1366,7 +1428,7 @@ class UniversalSmartTrafficController:
             return np.nan_to_num(state, nan=0.0, posinf=1.0, neginf=0.0)
         except Exception as e:
             print(f"Error creating state vector for {lane_id}: {e}")
-            return np.zeros(self.rl_agent.state_size)
+            return np.zeros(self.agent.state_size)
 
     def _calculate_reward(self, lane_id, lane_data, action_taken, current_time):
         try:
@@ -1395,8 +1457,8 @@ class UniversalSmartTrafficController:
 
     def end_episode(self):
     # Update adaptive parameters based on average reward
-        if self.rl_agent.reward_history:
-            avg_reward = np.mean(self.rl_agent.reward_history)
+        if self.agent.reward_history:
+            avg_reward = np.mean(self.agent.reward_history)
             print(f"Average reward this episode: {avg_reward:.2f}")
             if avg_reward < -10:
                 self.adaptive_params['min_green'] = min(self.adaptive_params['min_green'] + 1, self.adaptive_params['max_green'])
@@ -1406,18 +1468,18 @@ class UniversalSmartTrafficController:
                 self.adaptive_params['max_green'] = max(self.adaptive_params['max_green'] - 5, 30)
         else:
             print("No reward history for adaptive param update.")
-        self.rl_agent.adaptive_params = self.adaptive_params.copy()
+        self.agent.adaptive_params = self.adaptive_params.copy()
         print("🔄 Updated adaptive parameters:", self.adaptive_params)
-        self.rl_agent.save_model(adaptive_params=self.adaptive_params)
+        self.agent.save_model(adaptive_params=self.adaptive_params)
 
         # --- Epsilon decay: add this line ---
-        old_epsilon = self.rl_agent.epsilon
-        self.rl_agent.epsilon = max(self.rl_agent.epsilon * self.rl_agent.epsilon_decay, self.rl_agent.min_epsilon)
-        print(f"🚦 Epsilon after training/episode: {old_epsilon} -> {self.rl_agent.epsilon}")
+        old_epsilon = self.agent.epsilon
+        self.agent.epsilon = max(self.agent.epsilon * self.agent.epsilon_decay, self.agent.min_epsilon)
+        print(f"🚦 Epsilon after training/episode: {old_epsilon} -> {self.agent.epsilon}")
 
         self.previous_states.clear()
         self.previous_actions.clear()
-        self.rl_agent.reward_history.clear()
+        self.agent.reward_history.clear()
         
 
     def _update_adaptive_parameters(self, performance_stats):
