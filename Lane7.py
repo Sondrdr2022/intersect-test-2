@@ -52,7 +52,12 @@ class AdaptivePhaseController:
     - Does NOT select among existing phases or perform RL learning.
     - Handles all adaptive reward/metric calculations.
     """
-
+    BLOCKED_SPEED_THRESHOLD = 0.2
+    BLOCKED_DURATION_THRESHOLD = 5.0
+    BLOCKED_QUEUE_THRESHOLD = 2      # minimum queue size to consider blocked
+    BLOCKED_WAIT_THRESHOLD = 5.0     # minimum waiting time per vehicle to consider blocked
+    CLEARANCE_DISTANCE = 2.0         # Example, for clearance logic
+    CLEARANCE_COOLDOWN = 5.0    
     def __init__(self, lane_ids, tls_id, alpha=1.0, min_green=10, max_green=60,
                  r_base=0.5, r_adjust=0.1, severe_congestion_threshold=0.8, 
                  large_delta_t=20, apc_data_file=None):
@@ -272,13 +277,14 @@ class AdaptivePhaseController:
             if any(val < 0 for val in (q, w, v, dens)):
                 continue
             metrics += [
-                min(dens, max_vals[0]) / max_vals[0],
-                min(v, max_vals[1]) / max_vals[1],
-                min(w, max_vals[2]) / max_vals[2],
-                min(q, max_vals[3]) / max_vals[3]
+                min(dens, max_vals[0]) / max_vals[0] if max_vals[0] > 0 else 0,
+                min(v, max_vals[1]) / max_vals[1] if max_vals[1] > 0 else 0,
+                min(w, max_vals[2]) / max_vals[2] if max_vals[2] > 0 else 0,
+                min(q, max_vals[3]) / max_vals[3] if max_vals[3] > 0 else 0
             ]
             valid_lanes += 1
         if valid_lanes == 0:
+            print("[WARN] No valid lanes found for reward calculation.")
             self.last_R = 0
             return 0
         avg_metrics = metrics / valid_lanes
@@ -293,7 +299,6 @@ class AdaptivePhaseController:
         )
         self.last_R = np.clip(R, -100, 100)
         return self.last_R
-
     def update_R_target(self, window=10):
         if len(self.reward_history) < window:
             return
@@ -329,24 +334,63 @@ class AdaptivePhaseController:
         return "".join(state)
 
     def detect_blocked_left_turn(self):
+        """
+        Improved: Detects left-turn lanes where vehicles have been blocked for more than BLOCKED_DURATION_THRESHOLD seconds
+        and are not moving (speed < BLOCKED_SPEED_THRESHOLD). Also considers queue and waiting time.
+        Logs lane status for debugging.
+        Returns list of (lane_id, n_blocked) if any left lane is blocked.
+        """
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
-        current_phase = traci.trafficlight.getPhase(self.tls_id)
         current_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
         blocked_lefts = []
+        now = traci.simulation.getTime()
+        TIME_TRACK = getattr(self, "_vehicle_blocked_time", {})
+        updated_time_track = {}
+
         for lane_idx, lane_id in enumerate(controlled_lanes):
-            links = traci.lane.getLinks(lane_id)
-            is_left = any(len(link) > 6 and link[6] == 'l' for link in links)
-            if not is_left:
-                continue
-            if lane_idx >= len(current_state) or current_state[lane_idx] not in 'Gg':
-                continue
-            vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
-            if not vehicles:
-                continue
-            speeds = [traci.vehicle.getSpeed(vid) for vid in vehicles]
-            if speeds and max(speeds) < 0.2:
-                blocked_lefts.append((lane_id, len(vehicles)))
+            try:
+                links = traci.lane.getLinks(lane_id)
+                is_left = any(len(link) > 6 and link[6] == 'l' for link in links)
+                if not is_left:
+                    continue
+                # Only check lanes with green signal
+                if lane_idx >= len(current_state) or current_state[lane_idx] not in 'Gg':
+                    continue
+                vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
+                if not vehicles:
+                    continue
+
+                # Get queue and waiting time for this lane
+                queue, waiting_time, _, _ = self.get_lane_stats(lane_id)
+                blocked_count = 0
+                for vid in vehicles:
+                    # Use both speed and waiting time for more robust detection
+                    try:
+                        speed = traci.vehicle.getSpeed(vid)
+                        v_wait = traci.vehicle.getWaitingTime(vid) if hasattr(traci.vehicle, 'getWaitingTime') else waiting_time
+                    except Exception as e:
+                        speed = 0; v_wait = waiting_time
+                    if speed < self.BLOCKED_SPEED_THRESHOLD:
+                        prev_time = TIME_TRACK.get(vid, now)
+                        updated_time_track[vid] = prev_time
+                        stopped_duration = now - prev_time
+                        # Consider blocked only if waiting time is also high
+                        if (stopped_duration > self.BLOCKED_DURATION_THRESHOLD and v_wait > self.BLOCKED_WAIT_THRESHOLD):
+                            blocked_count += 1
+                    else:
+                        # Vehicle moved, remove from tracking
+                        pass
+                # Log lane status
+                print(f"[BLOCKED LEFT CHECK] Lane {lane_id}: queue={queue}, wait={waiting_time:.1f}, blocked_count={blocked_count}")
+                # Only consider lane blocked if enough vehicles and blocked_count
+                if blocked_count >= 1 and queue >= self.BLOCKED_QUEUE_THRESHOLD:
+                    print(f"[BLOCKED LEFT TURN DETECTED] Lane {lane_id} blocked: blocked_count={blocked_count}, queue={queue}, wait={waiting_time:.1f}")
+                    blocked_lefts.append((lane_id, blocked_count))
+            except Exception as e:
+                print(f"[ERROR] detect_blocked_left_turn: lane {lane_id}: {e}")
+        setattr(self, "_vehicle_blocked_time", updated_time_track)
         return blocked_lefts
+
 
     def create_true_protected_left_phase(self, left_lane):
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
@@ -469,10 +513,9 @@ class AdaptivePhaseController:
             length = max(1.0, traci.lane.getLength(lane_id))
             density = traci.lane.getLastStepVehicleNumber(lane_id) / length
             return queue, waiting_time, mean_speed, density
-        except traci.TraCIException:
+        except traci.TraCIException as e:
+            print(f"[ERROR] get_lane_stats for lane {lane_id}: {e}")
             return 0, 0, 0, 0
-
-
 
     def add_new_phase(self, green_lanes, green_duration=20, yellow_duration=3, yellow_lanes=None):
         """Add new phase to SUMO and record in apc_state."""
@@ -568,6 +611,7 @@ class AdaptivePhaseController:
                 front_veh = vehicles[0]
                 if traci.vehicle.getSpeed(front_veh) > 0.1:
                     continue
+                
 
                 left_phase = self.create_new_protected_left_phase(lane_id)
                 if left_phase is None or left_phase == current_phase:
@@ -673,24 +717,29 @@ class AdaptivePhaseController:
         Returns True if clearance was enforced, False otherwise.
         """
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+        CLEARANCE_DISTANCE = 2.0  # meters
+        CLEARANCE_COOLDOWN = 5.0  # seconds
+        last_clearance = getattr(self, "_last_clearance_time", 0)
+        now = traci.simulation.getTime()
+        # Don't trigger clearance too frequently
+        if now - last_clearance < CLEARANCE_COOLDOWN:
+            return False
         for lane_id in controlled_lanes:
             veh_ids = traci.lane.getLastStepVehicleIDs(lane_id)
+            stop_line_pos = self.get_lane_stop_line_position(lane_id)
             for vid in veh_ids:
                 try:
-                    pos = traci.vehicle.getPosition(vid)  # (x, y)
-                    # You might need lane geometry to get the stop line position.
-                    stop_line_pos = self.get_lane_stop_line_position(lane_id)  # Implement this utility!
-                    # Check if car is within 2 meters of stop line
-                    if abs(pos[0] - stop_line_pos[0]) < 2.0 and abs(pos[1] - stop_line_pos[1]) < 2.0:
-                        # Set all lights to red for 1 second
+                    pos = traci.vehicle.getPosition(vid)
+                    if abs(pos[0] - stop_line_pos[0]) < CLEARANCE_DISTANCE and abs(pos[1] - stop_line_pos[1]) < CLEARANCE_DISTANCE:
                         traci.trafficlight.setRedYellowGreenState(self.tls_id, "r" * len(controlled_lanes))
                         traci.trafficlight.setPhaseDuration(self.tls_id, 1)
                         print(f"[CLEARANCE] Enforced all red for 1s due to car {vid} in lane {lane_id}")
+                        setattr(self, "_last_clearance_time", now)
                         return True
-                except Exception:
+                except Exception as e:
+                    print(f"[ERROR] Clearance check for car {vid} in lane {lane_id}: {e}")
                     continue
         return False
-
     def get_lane_stop_line_position(self, lane_id):
         """
         Utility to get stop line position for a lane.
