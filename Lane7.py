@@ -824,10 +824,6 @@ class AdaptivePhaseController:
             "phase_idx": len(phases) - 2
         })
         return len(phases) - 2
-
-class AdaptivePhaseController:
-    # ... [existing __init__ and methods unchanged] ...
-
     def detect_blocked_left_turn_conflict(self):
         """
         Detect if any left-turn lane is blocked by conflicting straight traffic.
@@ -859,10 +855,7 @@ class AdaptivePhaseController:
             return None, False
 
     def serve_true_protected_left_if_needed(self):
-        """
-        If a blocked left-turn is detected, serve a true protected left-turn phase
-        with a yellow phase inserted before switching from green to red.
-        """
+        # If blocked left-turn detected, serve protected left phase
         lane_id, needs_protection = self.detect_blocked_left_turn_conflict()
         if not needs_protection:
             return False
@@ -995,7 +988,6 @@ class AdaptivePhaseController:
         except traci.TraCIException as e:
             print(f"[ERROR] Phase switch failed: {e}")
             return False
-
     def control_step(self):
         """
         Main control logic. Checks for blocked left-turns and activates protected left-turn phase.
@@ -1032,7 +1024,6 @@ class AdaptivePhaseController:
         self.adjust_phase_duration(delta_t)
         self.last_phase_switch_time = current_time
 
-# ... rest of file unchanged ...
 
 class EnhancedQLearningAgent:
     def __init__(self, state_size, action_size, adaptive_controller, learning_rate=0.1, discount_factor=0.95, 
