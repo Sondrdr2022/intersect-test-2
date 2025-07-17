@@ -825,18 +825,54 @@ class AdaptivePhaseController:
         })
         return len(phases) - 2
 
+class AdaptivePhaseController:
+    # ... [existing __init__ and methods unchanged] ...
+
+    def detect_blocked_left_turn_conflict(self):
+        """
+        Detect if any left-turn lane is blocked by conflicting straight traffic.
+        If found, returns (lane_id, True) for blocked left turn needing protection.
+        """
+        try:
+            controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+            for lane_id in controlled_lanes:
+                # Check if lane is a left-turn lane
+                links = traci.lane.getLinks(lane_id)
+                is_left = any(len(link) > 6 and link[6] == 'l' for link in links)
+                if not is_left:
+                    continue
+
+                vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
+                if not vehicles:
+                    continue
+
+                # If all vehicles have speed < 0.2, consider blocked
+                speeds = [traci.vehicle.getSpeed(vid) for vid in vehicles]
+                if speeds and max(speeds) < 0.2:
+                    # Now check if conflicting straight lanes have queue
+                    conflicting_straight = self.get_conflicting_straight_lanes(lane_id)
+                    if any(traci.lane.getLastStepVehicleNumber(l) > 0 for l in conflicting_straight):
+                        return lane_id, True
+            return None, False
+        except Exception as e:
+            print(f"[ERROR] Blocked left turn conflict detection failed: {e}")
+            return None, False
+
     def serve_true_protected_left_if_needed(self):
-        blocked = self.detect_blocked_left_turn()
-        if not blocked:
+        """
+        If a blocked left-turn is detected, serve a true protected left-turn phase
+        with a yellow phase inserted before switching from green to red.
+        """
+        lane_id, needs_protection = self.detect_blocked_left_turn_conflict()
+        if not needs_protection:
             return False
 
-        lane_id, n_blocked = max(blocked, key=lambda x: x[1])
-        queue, wait, _, _ = self.get_lane_stats(lane_id)
-        phase_idx = self.create_true_protected_left_phase(lane_id, queue_length=queue, waiting_time=wait)
+        queue = traci.lane.getLastStepHaltingNumber(lane_id)
+        wait = traci.lane.getWaitingTime(lane_id)
+        phase_idx = self.create_true_protected_left_phase(lane_id)
         if phase_idx is None:
             return False
 
-        # Flicker prevention
         now = traci.simulation.getTime()
         if self.last_phase_idx == phase_idx and now - self.last_phase_switch_sim_time < self.min_green:
             print(f"[TRUE PROTECTED LEFT] Flicker prevention for {self.tls_id}")
@@ -844,6 +880,8 @@ class AdaptivePhaseController:
 
         # Dynamically set phase duration based on queue/wait
         green_duration = min(self.max_green, max(self.min_green, queue * 2 + wait * 0.1))
+        # Insert yellow before switching if coming from green
+        self.insert_yellow_phase_if_needed(phase_idx)
         traci.trafficlight.setPhase(self.tls_id, phase_idx)
         traci.trafficlight.setPhaseDuration(self.tls_id, green_duration)
         print(f"[TRUE PROTECTED LEFT] Served for lane {lane_id} at phase {phase_idx} for {green_duration:.1f}s (queue={queue}, wait={wait})")
@@ -859,7 +897,110 @@ class AdaptivePhaseController:
         self.last_phase_idx = phase_idx
         return True
 
+    def insert_yellow_phase_if_needed(self, next_phase_idx):
+        """
+        When switching phases, if any lane is going from green to red,
+        insert a yellow phase before switching.
+        """
+        try:
+            logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+            current_phase = traci.trafficlight.getPhase(self.tls_id)
+            current_state = logic.getPhases()[current_phase].state
+            target_state = logic.getPhases()[next_phase_idx].state
+            n = len(current_state)
+            yellow_needed = False
+            yellow_state = ['r'] * n
+            for i in range(n):
+                if current_state[i].upper() == 'G' and target_state[i].upper() == 'R':
+                    yellow_needed = True
+                    yellow_state[i] = 'y'
+                else:
+                    yellow_state[i] = target_state[i]
+
+            if yellow_needed:
+                # Check if this yellow phase exists
+                for idx, phase in enumerate(logic.getPhases()):
+                    if phase.state == ''.join(yellow_state):
+                        # Set yellow phase before switching
+                        traci.trafficlight.setPhase(self.tls_id, idx)
+                        traci.trafficlight.setPhaseDuration(self.tls_id, 3)
+                        print(f"[YELLOW INSERT] Inserted yellow phase before switch at {self.tls_id}")
+                        time.sleep(0.2)  # Let yellow phase run (small delay, adjust if needed)
+                        break
+                else:
+                    # Create new yellow phase if not found
+                    yellow_phase = traci.trafficlight.Phase(3, ''.join(yellow_state))
+                    phases = list(logic.getPhases()) + [yellow_phase]
+                    new_logic = traci.trafficlight.Logic(
+                        logic.programID, logic.type, len(phases) - 1, phases
+                    )
+                    traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
+                    traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
+                    traci.trafficlight.setPhaseDuration(self.tls_id, 3)
+                    print(f"[YELLOW INSERT] Created & inserted new yellow phase before switch at {self.tls_id}")
+                    time.sleep(0.2)
+        except Exception as e:
+            print(f"[ERROR] Yellow phase insertion failed: {e}")
+
+    def log_phase_switch(self, new_phase_idx):
+        """
+        Safely switch phases, inserting yellow phase if needed.
+        """
+        try:
+            old_phase = traci.trafficlight.getPhase(self.tls_id)
+            old_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
+            current_sim_time = traci.simulation.getTime()
+
+            # Flicker prevention: don't allow switch to same phase or too soon since last switch
+            if (
+                self.last_phase_idx == new_phase_idx and 
+                current_sim_time - self.last_phase_switch_sim_time < self.min_green
+            ):
+                print(f"[PHASE SWITCH BLOCKED] Flicker prevention triggered for {self.tls_id}")
+                return False
+
+            # ENFORCE: never allow switching if not enough green time has elapsed
+            if current_sim_time - self.last_phase_switch_sim_time < self.min_green:
+                print(f"[PHASE SWITCH BLOCKED] Minimum green not elapsed ({current_sim_time - self.last_phase_switch_sim_time:.2f}s < {self.min_green}s)")
+                return False
+
+            # Insert yellow phase if needed
+            self.insert_yellow_phase_if_needed(new_phase_idx)
+
+            traci.trafficlight.setPhase(self.tls_id, new_phase_idx)
+            traci.trafficlight.setPhaseDuration(self.tls_id, max(self.min_green, self.max_green))
+
+            new_phase = traci.trafficlight.getPhase(self.tls_id)
+            new_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
+            self.last_phase_idx = new_phase_idx
+            self.last_phase_switch_sim_time = current_sim_time
+
+            event = {
+                "action": "phase_switch",
+                "old_phase": old_phase,
+                "new_phase": new_phase,
+                "old_state": old_state,
+                "new_state": new_state,
+                "reward": getattr(self, "last_R", None),
+                "weights": self.weights.tolist(),
+                "bonus": getattr(self, "last_bonus", 0),
+                "penalty": getattr(self, "last_penalty", 0)
+            }
+            self._log_apc_event(event)
+
+            print(f"\n[PHASE SWITCH] {self.tls_id}: {old_phase}→{new_phase}")
+            print(f"  Old: {old_state}\n  New: {new_state}")
+            print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
+            return True
+        except traci.TraCIException as e:
+            print(f"[ERROR] Phase switch failed: {e}")
+            return False
+
     def control_step(self):
+        """
+        Main control logic. Checks for blocked left-turns and activates protected left-turn phase.
+        Always inserts yellow between green-red transitions.
+        """
         self.phase_count += 1
         current_time = traci.simulation.getTime()
         bonus, penalty = self.compute_status_and_bonus_penalty()
@@ -875,22 +1016,23 @@ class AdaptivePhaseController:
         if elapsed_green < self.min_green:
             return
 
-        # Use new true protected left logic
+        # Serve protected left-turn if blocked/conflict detected (highest priority)
         if self.serve_true_protected_left_if_needed():
             self.last_phase_switch_time = current_time
             return
 
+        # Handle other special events as normal
         event_type, event_lane = self.check_special_events()
         if event_type:
             self.reorganize_or_create_phase(event_lane, event_type)
             self.last_phase_switch_time = current_time
             return
+
+        # Otherwise, adjust phase duration as usual
         self.adjust_phase_duration(delta_t)
         self.last_phase_switch_time = current_time
+
 # ... rest of file unchanged ...
-
-
-
 
 class EnhancedQLearningAgent:
     def __init__(self, state_size, action_size, adaptive_controller, learning_rate=0.1, discount_factor=0.95, 
