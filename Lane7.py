@@ -163,10 +163,12 @@ class AdaptivePhaseController:
 
     def create_or_extend_phase(self, green_lanes, delta_t):
         """Create a new phase or extend the current phase, log to pkl."""
+        print(f"[DEBUG] [CREATE_OR_EXTEND_PHASE] Will create/extend phase for lanes {green_lanes} with delta_t={delta_t:.2f}")
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         # For new phase creation
         new_state = self.create_phase_state(green_lanes=green_lanes)
         duration = np.clip(traci.trafficlight.getPhaseDuration(self.tls_id) + delta_t, self.min_green, self.max_green)
+        print(f"[DEBUG] [CREATE_OR_EXTEND_PHASE] New phase state: {new_state}, Duration: {duration:.2f}")
         new_phase = traci.trafficlight.Phase(duration, new_state)
         phases = list(logic.getPhases()) + [new_phase]
         new_logic = traci.trafficlight.Logic(
@@ -174,10 +176,10 @@ class AdaptivePhaseController:
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
+        print(f"[DEBUG] [CREATE_OR_EXTEND_PHASE] Pushed new phase index {len(phases) - 1} to traffic light {self.tls_id}")
         # Save the new/extended phase
         self.save_phase_to_pkl(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
         return len(phases) - 1
-
     def load_phase_from_pkl(self, phase_idx=None):
         """Return phase record by index (from APC pkl)."""
         for p in self.apc_state.get("phases", []):
@@ -190,6 +192,7 @@ class AdaptivePhaseController:
         penalty = max(0, abs(raw_delta_t) - 10)
         delta_t = 10 * np.tanh(raw_delta_t / 20)
         delta_t = np.clip(delta_t, -10, 10)
+        print(f"[DEBUG] [DELTA_T_PENALTY] R={R:.2f}, R_target={self.R_target:.2f}, raw_delta_t={raw_delta_t:.2f}, delta_t={delta_t:.2f}, penalty={penalty:.2f}")
         return raw_delta_t, delta_t, penalty
     def _log_apc_event(self, event):
         """Log structured event with timestamp and simulation context"""
@@ -359,6 +362,7 @@ class AdaptivePhaseController:
     def add_new_phase(self, green_lanes, green_duration=20, yellow_duration=3, yellow_lanes=None):
         """Add new phase program to traffic light, enforce yellow"""
         try:
+            print(f"[DEBUG] [CREATE_NEW_PHASE] Creating new phase: green_lanes={green_lanes}, green_duration={green_duration}, yellow_duration={yellow_duration}, yellow_lanes={yellow_lanes}")
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
             phases = list(logic.getPhases())
 
@@ -371,6 +375,7 @@ class AdaptivePhaseController:
             new_yellow = traci.trafficlight.Phase(yellow_duration, yellow_state)
 
             phases.extend([new_green, new_yellow])
+            print(f"[DEBUG] [CREATE_NEW_PHASE] Pushing new phase definition to traffic light {self.tls_id}. New phase index: {len(phases)-2}, Green state: {green_state}, Yellow state: {yellow_state}")
             new_logic = traci.trafficlight.Logic(
                 logic.programID,
                 logic.type,
@@ -403,7 +408,6 @@ class AdaptivePhaseController:
         except Exception as e:
             print(f"[ERROR] Phase creation failed: {e}")
             return None
-
     def check_special_events(self):
         """Detect special conditions with improved prioritization"""
         now = traci.simulation.getTime()
@@ -862,22 +866,26 @@ class AdaptivePhaseController:
 
         queue = traci.lane.getLastStepHaltingNumber(lane_id)
         wait = traci.lane.getWaitingTime(lane_id)
+        print(f"[DEBUG] [PROTECTED_LEFT_TURN] Detected blocked left lane {lane_id}. Queue={queue}, Wait={wait}")
+
         phase_idx = self.create_true_protected_left_phase(lane_id)
         if phase_idx is None:
+            print(f"[DEBUG] [PROTECTED_LEFT_TURN] No protected left phase index could be created for lane {lane_id}.")
             return False
 
         now = traci.simulation.getTime()
         if self.last_phase_idx == phase_idx and now - self.last_phase_switch_sim_time < self.min_green:
-            print(f"[TRUE PROTECTED LEFT] Flicker prevention for {self.tls_id}")
+            print(f"[DEBUG] [PROTECTED_LEFT_TURN] Flicker prevention for {self.tls_id} (phase {phase_idx})")
             return False
 
         # Dynamically set phase duration based on queue/wait
         green_duration = min(self.max_green, max(self.min_green, queue * 2 + wait * 0.1))
         # Insert yellow before switching if coming from green
         self.insert_yellow_phase_if_needed(phase_idx)
+        print(f"[DEBUG] [PROTECTED_LEFT_TURN] Pushing new protected left phase {phase_idx} to traffic light controller {self.tls_id}, green_duration={green_duration:.1f}")
         traci.trafficlight.setPhase(self.tls_id, phase_idx)
         traci.trafficlight.setPhaseDuration(self.tls_id, green_duration)
-        print(f"[TRUE PROTECTED LEFT] Served for lane {lane_id} at phase {phase_idx} for {green_duration:.1f}s (queue={queue}, wait={wait})")
+        print(f"[DEBUG] [PROTECTED_LEFT_TURN] Phase {phase_idx} activated for lane {lane_id} at {self.tls_id} for {green_duration:.1f}s (queue={queue}, wait={wait})")
         self._log_apc_event({
             "action": "serve_true_protected_left",
             "lane_id": lane_id,
@@ -889,7 +897,6 @@ class AdaptivePhaseController:
         self.last_phase_switch_sim_time = now
         self.last_phase_idx = phase_idx
         return True
-
     def insert_yellow_phase_if_needed(self, next_phase_idx):
         """
         When switching phases, if any lane is going from green to red,
@@ -2371,11 +2378,14 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
             while traci.simulation.getMinExpectedNumber() > 0:
                 if max_steps and step >= max_steps:
                     print(f"Reached max steps ({max_steps}), ending episode."); break
-                controller.run_step(); traci.simulationStep(); step += 1
-                if step % 200 == 0:
+                controller.run_step()
+                traci.simulationStep()
+                step += 1
+                if step % 1000 == 0:
                     print(f"Episode {episode + 1}: Step {step} completed, elapsed: {time.time()-tstart:.2f}s")
             print(f"Episode {episode + 1} completed after {step} steps")
-            controller.end_episode(); traci.close()
+            controller.end_episode()
+            traci.close()
             if episode < episodes - 1: time.sleep(2)
         print(f"\n🎉 All {episodes} episodes completed!")
         return controller
