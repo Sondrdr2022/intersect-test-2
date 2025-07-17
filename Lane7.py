@@ -57,6 +57,11 @@ class AdaptivePhaseController:
         self.r_adjust = r_adjust
         self.severe_congestion_threshold = severe_congestion_threshold
         self.large_delta_t = large_delta_t
+        self.apc_data_file = apc_data_file or f"apc_{tls_id}.pkl"
+        self.apc_state = {"events": [], "phases": []}
+        self._load_apc_state()
+        
+        
         self.emergency_cooldown = {}  # Track emergency vehicle priority
         self.emergency_global_cooldown = 0
         self.emergency_cooldown_time = 30  # Cooldown after emergency
@@ -128,24 +133,64 @@ class AdaptivePhaseController:
     def _load_apc_state(self):
         if not self.apc_data_file or not os.path.exists(self.apc_data_file):
             return
-
         try:
             with open(self.apc_data_file, "rb") as f:
                 self.apc_state = pickle.load(f)
-            print(f"[APC] Loaded state from {self.apc_data_file}")
         except Exception as e:
             print(f"[APC] State load failed: {e}")
 
     def _save_apc_state(self):
         if not self.apc_data_file:
             return
-
         try:
             with open(self.apc_data_file, "wb") as f:
                 pickle.dump(self.apc_state, f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception as e:
             print(f"[APC] State save failed: {e}")
+    def save_phase_to_pkl(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty):
+        entry = {
+            "phase_idx": phase_idx,
+            "duration": duration,
+            "state": state_str,
+            "delta_t": delta_t,
+            "raw_delta_t": raw_delta_t,
+            "penalty": penalty,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "sim_time": traci.simulation.getTime()
+        }
+        self.apc_state.setdefault("phases", []).append(entry)
+        self._save_apc_state()
 
+    def create_or_extend_phase(self, green_lanes, delta_t):
+        """Create a new phase or extend the current phase, log to pkl."""
+        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+        # For new phase creation
+        new_state = self.create_phase_state(green_lanes=green_lanes)
+        duration = np.clip(traci.trafficlight.getPhaseDuration(self.tls_id) + delta_t, self.min_green, self.max_green)
+        new_phase = traci.trafficlight.Phase(duration, new_state)
+        phases = list(logic.getPhases()) + [new_phase]
+        new_logic = traci.trafficlight.Logic(
+            logic.programID, logic.type, len(phases) - 1, phases
+        )
+        traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
+        traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
+        # Save the new/extended phase
+        self.save_phase_to_pkl(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
+        return len(phases) - 1
+
+    def load_phase_from_pkl(self, phase_idx=None):
+        """Return phase record by index (from APC pkl)."""
+        for p in self.apc_state.get("phases", []):
+            if p["phase_idx"] == phase_idx:
+                return p
+        return None
+
+    def calculate_delta_t_and_penalty(self, R):
+        raw_delta_t = self.alpha * (R - self.R_target)
+        penalty = max(0, abs(raw_delta_t) - 10)
+        delta_t = 10 * np.tanh(raw_delta_t / 20)
+        delta_t = np.clip(delta_t, -10, 10)
+        return raw_delta_t, delta_t, penalty
     def _log_apc_event(self, event):
         """Log structured event with timestamp and simulation context"""
         event["timestamp"] = datetime.datetime.now().isoformat()
@@ -846,18 +891,9 @@ class AdaptivePhaseController:
 
 
 
-# ... rest of file unchanged ...
-
-
-
 
 class EnhancedQLearningAgent:
-    """
-    RL agent + Adaptive controller integrated.
-    - Handles RL phase selection and delegates all adaptive logic to AdaptivePhaseController.
-    - Calls adaptive controller for event detection, dynamic phase creation, reward calculation, etc.
-    """
-    def __init__(self, state_size, action_size, lane_ids, tls_id, learning_rate=0.1, discount_factor=0.95, 
+    def __init__(self, state_size, action_size, adaptive_controller, learning_rate=0.1, discount_factor=0.95, 
                  epsilon=0.1, epsilon_decay=0.995, min_epsilon=0.01, 
                  q_table_file="enhanced_q_table.pkl", mode="train", adaptive_params=None):
         self.state_size, self.action_size = state_size, action_size
@@ -872,79 +908,10 @@ class EnhancedQLearningAgent:
             'queue_weight': 0.6, 'wait_weight': 0.3, 'flow_weight': 0.5, 'speed_weight': 0.2, 
             'left_turn_priority': 1.2, 'empty_green_penalty': 15, 'congestion_bonus': 10
         }
-        # Integrated adaptive controller
-        self.apc = AdaptivePhaseController(
-            lane_ids=lane_ids,
-            tls_id=tls_id,
-            alpha=1.0,
-            min_green=self.adaptive_params['min_green'],
-            max_green=self.adaptive_params['max_green'],
-        )
-
-    def get_action(self, state, tls_id=None, action_size=None):
-        action_size = action_size or self.action_size
-        key = self._state_to_key(state, tls_id)
-        if key not in self.q_table or len(self.q_table[key]) < action_size:
-            self.q_table[key] = np.zeros(action_size)
-        qs = self.q_table[key][:action_size]
-        if self.mode == "train" and np.random.rand() < self.epsilon:
-            return np.random.randint(action_size)
-        return np.argmax(qs)
-
-    def hybrid_switch_phase(self, state, tls_id):
-        """
-        Integrated logic: RL agent consults Adaptive controller for priority/special phases/events,
-        otherwise RL selects phase and can use adaptive delta_t for duration.
-        """
-        event_type, event_lane = self.apc.check_special_events()
-        if event_type:
-            self.apc.reorganize_or_create_phase(event_lane, event_type)
-            chosen_phase_idx = traci.trafficlight.getPhase(tls_id)
-            chosen_duration = self.apc.max_green
-        else:
-            chosen_phase_idx = self.get_action(state, tls_id)
-            delta_t = self.apc.calculate_delta_t(self.apc.last_R)
-            current_duration = traci.trafficlight.getPhaseDuration(tls_id)
-            chosen_duration = max(self.apc.min_green, min(self.apc.max_green, current_duration + delta_t))
-        traci.trafficlight.setPhase(tls_id, chosen_phase_idx)
-        traci.trafficlight.setPhaseDuration(tls_id, chosen_duration)
-        return chosen_phase_idx, chosen_duration
-
-    def update_q_table(self, state, action, reward, next_state, tls_id=None, extra_info=None, action_size=None):
-        if self.mode == "eval" or not self.is_valid_state(state) or not self.is_valid_state(next_state):
-            return
-        if reward is None or np.isnan(reward) or np.isinf(reward):
-            return
-        action_size = action_size or self.action_size
-        sk, nsk = self._state_to_key(state, tls_id), self._state_to_key(next_state, tls_id)
-        for k in [sk, nsk]:
-            if k not in self.q_table or len(self.q_table[k]) < action_size:
-                self.q_table[k] = np.zeros(action_size)
-        q, nq = self.q_table[sk][action], np.max(self.q_table[nsk])
-        new_q = q + self.learning_rate * (reward + self.discount_factor * nq - q)
-        self.q_table[sk][action] = new_q if not (np.isnan(new_q) or np.isinf(new_q)) else q
-        entry = {
-            'state': state.tolist() if isinstance(state, np.ndarray) else state,
-            'action': action, 'reward': reward,
-            'next_state': next_state.tolist() if isinstance(next_state, np.ndarray) else next_state,
-            'q_value': self.q_table[sk][action], 'timestamp': time.time(),
-            'learning_rate': self.learning_rate, 'epsilon': self.epsilon,
-            'tl_id': tls_id, 'adaptive_params': self.adaptive_params.copy()
-        }
-        if extra_info:
-            entry.update({k: v for k, v in extra_info.items() if k != "reward"})
-        self.training_data.append(entry)
-
-    def _state_to_key(self, state, tls_id=None):
-        try:
-            if isinstance(state, (np.ndarray, list)):
-                arr = np.round(np.array(state), 2)
-                key = tuple(arr.tolist())
-            else:
-                key = tuple(state) if hasattr(state, '__iter__') else (state,)
-            return (tls_id, key) if tls_id is not None else key
-        except Exception:
-            return (tls_id, (0,)) if tls_id is not None else (0,)
+        self.adaptive_controller = adaptive_controller
+        if mode == "eval": self.epsilon = 0.0
+        elif mode == "adaptive": self.epsilon = 0.01
+        print(f"AGENT INIT: mode={self.mode}, epsilon={self.epsilon}")
 
     def is_valid_state(self, state):
         arr = np.array(state)
@@ -955,6 +922,48 @@ class EnhancedQLearningAgent:
             and (np.abs(arr) <= 100).all()
             and not np.all(arr == 0)
         )
+
+    def get_action(self, state, tl_id=None, action_size=None):
+        action_size = action_size or self.action_size
+        key = self._state_to_key(state, tl_id)
+        if key not in self.q_table or len(self.q_table[key]) < action_size:
+            self.q_table[key] = np.zeros(action_size)
+        qs = self.q_table[key][:action_size]
+        
+        if self.mode == "train" and np.random.rand() < self.epsilon:
+            # Congestion-biased exploration
+            if hasattr(state, 'queues'):
+                congestion_scores = np.array([q + w*0.5 for q, w in zip(state.queues, state.waits)])
+                if congestion_scores.sum() > 0:
+                    congestion_scores = congestion_scores / congestion_scores.sum()
+                    return np.random.choice(range(action_size), p=congestion_scores)
+            return np.random.randint(action_size)
+        return np.argmax(qs)
+        pass
+
+    def set_phase_from_pkl(self, phase_idx):
+        """Pull phase from APC pkl file and push to SUMO."""
+        phase_record = self.adaptive_controller.load_phase_from_pkl(phase_idx)
+        if not phase_record:
+            print(f"[RL] No phase found in APC PKL for idx {phase_idx}")
+            return False
+        traci.trafficlight.setPhase(self.adaptive_controller.tls_id, phase_record["phase_idx"])
+        traci.trafficlight.setPhaseDuration(self.adaptive_controller.tls_id, phase_record["duration"])
+        print(f"[RL] Phase {phase_idx} set from APC PKL: duration={phase_record['duration']}")
+        return True
+
+    def switch_or_extend_phase(self, state, green_lanes):
+        """RL agent decides to create/extend phase, then sets it from pkl."""
+        R = self.adaptive_controller.calculate_reward()
+        raw_delta_t, delta_t, penalty = self.adaptive_controller.calculate_delta_t_and_penalty(R)
+        # Always create or extend phase and save to pkl before switching
+        phase_idx = self.adaptive_controller.create_or_extend_phase(green_lanes, delta_t)
+        self.set_phase_from_pkl(phase_idx)
+        return phase_idx
+    def calculate_total_reward(self, adaptive_R, rl_reward):
+        """Sum of Adaptive reward R (no penalty) and RL-specific reward."""
+        return adaptive_R + rl_reward
+
     def _state_to_key(self, state, tl_id=None):
         try:
             if isinstance(state, (np.ndarray, list)):
@@ -966,6 +975,32 @@ class EnhancedQLearningAgent:
         except Exception:
             return (tl_id, (0,)) if tl_id is not None else (0,)
 
+    def update_q_table(self, state, action, reward, next_state, tl_id=None, extra_info=None, action_size=None):
+        if self.mode == "eval" or not self.is_valid_state(state) or not self.is_valid_state(next_state):
+            return
+        if reward is None or np.isnan(reward) or np.isinf(reward):
+            return
+        action_size = action_size or self.action_size
+        sk, nsk = self._state_to_key(state, tl_id), self._state_to_key(next_state, tl_id)
+        for k in [sk, nsk]:
+            if k not in self.q_table or len(self.q_table[k]) < action_size:
+                self.q_table[k] = np.zeros(action_size)
+        q, nq = self.q_table[sk][action], np.max(self.q_table[nsk])
+        new_q = q + self.learning_rate * (reward + self.discount_factor * nq - q)
+        self.q_table[sk][action] = new_q if not (np.isnan(new_q) or np.isinf(new_q)) else q
+
+        entry = {
+            'state': state.tolist() if isinstance(state, np.ndarray) else state,
+            'action': action, 'reward': reward,
+            'next_state': next_state.tolist() if isinstance(next_state, np.ndarray) else next_state,
+            'q_value': self.q_table[sk][action], 'timestamp': time.time(),
+            'learning_rate': self.learning_rate, 'epsilon': self.epsilon,
+            'tl_id': tl_id, 'adaptive_params': self.adaptive_params.copy()
+        }
+        if extra_info:
+            entry.update({k: v for k, v in extra_info.items() if k != "reward"})
+        self.training_data.append(entry)
+        self._update_adaptive_parameters(reward)
 
     def _get_action_name(self, action):
         return {
@@ -1065,7 +1100,23 @@ class UniversalSmartTrafficController:
             'flow': 30, 'density': 0.2, 'arrival_rate': 5,
             'time_since_green': 120
         }
-        self.rl_agent = EnhancedQLearningAgent(state_size=12, action_size=8, mode=mode)
+        # -- PATCH: create adaptive_phase_controller first --
+        lane_ids = [lid for lid in traci.lane.getIDList() if not lid.startswith(":")]
+        tls_id = traci.trafficlight.getIDList()[0]
+        self.adaptive_phase_controller = AdaptivePhaseController(
+            lane_ids=lane_ids,
+            tls_id=tls_id,
+            alpha=1.0,
+            min_green=10,
+            max_green=60
+        )
+        # -- PATCH: pass adaptive_phase_controller to RL agent --
+        self.rl_agent = EnhancedQLearningAgent(
+            state_size=12,
+            action_size=8,
+            adaptive_controller=self.adaptive_phase_controller,
+            mode=mode
+        )
         self.rl_agent.load_model()
         self.adaptive_params = {
             'min_green': 30, 'max_green': 80, 'starvation_threshold': 40,
@@ -1073,41 +1124,7 @@ class UniversalSmartTrafficController:
             'flow_weight': 0.5, 'speed_weight': 0.2, 'left_turn_priority': 1.2,
             'empty_green_penalty': 15, 'congestion_bonus': 10
         }
-        pass
 
-    def _enforce_clearance_if_car_in_front(self, tl_id):
-        """
-        Detects if a car is in the 'dilemma zone' (near stop line) of any controlled lane.
-        If detected, sets all signals to red for 1 second to allow safe clearance.
-        Returns True if clearance was enforced, False otherwise.
-        """
-        controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
-        for lane_id in controlled_lanes:
-            veh_ids = traci.lane.getLastStepVehicleIDs(lane_id)
-            stop_line_pos = self._get_lane_stop_line_position(lane_id)
-            for vid in veh_ids:
-                try:
-                    pos = traci.vehicle.getPosition(vid)
-                    # If car is within 2 meters of stop line (front/middle of intersection)
-                    if abs(pos[0] - stop_line_pos[0]) < 2.0 and abs(pos[1] - stop_line_pos[1]) < 2.0:
-                        # Set all lights to red for 1 second
-                        traci.trafficlight.setRedYellowGreenState(tl_id, "r" * len(controlled_lanes))
-                        traci.trafficlight.setPhaseDuration(tl_id, 1)
-                        print(f"[CLEARANCE] All-red for 1s due to car {vid} at stop line in lane {lane_id} ({tl_id})")
-                        return True
-                except Exception:
-                    continue
-        return False
-    def _get_lane_stop_line_position(self, lane_id):
-        """
-        Utility to get stop line position for a lane.
-        Uses traci.lane.getShape(lane_id) and takes last point as stop line.
-        """
-        try:
-            shape = traci.lane.getShape(lane_id)
-            return shape[-1]  # (x, y) of stop line
-        except Exception:
-            return (0, 0)
 
     def subscribe_vehicles(self, vehicle_ids):
         for vid in vehicle_ids:
@@ -1164,6 +1181,12 @@ class UniversalSmartTrafficController:
             alpha=1.0,
             min_green=10,
             max_green=60
+        )
+        self.rl_agent = EnhancedQLearningAgent(
+            state_size=12,
+            action_size=8,
+            adaptive_controller=self.adaptive_phase_controller,
+            mode=self.mode
         )
         self.lane_id_list = [lid for lid in traci.lane.getIDList() if not lid.startswith(":")]
         self.tl_action_sizes = {tl_id: len(traci.trafficlight.getAllProgramLogics(tl_id)[0].phases)
@@ -1441,10 +1464,6 @@ class UniversalSmartTrafficController:
 
             # Vehicle management - use class methods
             all_vehicles = set(traci.vehicle.getIDList())
-            new_vehicles = all_vehicles - self.subscribed_vehicles
-            if new_vehicles:
-                self.subscribe_vehicles(new_vehicles)
-            self.subscribed_vehicles.update(new_vehicles)
             vehicle_classes = self.get_vehicle_classes(all_vehicles)
             lane_data = self._collect_enhanced_lane_data(vehicle_classes, all_vehicles)
             self.subscribed_vehicles.intersection_update(all_vehicles)
@@ -1456,21 +1475,6 @@ class UniversalSmartTrafficController:
                 controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
                 logic = self._get_traffic_light_logic(tl_id)
                 current_phase = traci.trafficlight.getPhase(tl_id)
-
-                # -- PATCH: Enforce phase completion before agent/adaptive control --
-                # Only act if phase duration is expired
-                phase_duration_left = traci.trafficlight.getPhaseDuration(tl_id)
-                if phase_duration_left > 0.1:  # SUMO returns >0 if phase not finished
-                    # Still running, no agent/adaptive action this tick
-                    continue
-
-                # -- PATCH: Clearance check --
-                if self._enforce_clearance_if_car_in_front(tl_id):
-                    # Clearance action taken, skip further logic this tick
-                    continue
-
-                # Call control_step for each intersection's AdaptivePhaseController
-                self.adaptive_phase_controllers[tl_id].control_step()
                 
                 # Handle pending phase transitions
                 if tl_id in self.pending_next_phase:
@@ -2020,14 +2024,6 @@ class UniversalSmartTrafficController:
                 state = self._create_intersection_state_vector(tl_id, intersection_data)
                 if not self.rl_agent.is_valid_state(state): 
                     continue
-
-                # --- Get adaptive reward (NO delta_t penalty) ---
-                apc = self.adaptive_phase_controllers.get(tl_id)
-                if apc is not None:
-                    bonus, penalty = apc.compute_status_and_bonus_penalty()
-                    adaptive_reward = apc.calculate_reward(bonus, penalty)
-                else:
-                    adaptive_reward = 0.0
                     
                 queues, waits = d['queues'], d['waits']
                 controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
@@ -2055,45 +2051,38 @@ class UniversalSmartTrafficController:
                     for q in queues if q > 5
                 )
                 
-                # Composite RL reward (unchanged logic)
+                # Composite reward
                 empty_green_penalty = self.adaptive_params['empty_green_penalty'] * empty_green_count
                 only_empty_green_penalty = 0
                 if not has_vehicle_on_green:
                     only_empty_green_penalty = 100  # make this large
 
-                rl_reward = (
+                reward = (
                     -self.adaptive_params['queue_weight'] * sum(queues) 
                     - self.adaptive_params['wait_weight'] * sum(waits) 
                     - empty_green_penalty
                     - only_empty_green_penalty  # strong penalty!
                     + congestion_bonus
                 )
-                # --- New: final RL Q-table reward ---
-                final_rl_reward = adaptive_reward + rl_reward
-
-                self.rl_agent.reward_history.append(final_rl_reward)
+                self.rl_agent.reward_history.append(reward)
                 reward_components = {
-                    "adaptive_reward": adaptive_reward,
-                    "rl_reward": rl_reward,
                     "queue_penalty": -self.adaptive_params['queue_weight'] * sum(queues),
                     "wait_penalty": -self.adaptive_params['wait_weight'] * sum(waits),
                     "empty_green_penalty": -self.adaptive_params['empty_green_penalty'] * empty_green_count,
                     "congestion_bonus": congestion_bonus,
-                    "total_raw": final_rl_reward
+                    "total_raw": reward
                 }
                 print(f"\n[RL REWARD COMPONENTS] TL: {tl_id}")
-                print(f"  - Adaptive reward: {adaptive_reward:.2f}")
-                print(f"  - RL reward: {rl_reward:.2f}")
                 print(f"  - Queue penalty: {reward_components['queue_penalty']:.2f}")
                 print(f"  - Wait penalty: {reward_components['wait_penalty']:.2f}")
                 print(f"  - Empty green penalty: {reward_components['empty_green_penalty']:.2f}")
                 print(f"  - Congestion bonus: {reward_components['congestion_bonus']:.2f}")
-                print(f"  - FINAL RL Q-table REWARD: {final_rl_reward:.2f}")
+                print(f"  - TOTAL REWARD: {reward:.2f}")
                 # Update Q-table if we have previous state
                 if tl_id in self.previous_states and tl_id in self.previous_actions:
                     prev_state, prev_action = self.previous_states[tl_id], self.previous_actions[tl_id]
                     self.rl_agent.update_q_table(
-                        prev_state, prev_action, final_rl_reward, state, 
+                        prev_state, prev_action, reward, state, 
                         tl_id=tl_id, 
                         extra_info={
                             **reward_components,
@@ -2116,6 +2105,7 @@ class UniversalSmartTrafficController:
         except Exception as e:
             print(f"Error in _process_rl_learning: {e}")
             traceback.print_exc()
+
     def _create_state_vector(self, lane_id, lane_data):
         try:
             if not (isinstance(lane_data, dict) and lane_id in lane_data):
