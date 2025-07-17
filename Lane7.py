@@ -79,6 +79,7 @@ class AdaptivePhaseController:
         self.weights = np.array([0.25] * 4)
         self.metric_history = []
         self.phase_count = 0
+        self.delta_t_penalty_factor = 2
 
     # ADAPTIVE: Only handle phase creation, duration adjustment and event detection/special phase logic
     def control_step(self):
@@ -104,13 +105,23 @@ class AdaptivePhaseController:
         self.reward_history.append(R)
         if self.phase_count % 10 == 0:
             self.update_R_target()
-        delta_t = self.calculate_delta_t(R)
+        delta_t, delta_t_penalty = self.calculate_delta_t_with_penalty(R)
         elapsed_green = current_time - self.last_phase_switch_time
 
         if elapsed_green < self.min_green:
             return
         self.adjust_phase_duration(delta_t)
         self.last_phase_switch_time = current_time
+
+        # Optionally, log the penalty event for diagnostics
+        if delta_t_penalty > 0:
+            self._log_apc_event({
+                "action": "delta_t_penalty",
+                "delta_t": delta_t,
+                "delta_t_penalty": delta_t_penalty,
+                "penalty_factor": self.delta_t_penalty_factor,
+                "reward_after_penalty": R - delta_t_penalty * self.delta_t_penalty_factor,
+            })
 
     def add_new_phase(self, green_lanes, green_duration=20, yellow_duration=3, yellow_lanes=None):
         """Add new phase to SUMO and record in apc_state."""
@@ -206,10 +217,21 @@ class AdaptivePhaseController:
         traci.trafficlight.setPhaseDuration(self.tls_id, new_duration)
         return new_duration
 
-    def calculate_delta_t(self, R):
+    def calculate_delta_t_with_penalty(self, R):
+        """
+        Calculate delta_t (capped to [-10, 10]), and compute penalty if raw delta_t exceeds cap.
+        Returns (capped_delta_t, penalty_value).
+        """
         raw_delta_t = self.alpha * (R - self.R_target)
         delta_t = 10 * np.tanh(raw_delta_t / 20)
-        return np.clip(delta_t, -10, 10)
+        capped_delta_t = np.clip(delta_t, -10, 10)
+        # Penalty calculation
+        delta_t_penalty = 0
+        if abs(delta_t) > 10:
+            delta_t_penalty = abs(delta_t) - 10
+            print(f"[DELTA_T PENALTY] Applied penalty of {delta_t_penalty * self.delta_t_penalty_factor} for delta_t={delta_t:.2f}")
+        return capped_delta_t, delta_t_penalty
+
 
     def compute_status_and_bonus_penalty(self, status_threshold=5):
         status_score = 0
@@ -437,7 +459,6 @@ class AdaptivePhaseController:
                 if idx and c[idx] == 'r':
                     right.add(lid)
         return left, right
-
 
     def get_lane_stats(self, lane_id):
         """Get comprehensive lane metrics with error handling"""
@@ -1855,6 +1876,14 @@ class UniversalSmartTrafficController:
                 state = self._create_intersection_state_vector(tl_id, intersection_data)
                 if not self.rl_agent.is_valid_state(state): 
                     continue
+
+                # --- Get adaptive reward (NO delta_t penalty) ---
+                apc = self.adaptive_phase_controllers.get(tl_id)
+                if apc is not None:
+                    bonus, penalty = apc.compute_status_and_bonus_penalty()
+                    adaptive_reward = apc.calculate_reward(bonus, penalty)
+                else:
+                    adaptive_reward = 0.0
                     
                 queues, waits = d['queues'], d['waits']
                 controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
@@ -1882,38 +1911,45 @@ class UniversalSmartTrafficController:
                     for q in queues if q > 5
                 )
                 
-                # Composite reward
+                # Composite RL reward (unchanged logic)
                 empty_green_penalty = self.adaptive_params['empty_green_penalty'] * empty_green_count
                 only_empty_green_penalty = 0
                 if not has_vehicle_on_green:
                     only_empty_green_penalty = 100  # make this large
 
-                reward = (
+                rl_reward = (
                     -self.adaptive_params['queue_weight'] * sum(queues) 
                     - self.adaptive_params['wait_weight'] * sum(waits) 
                     - empty_green_penalty
                     - only_empty_green_penalty  # strong penalty!
                     + congestion_bonus
                 )
-                self.rl_agent.reward_history.append(reward)
+                # --- New: final RL Q-table reward ---
+                final_rl_reward = adaptive_reward + rl_reward
+
+                self.rl_agent.reward_history.append(final_rl_reward)
                 reward_components = {
+                    "adaptive_reward": adaptive_reward,
+                    "rl_reward": rl_reward,
                     "queue_penalty": -self.adaptive_params['queue_weight'] * sum(queues),
                     "wait_penalty": -self.adaptive_params['wait_weight'] * sum(waits),
                     "empty_green_penalty": -self.adaptive_params['empty_green_penalty'] * empty_green_count,
                     "congestion_bonus": congestion_bonus,
-                    "total_raw": reward
+                    "total_raw": final_rl_reward
                 }
                 print(f"\n[RL REWARD COMPONENTS] TL: {tl_id}")
+                print(f"  - Adaptive reward: {adaptive_reward:.2f}")
+                print(f"  - RL reward: {rl_reward:.2f}")
                 print(f"  - Queue penalty: {reward_components['queue_penalty']:.2f}")
                 print(f"  - Wait penalty: {reward_components['wait_penalty']:.2f}")
                 print(f"  - Empty green penalty: {reward_components['empty_green_penalty']:.2f}")
                 print(f"  - Congestion bonus: {reward_components['congestion_bonus']:.2f}")
-                print(f"  - TOTAL REWARD: {reward:.2f}")
+                print(f"  - FINAL RL Q-table REWARD: {final_rl_reward:.2f}")
                 # Update Q-table if we have previous state
                 if tl_id in self.previous_states and tl_id in self.previous_actions:
                     prev_state, prev_action = self.previous_states[tl_id], self.previous_actions[tl_id]
                     self.rl_agent.update_q_table(
-                        prev_state, prev_action, reward, state, 
+                        prev_state, prev_action, final_rl_reward, state, 
                         tl_id=tl_id, 
                         extra_info={
                             **reward_components,
@@ -1936,7 +1972,6 @@ class UniversalSmartTrafficController:
         except Exception as e:
             print(f"Error in _process_rl_learning: {e}")
             traceback.print_exc()
-
     def _create_state_vector(self, lane_id, lane_data):
         try:
             if not (isinstance(lane_data, dict) and lane_id in lane_data):
