@@ -3,7 +3,7 @@ from tkinter import ttk
 import traci
 
 class TrafficLightPhaseDisplay:
-    def __init__(self, poll_interval=1000):
+    def __init__(self,event_log, poll_interval=1000):
         self.root = tk.Tk()
         self.root.title("Phase Time")
         # Add new columns for analytics/log info
@@ -35,6 +35,8 @@ class TrafficLightPhaseDisplay:
         self.poll_interval = poll_interval
         self.running = False
         self.ready = True  # Set to True when SUMO/TraCI is connected
+        self.event_log = event_log
+        
 
     def update_table(self):
         if not getattr(self, "ready", True):
@@ -81,19 +83,29 @@ class TrafficLightPhaseDisplay:
             self.root.after(self.poll_interval, self.update_table)
 
     def get_event_type_for(self, tl_id, phase_index):
-        # TODO: Connect to your actual event log (phase switch, extension, congestion, etc.)
-        return "Unknown"  # Replace with actual event
+        for event in reversed(self.event_log):
+            if event.get("tls_id") == tl_id and event.get("phase_idx") == phase_index:
+                return event.get("action", "Unknown")
+        return "Unknown"
 
     def get_action_taken_for(self, tl_id, phase_index):
-        # TODO: Connect to your actual event log ("Extended by 5s", "Switched to phase 2", etc.)
-        return "Unknown"  # Replace with actual action
+        for event in reversed(self.event_log):
+            if event.get("tls_id") == tl_id and event.get("phase_idx") == phase_index:
+                # You can customize this logic based on your event structure
+                return event.get("action_taken", event.get("action", "Unknown"))
+        return "Unknown"
 
     def is_protected_left(self, tl_id, phase_index):
-        # TODO: Implement logic based on your controller's state/logs
+        for event in reversed(self.event_log):
+            if event.get("tls_id") == tl_id and event.get("phase_idx") == phase_index:
+                # Heuristic: check action or a key
+                return event.get("protected_left", False) or event.get("action", "").startswith("add_true_protected_left")
         return False
 
     def is_blocked(self, tl_id, phase_index):
-        # TODO: Implement logic based on your controller's state/logs
+        for event in reversed(self.event_log):
+            if event.get("tls_id") == tl_id and event.get("phase_idx") == phase_index:
+                return event.get("blocked", False)
         return False
 
     def start(self):

@@ -725,6 +725,24 @@ class AdaptivePhaseController:
                     if link[0] in left_turn_targets:
                         conflicting_straight.append(lane)
         return conflicting_straight
+    
+    def set_phase_from_pkl(self, phase_idx):
+        """
+        Always set the SUMO traffic light phase and duration using data from APC's PKL file.
+        """
+        phase_record = self.load_phase_from_pkl(phase_idx)
+        if phase_record:
+            traci.trafficlight.setPhase(self.tls_id, phase_record["phase_idx"])
+            traci.trafficlight.setPhaseDuration(self.tls_id, phase_record["duration"])
+            print(f"[APC] Phase {phase_idx} set from PKL: duration={phase_record['duration']}")
+            return True
+        else:
+            print(f"[APC] Phase {phase_idx} not found in PKL, fallback to max_green")
+            traci.trafficlight.setPhase(self.tls_id, phase_idx)
+            traci.trafficlight.setPhaseDuration(self.tls_id, self.max_green)
+            return False
+
+
 
     def ensure_true_protected_left_phase(self, left_lane):
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
@@ -1089,38 +1107,20 @@ class EnhancedQLearningAgent:
         return np.argmax(qs)
         pass
 
-    def set_phase_from_pkl(self, phase_idx):
-        """Pull phase from APC pkl file and push to SUMO."""
-        phase_record = self.adaptive_controller.load_phase_from_pkl(phase_idx)
-        if not phase_record:
-            print(f"[RL] No phase found in APC PKL for idx {phase_idx}")
-            return False
-        traci.trafficlight.setPhase(self.adaptive_controller.tls_id, phase_record["phase_idx"])
-        traci.trafficlight.setPhaseDuration(self.adaptive_controller.tls_id, phase_record["duration"])
-        print(f"[RL] Phase {phase_idx} set from APC PKL: duration={phase_record['duration']}")
-        return True
 
     def switch_or_extend_phase(self, state, green_lanes, force_protected_left=False):
-        """
-        Improved: RL agent can now request a protected left phase directly if needed.
-        If force_protected_left is True, will use create_or_extend_protected_left_phase.
-        PATCH: Logs every RL phase creation request and whether a new phase was created or not.
-        """
         print(f"[DEBUG] RL Agent switch_or_extend_phase called with state={state}, green_lanes={green_lanes}, force_protected_left={force_protected_left}")
         R = self.adaptive_controller.calculate_reward()
         raw_delta_t, delta_t, penalty = self.adaptive_controller.calculate_delta_t_and_penalty(R)
-        print(f"[DEBUG] RL Agent received delta_t={delta_t}, penalty={penalty} from AdaptivePhaseController")
 
         if force_protected_left and len(green_lanes) == 1:
             phase_idx = self.adaptive_controller.create_or_extend_protected_left_phase(green_lanes[0], delta_t)
-            print(f"[DEBUG] RL Agent created/extended protected left phase with index {phase_idx}")
             rl_phase_type = "protected_left"
         else:
             phase_idx = self.adaptive_controller.create_or_extend_phase(green_lanes, delta_t)
-            print(f"[DEBUG] RL Agent created/extended general phase with index {phase_idx}")
             rl_phase_type = "general"
 
-        # PATCH: log RL agent phase request with phase index and type
+        # Log RL agent phase request
         self.adaptive_controller._log_apc_event({
             "action": "rl_phase_request",
             "rl_phase_type": rl_phase_type,
@@ -1131,9 +1131,11 @@ class EnhancedQLearningAgent:
             "state": str(state),
         })
 
-        self.set_phase_from_pkl(phase_idx)
-        print(f"[DEBUG] RL Agent set phase from pkl with index {phase_idx}")
-        return phase_idx
+        # *** PATCH: Always set phase using APC PKL for both phase and duration ***
+        self.adaptive_controller.set_phase_from_pkl(phase_idx)
+
+        return phase_idx    
+    
     def switch_to_best_phase(self, state, lane_data, left_turn_lanes=None):
         """
         New method: RL agent picks best phase (possibly protected left) based on state and lane_data.
@@ -1350,6 +1352,7 @@ class UniversalSmartTrafficController:
         self.lane_to_tl = {}
         self.tl_action_sizes = {}
         self.last_green_time = None
+
         self.pending_next_phase = {}
         self.lane_lengths = {}
         self.phase_event_log_file = f"phase_event_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
@@ -1527,8 +1530,10 @@ class UniversalSmartTrafficController:
     def _handle_protected_left_turn(self, tl_id, controlled_lanes, lane_data, current_time):
         """
         Improved: Check for blocked left-turn lanes and serve a protected left phase if needed.
+        PATCH: Set protected left phase and duration using APC PKL information.
         """
         try:
+            apc = self.adaptive_phase_controllers.get(tl_id, self.apc)
             # Find left-turn lanes needing service (blocked: queue > 0, all vehicles stopped)
             left_candidates = []
             for lane in controlled_lanes:
@@ -1579,8 +1584,14 @@ class UniversalSmartTrafficController:
             if current_phase == phase_idx and (current_time - last_change < min_green):
                 return False
 
-            traci.trafficlight.setPhase(tl_id, phase_idx)
-            traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['max_green'])
+            # PATCH: Use phase record from APC PKL to set SUMO phase/duration
+            phase_record = apc.load_phase_from_pkl(phase_idx)
+            if phase_record:
+                traci.trafficlight.setPhase(apc.tls_id, phase_record["phase_idx"])
+                traci.trafficlight.setPhaseDuration(apc.tls_id, phase_record["duration"])
+            else:
+                traci.trafficlight.setPhase(apc.tls_id, phase_idx)
+                traci.trafficlight.setPhaseDuration(apc.tls_id, apc.max_green)
             self.last_phase_change[tl_id] = current_time
             self.phase_utilization[(tl_id, phase_idx)] = self.phase_utilization.get((tl_id, phase_idx), 0) + 1
             print(f"[PROTECTED LEFT] Served at {tl_id} for lane {target} (phase {phase_idx})")
@@ -1595,7 +1606,6 @@ class UniversalSmartTrafficController:
         except Exception as e:
             print(f"Error in _handle_protected_left_turn: {e}")
             return False
-
     def _find_best_left_turn_phase(self, tl_id, left_turn_lane, lane_data):
         """Find best phase for protected left turns (prefer exclusive left phases)."""
         try:
@@ -1771,7 +1781,6 @@ class UniversalSmartTrafficController:
 
                     if current_time - set_time >= phase_duration - 0.1:
                         traci.trafficlight.setPhase(tl_id, pending_phase)
-                        traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
                         self.last_phase_change[tl_id] = current_time
                         del self.pending_next_phase[tl_id]
                         logic = self._get_traffic_light_logic(tl_id)
@@ -2507,10 +2516,6 @@ def main():
 def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episodes=1, num_retries=1, retry_delay=1, mode="train"):
     global controller
 
-    # 1. Create the Tkinter display
-    phase_display = TrafficLightPhaseDisplay(poll_interval=500)
-
-    # 2. Define the simulation loop as a function
     def simulation_loop():
         global controller
         try:
@@ -2543,16 +2548,20 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
             except: pass
             print("Simulation resources cleaned up")
 
-    # 3. Start the simulation in a background thread
+    # 1. Start the simulation in a background thread
     sim_thread = threading.Thread(target=simulation_loop)
     sim_thread.start()
 
-    # 4. Start Tkinter mainloop in the main thread (this blocks until the window closes)
+    # 2. Wait for the controller to exist before creating the display
+    while controller is None or not hasattr(controller, "phase_events"):
+        time.sleep(0.1)
+
+    # 3. Pass the log reference to the display
+    phase_display = TrafficLightPhaseDisplay(controller.phase_events, poll_interval=500)
     phase_display.start()
 
-    # 5. Wait for simulation to finish (after window is closed)
     sim_thread.join()
-
     return controller
+
 if __name__ == "__main__":
     main()
