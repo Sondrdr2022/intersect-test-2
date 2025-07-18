@@ -43,31 +43,31 @@ class TrafficLightPhaseDisplay:
             self.root.after(self.poll_interval, self.update_table)
             return
         try:
-            # Remove old rows
             for row in self.tree.get_children():
                 self.tree.delete(row)
-            # Example: You need to replace the following with your actual log/event extraction logic
             for tl_id in traci.trafficlight.getIDList():
                 logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(tl_id)[0]
                 current_phase = traci.trafficlight.getPhase(tl_id)
                 phases = logic.getPhases()
-                curr_time = phases[current_phase].duration if current_phase < len(phases) else "-"
+                # PATCH: Get the ACTUAL set duration for current phase
+                curr_time = traci.trafficlight.getPhaseDuration(tl_id)
+                # PATCH: Estimate actual time left in current phase
+                time_left = traci.trafficlight.getNextSwitch(tl_id) - traci.simulation.getTime()
+                # Next phase index and duration
                 next_phase = (current_phase + 1) % len(phases)
+                # Use the duration set in SUMO for the NEXT phase, unless you have a custom duration in PKL
                 next_time = phases[next_phase].duration if next_phase < len(phases) else "-"
-                
-                # --- YOU MUST SET THESE FROM YOUR EVENT LOGGING SYSTEM ---
-                # For demo, defaults are shown here. Replace with actual values!
+                # ... rest unchanged ...
                 event_type = self.get_event_type_for(tl_id, current_phase)
                 action_taken = self.get_action_taken_for(tl_id, current_phase)
                 phase_state = phases[current_phase].state if current_phase < len(phases) else "-"
                 protected_left = self.is_protected_left(tl_id, current_phase)
                 blocked = self.is_blocked(tl_id, current_phase)
-                # --------------------------------------------------------
                 self.tree.insert(
                     "", "end",
                     values=(
                         tl_id,
-                        curr_time,
+                        curr_time,  # This is the dynamic, actual set duration
                         next_time,
                         event_type,
                         current_phase,
@@ -81,7 +81,6 @@ class TrafficLightPhaseDisplay:
             print("[TrafficLightPhaseDisplay ERROR]:", e)
         if self.running:
             self.root.after(self.poll_interval, self.update_table)
-
     def get_event_type_for(self, tl_id, phase_index):
         for event in reversed(self.event_log):
             if event.get("tls_id") == tl_id and event.get("phase_idx") == phase_index:
