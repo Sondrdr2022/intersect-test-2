@@ -728,7 +728,7 @@ class AdaptivePhaseController:
     
     def set_phase_from_pkl(self, phase_idx):
         """
-        Always set the SUMO traffic light phase and duration using data from APC's PKL file.
+        Always set the SUMO traffic light phase and duration using data from APC's PKL file (for RL/Smart control).
         """
         phase_record = self.load_phase_from_pkl(phase_idx)
         if phase_record:
@@ -741,7 +741,6 @@ class AdaptivePhaseController:
             traci.trafficlight.setPhase(self.tls_id, phase_idx)
             traci.trafficlight.setPhaseDuration(self.tls_id, self.max_green)
             return False
-
 
 
     def ensure_true_protected_left_phase(self, left_lane):
@@ -1120,7 +1119,6 @@ class EnhancedQLearningAgent:
             phase_idx = self.adaptive_controller.create_or_extend_phase(green_lanes, delta_t)
             rl_phase_type = "general"
 
-        # Log RL agent phase request
         self.adaptive_controller._log_apc_event({
             "action": "rl_phase_request",
             "rl_phase_type": rl_phase_type,
@@ -1131,11 +1129,9 @@ class EnhancedQLearningAgent:
             "state": str(state),
         })
 
-        # *** PATCH: Always set phase using APC PKL for both phase and duration ***
+        # PATCH: Always set phase using APC PKL for both phase and duration
         self.adaptive_controller.set_phase_from_pkl(phase_idx)
-
         return phase_idx    
-    
     def switch_to_best_phase(self, state, lane_data, left_turn_lanes=None):
         """
         New method: RL agent picks best phase (possibly protected left) based on state and lane_data.
@@ -1383,7 +1379,7 @@ class UniversalSmartTrafficController:
             min_green=10,
             max_green=60
         )
-        # -- PATCH: pass adaptive_phase_controller to RL agent --
+        self.apc = self.adaptive_phase_controller  # <== for convenience
         self.rl_agent = EnhancedQLearningAgent(
             state_size=12,
             action_size=8,
@@ -1397,7 +1393,6 @@ class UniversalSmartTrafficController:
             'flow_weight': 0.5, 'speed_weight': 0.2, 'left_turn_priority': 1.2,
             'empty_green_penalty': 15, 'congestion_bonus': 10
         }
-
     def log_phase_event(self, event: dict):
         # Log to in-memory list and optionally to a separate file
         event["timestamp"] = datetime.datetime.now().isoformat()
@@ -1744,15 +1739,14 @@ class UniversalSmartTrafficController:
             # Defensive re-initialization of APCs if needed (for dynamic networks)
             for tls_id in traci.trafficlight.getIDList():
                 lanes = traci.trafficlight.getControlledLanes(tls_id)
-                self.adaptive_phase_controllers[tls_id] = AdaptivePhaseController(
-                    lane_ids=lanes,
-                    tls_id=tls_id,
-                    alpha=1.0,
-                    min_green=10,
-                    max_green=60
-                )
-
-            # Vehicle management - use class methods
+                if tls_id not in self.adaptive_phase_controllers:
+                    self.adaptive_phase_controllers[tls_id] = AdaptivePhaseController(
+                        lane_ids=lanes,
+                        tls_id=tls_id,
+                        alpha=1.0,
+                        min_green=10,
+                        max_green=60
+                    )
             all_vehicles = set(traci.vehicle.getIDList())
             vehicle_classes = self.get_vehicle_classes(all_vehicles)
             lane_data = self._collect_enhanced_lane_data(vehicle_classes, all_vehicles)
@@ -1762,10 +1756,11 @@ class UniversalSmartTrafficController:
             self.subscribed_vehicles.update(new_vehicles)
 
             for tl_id in traci.trafficlight.getIDList():
+                apc = self.adaptive_phase_controllers[tl_id]
                 controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
                 logic = self._get_traffic_light_logic(tl_id)
                 current_phase = traci.trafficlight.getPhase(tl_id)
-                
+
                 # Handle pending phase transitions
                 if tl_id in self.pending_next_phase:
                     pending_phase, set_time = self.pending_next_phase[tl_id]
@@ -1774,28 +1769,27 @@ class UniversalSmartTrafficController:
                         phase_duration = logic.phases[current_phase].duration
                     else:
                         phase_duration = 3
-
                     if n_phases == 0 or pending_phase >= n_phases or pending_phase < 0:
                         print(f"[WARNING] Pending phase {pending_phase} for {tl_id} is out of bounds (n_phases={n_phases}), setting to 0")
                         pending_phase = 0
-
                     if current_time - set_time >= phase_duration - 0.1:
-                        traci.trafficlight.setPhase(tl_id, pending_phase)
+                        # PATCH: Use APC PKL for all phase switches
+                        apc.set_phase_from_pkl(pending_phase)
                         self.last_phase_change[tl_id] = current_time
                         del self.pending_next_phase[tl_id]
                         logic = self._get_traffic_light_logic(tl_id)
                         n_phases = len(logic.phases) if logic else 0
                         current_phase = traci.trafficlight.getPhase(tl_id)
                         if n_phases == 0 or current_phase >= n_phases or current_phase < 0:
-                            traci.trafficlight.setPhase(tl_id, max(0, n_phases - 1))
+                            apc.set_phase_from_pkl(max(0, n_phases - 1))
                     continue
-                
+
                 # Priority handling
-                if self._handle_ambulance_priority(tl_id, controlled_lanes, lane_data, current_time): 
+                if self._handle_ambulance_priority(tl_id, controlled_lanes, lane_data, current_time):
                     continue
-                if self._handle_protected_left_turn(tl_id, controlled_lanes, lane_data, current_time): 
+                if self._handle_protected_left_turn(tl_id, controlled_lanes, lane_data, current_time):
                     continue
-                
+
                 # Starvation detection - only consider lanes with vehicles
                 starved_lanes = []
                 for lane in controlled_lanes:
@@ -1818,19 +1812,18 @@ class UniversalSmartTrafficController:
                         n_phases = len(logic.phases) if logic else 1
                         current_phase = traci.trafficlight.getPhase(tl_id)
                         if current_phase >= n_phases:
-                            traci.trafficlight.setPhase(tl_id, n_phases - 1)
+                            apc.set_phase_from_pkl(n_phases - 1)
+                        # PATCH: Always set via APC PKL, not direct setPhase/setPhaseDuration
                         if not switched:
-                            traci.trafficlight.setPhase(tl_id, starved_phase)
-                            traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
+                            apc.set_phase_from_pkl(starved_phase)
                             self.last_phase_change[tl_id] = current_time
                     self.last_green_time[self.lane_id_to_idx[most_starved_lane]] = current_time
                     self.debug_green_lanes(tl_id, lane_data)
                     continue
-                
+
                 # Normal RL control
                 self.tl_action_sizes[tl_id] = len(logic.phases)
                 self.rl_agent.action_size = max(self.tl_action_sizes.values())
-
                 queues = np.array([lane_data[l]['queue_length'] for l in controlled_lanes if l in lane_data])
                 waits = [lane_data[l]['waiting_time'] for l in controlled_lanes if l in lane_data]
                 speeds = [lane_data[l]['mean_speed'] for l in controlled_lanes if l in lane_data]
@@ -1847,24 +1840,23 @@ class UniversalSmartTrafficController:
                 state = self._create_intersection_state_vector(tl_id, self.intersection_data)
                 action = self.rl_agent.get_action(state, tl_id, action_size=self.tl_action_sizes[tl_id])
                 last_change = self.last_phase_change.get(tl_id, -9999)
-                if (current_time - last_change >= self.adaptive_params['min_green'] and 
+                if (current_time - last_change >= self.adaptive_params['min_green'] and
                     action != current_phase and
                     not self._is_in_dilemma_zone(tl_id, controlled_lanes, lane_data)):
                     if not self._phase_has_traffic(logic, action, controlled_lanes, lane_data):
                         continue
                     switched = self._switch_phase_with_yellow_if_needed(
                         tl_id, current_phase, action, logic, controlled_lanes, lane_data, current_time)
+                    # PATCH: Always use APC PKL for all RL phase changes!
                     if not switched:
-                        traci.trafficlight.setPhase(tl_id, action)
-                        traci.trafficlight.setPhaseDuration(tl_id, self.adaptive_params['min_green'])
+                        apc.set_phase_from_pkl(action)
                         self.last_phase_change[tl_id] = current_time
                         self._process_rl_learning(self.intersection_data, lane_data, current_time)
                 self.debug_green_lanes(tl_id, lane_data)
 
         except Exception as e:
             print(f"Error in run_step: {e}")
-            traceback.print_exc()
- 
+            import traceback; traceback.print_exc() 
     def _phase_has_traffic(self, logic, action, controlled_lanes, lane_data):
         """Returns True if at least one green lane in the selected phase has traffic."""
         phase_state = logic.phases[action].state
