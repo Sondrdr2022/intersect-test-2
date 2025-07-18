@@ -2506,46 +2506,53 @@ def main():
 
 def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episodes=1, num_retries=1, retry_delay=1, mode="train"):
     global controller
-    # --- ADD IMPORT AT TOP ---
-    phase_display = None
 
-    try:
-        for episode in range(episodes):
-            print(f"\n{'='*50}\n🚦 STARTING UNIVERSAL EPISODE {episode + 1}/{episodes}\n{'='*50}")
-            sumo_binary = "sumo-gui" if use_gui else "sumo"
-            sumo_cmd = [os.path.join(os.environ['SUMO_HOME'], 'bin', sumo_binary), '-c', sumocfg_path, '--start', '--quit-on-end']
-            traci.start(sumo_cmd)
+    # 1. Create the Tkinter display
+    phase_display = TrafficLightPhaseDisplay(poll_interval=500)
 
-            # --- START PHASE DISPLAY AFTER traci.start ---
-            if episode == 0:
-                phase_display = TrafficLightPhaseDisplay(poll_interval=500)
-                phase_display.start()
+    # 2. Define the simulation loop as a function
+    def simulation_loop():
+        global controller
+        try:
+            for episode in range(episodes):
+                print(f"\n{'='*50}\n🚦 STARTING UNIVERSAL EPISODE {episode + 1}/{episodes}\n{'='*50}")
+                sumo_binary = "sumo-gui" if use_gui else "sumo"
+                sumo_cmd = [os.path.join(os.environ['SUMO_HOME'], 'bin', sumo_binary), '-c', sumocfg_path, '--start', '--quit-on-end']
+                traci.start(sumo_cmd)
+                controller = UniversalSmartTrafficController(sumocfg_path=sumocfg_path, mode=mode)
+                controller.initialize()
+                controller.current_episode = episode + 1
+                step, tstart = 0, time.time()
+                while traci.simulation.getMinExpectedNumber() > 0:
+                    if max_steps and step >= max_steps:
+                        print(f"Reached max steps ({max_steps}), ending episode."); break
+                    controller.run_step()
+                    traci.simulationStep()
+                    step += 1
+                    if step % 1000 == 0:
+                        print(f"Episode {episode + 1}: Step {step} completed, elapsed: {time.time()-tstart:.2f}s")
+                print(f"Episode {episode + 1} completed after {step} steps")
+                controller.end_episode()
+                traci.close()
+                if episode < episodes - 1: time.sleep(2)
+            print(f"\n🎉 All {episodes} episodes completed!")
+        except Exception as e:
+            print(f"Error in universal simulation: {e}")
+        finally:
+            try: traci.close()
+            except: pass
+            print("Simulation resources cleaned up")
 
-            controller = UniversalSmartTrafficController(sumocfg_path=sumocfg_path, mode=mode)
-            controller.initialize()
-            controller.current_episode = episode + 1
-            step, tstart = 0, time.time()
-            while traci.simulation.getMinExpectedNumber() > 0:
-                if max_steps and step >= max_steps:
-                    print(f"Reached max steps ({max_steps}), ending episode."); break
-                controller.run_step()
-                traci.simulationStep()
-                step += 1
-                if step % 1000 == 0:
-                    print(f"Episode {episode + 1}: Step {step} completed, elapsed: {time.time()-tstart:.2f}s")
-            print(f"Episode {episode + 1} completed after {step} steps")
-            controller.end_episode()
-            traci.close()
-            if episode < episodes - 1: time.sleep(2)
-        print(f"\n🎉 All {episodes} episodes completed!")
-        return controller
-    except Exception as e:
-        print(f"Error in universal simulation: {e}")
-    finally:
-        if phase_display is not None:
-            phase_display.stop()
-        try: traci.close()
-        except: pass
-        print("Simulation resources cleaned up")
+    # 3. Start the simulation in a background thread
+    sim_thread = threading.Thread(target=simulation_loop)
+    sim_thread.start()
+
+    # 4. Start Tkinter mainloop in the main thread (this blocks until the window closes)
+    phase_display.start()
+
+    # 5. Wait for simulation to finish (after window is closed)
+    sim_thread.join()
+
+    return controller
 if __name__ == "__main__":
     main()
