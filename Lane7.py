@@ -1110,16 +1110,121 @@ class EnhancedQLearningAgent:
         print(f"[RL] Phase {phase_idx} set from APC PKL: duration={phase_record['duration']}")
         return True
 
-    def switch_or_extend_phase(self, state, green_lanes):
-        print(f"[DEBUG] RL Agent switch_or_extend_phase called with state={state}, green_lanes={green_lanes}")
+    def switch_or_extend_phase(self, state, green_lanes, force_protected_left=False):
+        """
+        Improved: RL agent can now request a protected left phase directly if needed.
+        If force_protected_left is True, will use create_or_extend_protected_left_phase.
+        """
+        print(f"[DEBUG] RL Agent switch_or_extend_phase called with state={state}, green_lanes={green_lanes}, force_protected_left={force_protected_left}")
         R = self.adaptive_controller.calculate_reward()
         raw_delta_t, delta_t, penalty = self.adaptive_controller.calculate_delta_t_and_penalty(R)
         print(f"[DEBUG] RL Agent received delta_t={delta_t}, penalty={penalty} from AdaptivePhaseController")
-        phase_idx = self.adaptive_controller.create_or_extend_phase(green_lanes, delta_t)
-        print(f"[DEBUG] RL Agent created/extended phase with index {phase_idx}")
+
+        if force_protected_left and len(green_lanes) == 1:
+            phase_idx = self.adaptive_controller.create_or_extend_protected_left_phase(green_lanes[0], delta_t)
+            print(f"[DEBUG] RL Agent created/extended protected left phase with index {phase_idx}")
+        else:
+            phase_idx = self.adaptive_controller.create_or_extend_phase(green_lanes, delta_t)
+            print(f"[DEBUG] RL Agent created/extended general phase with index {phase_idx}")
+
         self.set_phase_from_pkl(phase_idx)
         print(f"[DEBUG] RL Agent set phase from pkl with index {phase_idx}")
         return phase_idx
+
+    def switch_to_best_phase(self, state, lane_data, left_turn_lanes=None):
+        """
+        New method: RL agent picks best phase (possibly protected left) based on state and lane_data.
+        Prioritizes blocked/queued left-turns (as protected left), else chooses the lane with largest queue.
+        """
+        # 1. Prioritize protected left turn if severely blocked
+        if left_turn_lanes:
+            for left_lane in left_turn_lanes:
+                # Consider "blocked" if queue is high and (optionally) all vehicles stopped
+                queue = lane_data[left_lane]['queue_length']
+                vehicles = lane_data[left_lane]['vehicle_ids']
+                speeds = [traci.vehicle.getSpeed(vid) for vid in vehicles] if vehicles else []
+                # Threshold: queue >= 2 and all speeds low
+                if queue >= 2 and (not speeds or max(speeds) < 0.2):
+                    print(f"[RL] Detected blocked left {left_lane}, requesting protected left phase.")
+                    return self.switch_or_extend_phase(state, [left_lane], force_protected_left=True)
+
+        # 2. Otherwise: select the lane with highest queue for green
+        max_q = -1
+        best_lane = None
+        for lane, data in lane_data.items():
+            if data.get('queue_length', 0) > max_q:
+                max_q = data['queue_length']
+                best_lane = lane
+
+        if best_lane is not None:
+            print(f"[RL] Selecting lane {best_lane} with queue {max_q} for green phase.")
+            return self.switch_or_extend_phase(state, [best_lane])
+
+        # 3. Fallback: use all lanes (should not usually happen)
+        print("[RL] No valid lane found, defaulting to all green.")
+        all_lanes = list(lane_data.keys())
+        return self.switch_or_extend_phase(state, all_lanes)
+    
+
+    def create_or_extend_protected_left_phase(self, left_lane, delta_t):
+        """
+        Create or extend a protected left turn phase for the given lane.
+        If such a phase already exists, extend its duration using delta_t.
+        If not, create a new protected left phase and set its duration.
+        """
+        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+        left_idx = controlled_lanes.index(left_lane)
+        protected_state = ''.join(['G' if i == left_idx else 'r' for i in range(len(controlled_lanes))])
+        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+
+        # Check if protected left phase already exists
+        for idx, phase in enumerate(logic.getPhases()):
+            if phase.state == protected_state:
+                # Extend phase duration
+                old_duration = phase.duration
+                new_duration = np.clip(old_duration + delta_t, self.min_green, self.max_green)
+                phases = list(logic.getPhases())
+                phases[idx] = traci.trafficlight.Phase(new_duration, protected_state)
+                new_logic = traci.trafficlight.Logic(
+                    logic.programID, logic.type, logic.currentPhaseIndex, phases
+                )
+                traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
+                traci.trafficlight.setPhase(self.tls_id, idx)
+                self.save_phase_to_pkl(idx, new_duration, protected_state, delta_t, delta_t, penalty=0)
+                self._log_apc_event({
+                    "action": "extend_protected_left_phase",
+                    "tls_id": self.tls_id,
+                    "lane_id": left_lane,
+                    "phase_idx": idx,
+                    "new_duration": new_duration,
+                    "delta_t": delta_t,
+                    "protected_state": protected_state,
+                })
+                return idx
+
+        # If not found, create new protected left phase
+        yellow_state = ''.join(['y' if i == left_idx else 'r' for i in range(len(controlled_lanes))])
+        green_phase = traci.trafficlight.Phase(self.max_green, protected_state)
+        yellow_phase = traci.trafficlight.Phase(3, yellow_state)
+        phases = list(logic.getPhases()) + [green_phase, yellow_phase]
+        new_logic = traci.trafficlight.Logic(
+            logic.programID, logic.type, len(phases) - 2, phases
+        )
+        traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
+        traci.trafficlight.setPhase(self.tls_id, len(phases) - 2)
+        self.save_phase_to_pkl(len(phases) - 2, self.max_green, protected_state, delta_t, delta_t, penalty=0)
+        self._log_apc_event({
+            "action": "create_protected_left_phase",
+            "tls_id": self.tls_id,
+            "lane_id": left_lane,
+            "phase_idx": len(phases) - 2,
+            "duration": self.max_green,
+            "delta_t": delta_t,
+            "protected_state": protected_state,
+        })
+        return len(phases) - 2
+
+
     def calculate_total_reward(self, adaptive_R, rl_reward):
         """Sum of Adaptive reward R (no penalty) and RL-specific reward."""
         return adaptive_R + rl_reward
