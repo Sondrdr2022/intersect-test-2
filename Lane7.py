@@ -162,23 +162,38 @@ class AdaptivePhaseController:
         self._save_apc_state()
 
     def create_or_extend_phase(self, green_lanes, delta_t):
-        """Create a new phase or extend the current phase, log to pkl."""
-        print(f"[DEBUG] [CREATE_OR_EXTEND_PHASE] Will create/extend phase for lanes {green_lanes} with delta_t={delta_t:.2f}")
+        print(f"[DEBUG] create_or_extend_phase called with green_lanes={green_lanes}, delta_t={delta_t}")
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
-        # For new phase creation
         new_state = self.create_phase_state(green_lanes=green_lanes)
         duration = np.clip(traci.trafficlight.getPhaseDuration(self.tls_id) + delta_t, self.min_green, self.max_green)
-        print(f"[DEBUG] [CREATE_OR_EXTEND_PHASE] New phase state: {new_state}, Duration: {duration:.2f}")
+        print(f"[DEBUG] Creating or extending phase: new_state={new_state}, duration={duration}")
+
         new_phase = traci.trafficlight.Phase(duration, new_state)
         phases = list(logic.getPhases()) + [new_phase]
         new_logic = traci.trafficlight.Logic(
             logic.programID, logic.type, len(phases) - 1, phases
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
+        print(f"[DEBUG] setCompleteRedYellowGreenDefinition called for {self.tls_id} with {len(phases)} phases")
+
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
-        print(f"[DEBUG] [CREATE_OR_EXTEND_PHASE] Pushed new phase index {len(phases) - 1} to traffic light {self.tls_id}")
-        # Save the new/extended phase
+        print(f"[DEBUG] setPhase called for {self.tls_id} to phase {len(phases) - 1}")
+
         self.save_phase_to_pkl(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
+        print(f"[DEBUG] save_phase_to_pkl called for phase index {len(phases) - 1}")
+
+        event = {
+            "action": "create_or_extend_phase",
+            "tls_id": self.tls_id,
+            "green_lanes": green_lanes,
+            "duration": duration,
+            "phase_idx": len(phases) - 1,
+            "state": new_state,
+            "delta_t": delta_t
+        }
+        self._log_apc_event(event)
+        print(f"[DEBUG] create_or_extend_phase event logged: {event}")
+
         return len(phases) - 1
     def load_phase_from_pkl(self, phase_idx=None):
         """Return phase record by index (from APC pkl)."""
@@ -360,54 +375,51 @@ class AdaptivePhaseController:
         return "".join(state)
 
     def add_new_phase(self, green_lanes, green_duration=20, yellow_duration=3, yellow_lanes=None):
-        """Add new phase program to traffic light, enforce yellow"""
+        print(f"[DEBUG] add_new_phase called with green_lanes={green_lanes}, green_duration={green_duration}, yellow_duration={yellow_duration}, yellow_lanes={yellow_lanes}")
+
         try:
-            print(f"[DEBUG] [CREATE_NEW_PHASE] Creating new phase: green_lanes={green_lanes}, green_duration={green_duration}, yellow_duration={yellow_duration}, yellow_lanes={yellow_lanes}")
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
             phases = list(logic.getPhases())
-
             green_state = self.create_phase_state(green_lanes=green_lanes)
-            # Default yellow lanes: green lanes, make sure yellow is present for every green
             yellow_lanes_final = yellow_lanes if yellow_lanes is not None else green_lanes
             yellow_state = self.create_phase_state(yellow_lanes=yellow_lanes_final)
-
             new_green = traci.trafficlight.Phase(green_duration, green_state)
             new_yellow = traci.trafficlight.Phase(yellow_duration, yellow_state)
-
             phases.extend([new_green, new_yellow])
-            print(f"[DEBUG] [CREATE_NEW_PHASE] Pushing new phase definition to traffic light {self.tls_id}. New phase index: {len(phases)-2}, Green state: {green_state}, Yellow state: {yellow_state}")
+
+            print(f"[DEBUG] Creating new phase objects: Green={green_state}, Yellow={yellow_state} at durations {green_duration}, {yellow_duration}")
+
             new_logic = traci.trafficlight.Logic(
                 logic.programID,
                 logic.type,
                 min(logic.currentPhaseIndex, len(phases)-1),
                 phases
             )
-
             traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
-            traci.trafficlight.setPhase(self.tls_id, 0)  # or another valid index
+            print(f"[DEBUG] setCompleteRedYellowGreenDefinition called for {self.tls_id} with {len(phases)} phases")
+
+            traci.trafficlight.setPhase(self.tls_id, len(phases)-2)
+            print(f"[DEBUG] setPhase called for {self.tls_id} to phase {len(phases)-2}")
 
             event = {
                 "action": "add_new_phase",
+                "tls_id": self.tls_id,
                 "green_lanes": green_lanes,
                 "yellow_lanes": yellow_lanes_final,
                 "green_duration": green_duration,
                 "yellow_duration": yellow_duration,
                 "new_phase_idx": len(phases)-2,
                 "green_state": green_state,
-                "yellow_state": yellow_state,
-                "weights": self.weights.tolist(),
-                "bonus": getattr(self, "last_bonus", 0),
-                "penalty": getattr(self, "last_penalty", 0)
+                "yellow_state": yellow_state
             }
             self._log_apc_event(event)
+            print(f"[DEBUG] add_new_phase event logged: {event}")
 
-            print(f"[NEW PHASE] Added for lanes {green_lanes} at {self.tls_id}")
-            print(f"  Green state: {green_state}\n  Yellow state: {yellow_state}")
-            print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
             return len(phases)-2
         except Exception as e:
             print(f"[ERROR] Phase creation failed: {e}")
             return None
+
     def check_special_events(self):
         """Detect special conditions with improved prioritization"""
         now = traci.simulation.getTime()
@@ -1093,12 +1105,14 @@ class EnhancedQLearningAgent:
         return True
 
     def switch_or_extend_phase(self, state, green_lanes):
-        """RL agent decides to create/extend phase, then sets it from pkl."""
+        print(f"[DEBUG] RL Agent switch_or_extend_phase called with state={state}, green_lanes={green_lanes}")
         R = self.adaptive_controller.calculate_reward()
         raw_delta_t, delta_t, penalty = self.adaptive_controller.calculate_delta_t_and_penalty(R)
-        # Always create or extend phase and save to pkl before switching
+        print(f"[DEBUG] RL Agent received delta_t={delta_t}, penalty={penalty} from AdaptivePhaseController")
         phase_idx = self.adaptive_controller.create_or_extend_phase(green_lanes, delta_t)
+        print(f"[DEBUG] RL Agent created/extended phase with index {phase_idx}")
         self.set_phase_from_pkl(phase_idx)
+        print(f"[DEBUG] RL Agent set phase from pkl with index {phase_idx}")
         return phase_idx
     def calculate_total_reward(self, adaptive_R, rl_reward):
         """Sum of Adaptive reward R (no penalty) and RL-specific reward."""
