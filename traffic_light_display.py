@@ -1,29 +1,50 @@
 import tkinter as tk
 from tkinter import ttk
-import threading
 import traci
 
 class TrafficLightPhaseDisplay:
     def __init__(self, poll_interval=1000):
         self.root = tk.Tk()
         self.root.title("Phase Time")
-        self.tree = ttk.Treeview(self.root, columns=("tl_id", "current time", "next"), show="headings")
+        # Add new columns for analytics/log info
+        self.tree = ttk.Treeview(
+            self.root,
+            columns=(
+                "tl_id",
+                "current time",
+                "next",
+                "event type",
+                "phase index",
+                "phase state",
+                "action taken",
+                "protected left",
+                "blocked"
+            ),
+            show="headings"
+        )
         self.tree.heading("tl_id", text="tl_id")
         self.tree.heading("current time", text="current time")
         self.tree.heading("next", text="next")
+        self.tree.heading("event type", text="Event Type")
+        self.tree.heading("phase index", text="Phase Index")
+        self.tree.heading("phase state", text="Phase State")
+        self.tree.heading("action taken", text="Action Taken")
+        self.tree.heading("protected left", text="Protected Left Turn")
+        self.tree.heading("blocked", text="Is Blocked")
         self.tree.pack(fill=tk.BOTH, expand=True)
         self.poll_interval = poll_interval
         self.running = False
+        self.ready = True  # Set to True when SUMO/TraCI is connected
 
-def update_table(self):
-    if not getattr(self, "ready", True):  # Only update if ready (SUMO connected)
-        self.root.after(self.poll_interval, self.update_table)
-        return
-    try:
+    def update_table(self):
+        if not getattr(self, "ready", True):
+            self.root.after(self.poll_interval, self.update_table)
+            return
+        try:
             # Remove old rows
             for row in self.tree.get_children():
                 self.tree.delete(row)
-            # Query TraCI for all traffic lights
+            # Example: You need to replace the following with your actual log/event extraction logic
             for tl_id in traci.trafficlight.getIDList():
                 logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(tl_id)[0]
                 current_phase = traci.trafficlight.getPhase(tl_id)
@@ -31,17 +52,54 @@ def update_table(self):
                 curr_time = phases[current_phase].duration if current_phase < len(phases) else "-"
                 next_phase = (current_phase + 1) % len(phases)
                 next_time = phases[next_phase].duration if next_phase < len(phases) else "-"
-                self.tree.insert("", "end", values=(tl_id, curr_time, next_time))
-    except Exception as e:
-        print("[TrafficLightPhaseDisplay ERROR]:", e)
-    if self.running:
-        self.root.after(self.poll_interval, self.update_table)
+                
+                # --- YOU MUST SET THESE FROM YOUR EVENT LOGGING SYSTEM ---
+                # For demo, defaults are shown here. Replace with actual values!
+                event_type = self.get_event_type_for(tl_id, current_phase)
+                action_taken = self.get_action_taken_for(tl_id, current_phase)
+                phase_state = phases[current_phase].state if current_phase < len(phases) else "-"
+                protected_left = self.is_protected_left(tl_id, current_phase)
+                blocked = self.is_blocked(tl_id, current_phase)
+                # --------------------------------------------------------
+                self.tree.insert(
+                    "", "end",
+                    values=(
+                        tl_id,
+                        curr_time,
+                        next_time,
+                        event_type,
+                        current_phase,
+                        phase_state,
+                        action_taken,
+                        "Yes" if protected_left else "No",
+                        "Yes" if blocked else "No"
+                    )
+                )
+        except Exception as e:
+            print("[TrafficLightPhaseDisplay ERROR]:", e)
+        if self.running:
+            self.root.after(self.poll_interval, self.update_table)
+
+    def get_event_type_for(self, tl_id, phase_index):
+        # TODO: Connect to your actual event log (phase switch, extension, congestion, etc.)
+        return "Unknown"  # Replace with actual event
+
+    def get_action_taken_for(self, tl_id, phase_index):
+        # TODO: Connect to your actual event log ("Extended by 5s", "Switched to phase 2", etc.)
+        return "Unknown"  # Replace with actual action
+
+    def is_protected_left(self, tl_id, phase_index):
+        # TODO: Implement logic based on your controller's state/logs
+        return False
+
+    def is_blocked(self, tl_id, phase_index):
+        # TODO: Implement logic based on your controller's state/logs
+        return False
 
     def start(self):
         self.running = True
         self.update_table()
         self.root.mainloop()
-        threading.Thread(target=self.root.mainloop, daemon=True).start()
 
     def stop(self):
         self.running = False
