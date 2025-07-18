@@ -309,43 +309,6 @@ class AdaptivePhaseController:
         except traci.TraCIException as e:
             print(f"[ERROR] Phase switch failed: {e}")
             return False
-    def adjust_phase_duration(self, delta_t):
-        """Adjust current phase duration, never letting it go below min_green."""
-        try:
-            old_phase = traci.trafficlight.getPhase(self.tls_id)
-            current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
-
-            # Clamp new duration
-            new_duration = np.clip(
-                current_duration + delta_t,
-                self.min_green,
-                self.max_green
-            )
-            if new_duration < self.min_green:
-                print(f"[WARNING] Tried to set duration {new_duration}s < min_green {self.min_green}s! Forcing min_green.")
-                new_duration = self.min_green
-
-            traci.trafficlight.setPhaseDuration(self.tls_id, new_duration)
-
-            event = {
-                "action": "adjust_phase_duration",
-                "phase": old_phase,
-                "delta_t": delta_t,
-                "old_duration": current_duration,
-                "new_duration": new_duration,
-                "reward": self.last_R,
-                "weights": self.weights.tolist(),
-                "bonus": getattr(self, "last_bonus", 0),
-                "penalty": getattr(self, "last_penalty", 0)
-            }
-            self._log_apc_event(event)
-
-            print(f"\n[PHASE ADJUST] Phase {old_phase}: {current_duration:.1f}s → {new_duration:.1f}s")
-            print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
-            return new_duration
-        except traci.TraCIException as e:
-            print(f"[ERROR] Duration adjustment failed: {e}")
-            return current_duration
 
     def create_phase_state(self, green_lanes=None, yellow_lanes=None, red_lanes=None):
         """Create phase state string from lane specifications, always include yellow transition"""
@@ -954,26 +917,33 @@ class AdaptivePhaseController:
         except Exception as e:
             print(f"[ERROR] Yellow phase insertion failed: {e}")
 
+
+    def enforce_min_green(self):
+        """Return True if enough time has passed since last phase switch."""
+        current_sim_time = traci.simulation.getTime()
+        elapsed = current_sim_time - self.last_phase_switch_sim_time
+        if elapsed < self.min_green:
+            print(f"[MIN_GREEN ENFORCED] {self.tls_id}: Only {elapsed:.2f}s since last switch, min_green={self.min_green}s")
+            return False
+        return True
+
     def log_phase_switch(self, new_phase_idx):
         """
-        Safely switch phases, inserting yellow phase if needed.
+        Safely switch phases, inserting yellow phase if needed, and always enforce min_green.
         """
         try:
             old_phase = traci.trafficlight.getPhase(self.tls_id)
             old_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
             current_sim_time = traci.simulation.getTime()
 
-            # Flicker prevention: don't allow switch to same phase or too soon since last switch
-            if (
-                self.last_phase_idx == new_phase_idx and 
-                current_sim_time - self.last_phase_switch_sim_time < self.min_green
-            ):
-                print(f"[PHASE SWITCH BLOCKED] Flicker prevention triggered for {self.tls_id}")
+            # Use the new enforcement function
+            if not self.enforce_min_green():
+                print(f"[PHASE SWITCH BLOCKED] Minimum green not elapsed ({current_sim_time - self.last_phase_switch_sim_time:.2f}s < {self.min_green}s)")
                 return False
 
-            # ENFORCE: never allow switching if not enough green time has elapsed
-            if current_sim_time - self.last_phase_switch_sim_time < self.min_green:
-                print(f"[PHASE SWITCH BLOCKED] Minimum green not elapsed ({current_sim_time - self.last_phase_switch_sim_time:.2f}s < {self.min_green}s)")
+            # Flicker prevention: don't allow switch to same phase
+            if self.last_phase_idx == new_phase_idx:
+                print(f"[PHASE SWITCH BLOCKED] Flicker prevention triggered for {self.tls_id}")
                 return False
 
             # Insert yellow phase if needed
@@ -1007,10 +977,47 @@ class AdaptivePhaseController:
         except traci.TraCIException as e:
             print(f"[ERROR] Phase switch failed: {e}")
             return False
+
+    def adjust_phase_duration(self, delta_t):
+        """Adjust current phase duration, never letting it go below min_green and always enforcing min_green."""
+        try:
+            if not self.enforce_min_green():
+                print("[PHASE DURATION ADJUST BLOCKED] Minimum green not elapsed.")
+                return traci.trafficlight.getPhaseDuration(self.tls_id)
+
+            old_phase = traci.trafficlight.getPhase(self.tls_id)
+            current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
+            new_duration = np.clip(current_duration + delta_t, self.min_green, self.max_green)
+            if new_duration < self.min_green:
+                print(f"[WARNING] Tried to set duration {new_duration}s < min_green {self.min_green}s! Forcing min_green.")
+                new_duration = self.min_green
+
+            traci.trafficlight.setPhaseDuration(self.tls_id, new_duration)
+
+            event = {
+                "action": "adjust_phase_duration",
+                "phase": old_phase,
+                "delta_t": delta_t,
+                "old_duration": current_duration,
+                "new_duration": new_duration,
+                "reward": self.last_R,
+                "weights": self.weights.tolist(),
+                "bonus": getattr(self, "last_bonus", 0),
+                "penalty": getattr(self, "last_penalty", 0)
+            }
+            self._log_apc_event(event)
+
+            print(f"\n[PHASE ADJUST] Phase {old_phase}: {current_duration:.1f}s → {new_duration:.1f}s")
+            print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
+            return new_duration
+        except traci.TraCIException as e:
+            print(f"[ERROR] Duration adjustment failed: {e}")
+            return traci.trafficlight.getPhaseDuration(self.tls_id)
+
     def control_step(self):
         """
         Main control logic. Checks for blocked left-turns and activates protected left-turn phase.
-        Always inserts yellow between green-red transitions.
+        Always inserts yellow between green-red transitions and always enforces min_green.
         """
         self.phase_count += 1
         current_time = traci.simulation.getTime()
@@ -1025,6 +1032,7 @@ class AdaptivePhaseController:
 
         # ENFORCE: never allow phase switch or duration change before min_green elapsed
         if elapsed_green < self.min_green:
+            print(f"[CONTROL STEP BLOCKED] {self.tls_id}: Only {elapsed_green:.2f}s since last switch (min_green={self.min_green}s)")
             return
 
         # Serve protected left-turn if blocked/conflict detected (highest priority)
@@ -1042,8 +1050,6 @@ class AdaptivePhaseController:
         # Otherwise, adjust phase duration as usual
         self.adjust_phase_duration(delta_t)
         self.last_phase_switch_time = current_time
-
-
 class EnhancedQLearningAgent:
     def __init__(self, state_size, action_size, adaptive_controller, learning_rate=0.1, discount_factor=0.95, 
                  epsilon=0.1, epsilon_decay=0.995, min_epsilon=0.01, 
