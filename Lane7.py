@@ -728,20 +728,21 @@ class AdaptivePhaseController:
     
     def set_phase_from_pkl(self, phase_idx):
         """
-        Always set the SUMO traffic light phase and duration using data from APC's PKL file (for RL/Smart control).
+        Force SUMO to use RL agent's phase and duration from PKL, replacing any built-in SUMO logic.
+        This should be the ONLY way phases/durations are set in RL mode.
         """
         phase_record = self.load_phase_from_pkl(phase_idx)
         if phase_record:
-            traci.trafficlight.setPhase(self.tls_id, phase_record["phase_idx"])
+            # SET PHASE, THEN DURATION!
+            traci.trafficlight.setPhase(self.tls_id, phase_idx)
             traci.trafficlight.setPhaseDuration(self.tls_id, phase_record["duration"])
-            print(f"[APC] Phase {phase_idx} set from PKL: duration={phase_record['duration']}")
+            print(f"[APC-RL] Phase {phase_idx} set from PKL: duration={phase_record['duration']}")
             return True
         else:
-            print(f"[APC] Phase {phase_idx} not found in PKL, fallback to max_green")
+            print(f"[APC-RL] Phase {phase_idx} not found in PKL, fallback to max_green")
             traci.trafficlight.setPhase(self.tls_id, phase_idx)
             traci.trafficlight.setPhaseDuration(self.tls_id, self.max_green)
             return False
-
 
     def ensure_true_protected_left_phase(self, left_lane):
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
@@ -1031,7 +1032,6 @@ class AdaptivePhaseController:
         self.phase_count += 1
         current_time = traci.simulation.getTime()
         bonus, penalty = self.compute_status_and_bonus_penalty()
-        self.adjust_weights()
         R = self.calculate_reward(bonus, penalty)
         self.reward_history.append(R)
         if self.phase_count % 10 == 0:
@@ -1108,6 +1108,9 @@ class EnhancedQLearningAgent:
 
 
     def switch_or_extend_phase(self, state, green_lanes, force_protected_left=False):
+        """
+        RL agent: set phase/duration for SUMO via PKL, fully overriding SUMO built-in logic.
+        """
         print(f"[DEBUG] RL Agent switch_or_extend_phase called with state={state}, green_lanes={green_lanes}, force_protected_left={force_protected_left}")
         R = self.adaptive_controller.calculate_reward()
         raw_delta_t, delta_t, penalty = self.adaptive_controller.calculate_delta_t_and_penalty(R)
@@ -1129,9 +1132,12 @@ class EnhancedQLearningAgent:
             "state": str(state),
         })
 
-        # PATCH: Always set phase using APC PKL for both phase and duration
+        # --- MAIN PATCH: This is the only place SUMO logic is overridden ---
         self.adaptive_controller.set_phase_from_pkl(phase_idx)
-        return phase_idx    
+        # Optionally (if you want to hard-enforce RL control even more):
+        # traci.trafficlight.setProgram(self.adaptive_controller.tls_id, "custom")  # if you use a custom program for RL control
+
+        return phase_idx 
     def switch_to_best_phase(self, state, lane_data, left_turn_lanes=None):
         """
         New method: RL agent picks best phase (possibly protected left) based on state and lane_data.
@@ -2173,14 +2179,11 @@ class UniversalSmartTrafficController:
             current_phase = traci.trafficlight.getPhase(tl_id)
             target_phase = self._find_phase_for_lane(tl_id, target_lane) or current_phase
 
-            if action == 0:  # Set green for target lane
-                if current_phase != target_phase:
-                    green_time = self._calculate_dynamic_green(lane_data[target_lane]) \
-                        if target_lane in lane_data else self.adaptive_params['min_green']
-                    traci.trafficlight.setPhase(tl_id, target_phase)
-                    traci.trafficlight.setPhaseDuration(tl_id, green_time)
-                    self.last_phase_change[tl_id] = current_time
-                    self.last_green_time[self.lane_id_to_idx[target_lane]] = current_time
+            apc = self.adaptive_phase_controllers[tl_id]
+            if current_phase != target_phase:
+                apc.set_phase_from_pkl(target_phase)
+                self.last_phase_change[tl_id] = current_time
+                self.last_green_time[self.lane_id_to_idx[target_lane]] = current_time
             elif action == 1:  # Next phase
                 next_phase = (current_phase + 1) % self._get_phase_count(tl_id)
                 traci.trafficlight.setPhase(tl_id, next_phase)
