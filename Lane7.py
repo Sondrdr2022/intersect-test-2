@@ -5,6 +5,11 @@ from pyinstrument import Profiler
 warnings.filterwarnings('ignore')
 from flask import Flask, request, jsonify
 from traffic_light_display import TrafficLightPhaseDisplay
+try:
+    from traci._trafficlight import Logic, Phase
+    import traci.constants
+except ImportError:
+    Logic = Phase = None
 
 app = Flask(__name__)
 controller = None  # global reference for the API
@@ -41,8 +46,27 @@ def run_episode():
 os.environ.setdefault('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
 tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
 if tools not in sys.path: sys.path.append(tools)
+def override_sumo_program_from_pkl(apc, current_phase_idx=None):
+    """
+    Replace the SUMO phase program for this controller with the PKL-defined sequence.
+    """
+    phase_seq = apc.get_full_phase_sequence()
+    if not phase_seq:
+        print(f"[PATCH] No PKL phase sequence for {apc.tls_id}, skipping override.")
+        return
 
-
+    # Default to current SUMO phase if not given
+    if current_phase_idx is None:
+        current_phase_idx = traci.trafficlight.getPhase(apc.tls_id)
+    phases = [Phase(duration, state) for (state, duration) in phase_seq]
+    new_logic = Logic(
+        programID="PKL-OVERRIDE",
+        type=traci.constants.TL_LOGIC_PROGRAM,
+        currentPhaseIndex=current_phase_idx if 0 <= current_phase_idx < len(phases) else 0,
+        phases=phases,
+    )
+    traci.trafficlight.setCompleteRedYellowGreenDefinition(apc.tls_id, new_logic)
+    print(f"[PATCH] Overrode SUMO program for {apc.tls_id} with {len(phases)} PKL phases.")
 
 
 class AdaptivePhaseController:
@@ -153,6 +177,20 @@ class AdaptivePhaseController:
                 pickle.dump(self.apc_state, f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception as e:
             print(f"[APC] State save failed: {e}")
+    def get_full_phase_sequence(self):
+        """
+        Return a list of (state_string, duration) tuples representing all phases
+        (in order by phase_idx) from the PKL. If not found, fall back to default logic.
+        """
+        # Get all unique phase_idx in PKL (sorted)
+        phase_records = sorted(self.apc_state.get("phases", []), key=lambda x: x["phase_idx"])
+        # If empty, fallback
+        if not phase_records:
+            import traci
+            logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+            return [(p.state, p.duration) for p in logic.getPhases()]
+        # Build the full sequence
+        return [(rec["state"], rec["duration"]) for rec in phase_records]
     def save_phase_to_pkl(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty, reward=None, bonus=None, weights=None, event_type=None, lanes=None):
         entry = {
             "phase_idx": phase_idx,
@@ -198,8 +236,13 @@ class AdaptivePhaseController:
                 return idx
         new_phase = traci.trafficlight.Phase(duration, new_state)
         phases = list(logic.getPhases()) + [new_phase]
+
+        # PATCH: Use the explicit construction of new_logic and setting the definition as requested
         new_logic = traci.trafficlight.Logic(
-            logic.programID, logic.type, len(phases) - 1, phases
+            id=self.tls_id,
+            type=traci.constants.TL_LOGIC_PROG,
+            currentPhaseIndex=len(phases) - 1,
+            phases=[traci.trafficlight.Phase(duration=ph.duration, state=ph.state) for ph in phases]
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
         print(f"[DEBUG] setCompleteRedYellowGreenDefinition called for {self.tls_id} with {len(phases)} phases")
@@ -225,7 +268,6 @@ class AdaptivePhaseController:
         self._log_apc_event(event)
         print(f"[DEBUG] RL/Controller created new phase: {event}")
         return len(phases) - 1
-
     def load_phase_from_pkl(self, phase_idx=None):
         for p in self.apc_state.get("phases", []):
             if p["phase_idx"] == phase_idx:
@@ -745,10 +787,9 @@ class AdaptivePhaseController:
         """
         phase_record = self.load_phase_from_pkl(phase_idx)
         if phase_record:
-            # SET PHASE, THEN DURATION!
-            traci.trafficlight.setPhase(self.tls_id, phase_idx)
-            traci.trafficlight.setPhaseDuration(self.tls_id, phase_record["duration"])
-            print(f"[APC-RL] Phase {phase_idx} set from PKL: duration={phase_record['duration']}")
+            # PATCH: Override SUMO logic with PKL full sequence and set phase
+            override_sumo_program_from_pkl(self, current_phase_idx=phase_idx)
+            print(f"[APC-RL] Phase {phase_idx} set from PKL/override: duration={phase_record['duration']}")
             return True
         else:
             print(f"[APC-RL] Phase {phase_idx} not found in PKL, fallback to max_green")
