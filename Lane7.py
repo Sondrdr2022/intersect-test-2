@@ -153,7 +153,7 @@ class AdaptivePhaseController:
                 pickle.dump(self.apc_state, f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception as e:
             print(f"[APC] State save failed: {e}")
-    def save_phase_to_pkl(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty):
+    def save_phase_to_pkl(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty, reward=None, bonus=None, weights=None, event_type=None, lanes=None):
         entry = {
             "phase_idx": phase_idx,
             "duration": duration,
@@ -162,12 +162,20 @@ class AdaptivePhaseController:
             "raw_delta_t": raw_delta_t,
             "penalty": penalty,
             "timestamp": datetime.datetime.now().isoformat(),
-            "sim_time": traci.simulation.getTime()
+            "sim_time": traci.simulation.getTime(),
+            "reward": reward if reward is not None else getattr(self, "last_R", None),
+            "bonus": bonus if bonus is not None else getattr(self, "last_bonus", 0),
+            "weights": weights if weights is not None else self.weights.tolist(),
+            "event_type": event_type,
+            "lanes": lanes if lanes is not None else self.lane_ids[:],
         }
         self.apc_state.setdefault("phases", []).append(entry)
         self._save_apc_state()
-
-
+        # Also log to events for easier lookup by phase
+        ev = entry.copy()
+        ev["action"] = event_type or "phase_persist"
+        self.apc_state.setdefault("events", []).append(ev)
+        self._save_apc_state()
     def create_or_extend_phase(self, green_lanes, delta_t):
         print(f"[DEBUG] create_or_extend_phase called with green_lanes={green_lanes}, delta_t={delta_t}")
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -197,7 +205,11 @@ class AdaptivePhaseController:
         print(f"[DEBUG] setCompleteRedYellowGreenDefinition called for {self.tls_id} with {len(phases)} phases")
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
         print(f"[DEBUG] setPhase called for {self.tls_id} to phase {len(phases) - 1}")
-        self.save_phase_to_pkl(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
+        reward = getattr(self, "last_R", None)
+        bonus = getattr(self, "last_bonus", 0)
+        weights = self.weights.tolist()
+        event_type = "rl_phase_created"
+        self.save_phase_to_pkl(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0, reward=reward, bonus=bonus, weights=weights, event_type=event_type, lanes=green_lanes)
         print(f"[DEBUG] save_phase_to_pkl called for phase index {len(phases) - 1}")
         # PATCH: Explicitly log RL-created phase
         event = {
@@ -1134,10 +1146,16 @@ class EnhancedQLearningAgent:
 
         # --- MAIN PATCH: This is the only place SUMO logic is overridden ---
         self.adaptive_controller.set_phase_from_pkl(phase_idx)
-        # Optionally (if you want to hard-enforce RL control even more):
-        # traci.trafficlight.setProgram(self.adaptive_controller.tls_id, "custom")  # if you use a custom program for RL control
-
-        return phase_idx 
+        phase_record = self.adaptive_controller.load_phase_from_pkl(phase_idx)
+        if phase_record:
+            traci.trafficlight.setPhase(self.adaptive_controller.tls_id, phase_record["phase_idx"])
+            traci.trafficlight.setPhaseDuration(self.adaptive_controller.tls_id, phase_record["duration"])
+            print(f"[APC-RL] RL agent set phase {phase_record['phase_idx']} duration={phase_record['duration']} (from PKL)")
+        else:
+            print(f"[APC-RL] No PKL record for RL agent phase {phase_idx}, fallback to default.")
+            traci.trafficlight.setPhase(self.adaptive_controller.tls_id, phase_idx)
+            traci.trafficlight.setPhaseDuration(self.adaptive_controller.tls_id, self.adaptive_controller.max_green)
+        return phase_idx
     def switch_to_best_phase(self, state, lane_data, left_turn_lanes=None):
         """
         New method: RL agent picks best phase (possibly protected left) based on state and lane_data.
@@ -2181,9 +2199,18 @@ class UniversalSmartTrafficController:
 
             apc = self.adaptive_phase_controllers[tl_id]
             if current_phase != target_phase:
-                apc.set_phase_from_pkl(target_phase)
+                # Apply adaptive phase controller's PKL-driven phase record
+                phase_record = apc.load_phase_from_pkl(target_phase)
+                if phase_record:
+                    traci.trafficlight.setPhase(tl_id, phase_record["phase_idx"])
+                    traci.trafficlight.setPhaseDuration(tl_id, phase_record["duration"])
+                else:
+                    # Fallback to default phase timing
+                    traci.trafficlight.setPhase(tl_id, target_phase)
+                    traci.trafficlight.setPhaseDuration(tl_id, apc.max_green)
+                # Update timing records
                 self.last_phase_change[tl_id] = current_time
-                self.last_green_time[self.lane_id_to_idx[target_lane]] = current_time
+                self.last_green_time[self.lane_id_to_idx[target_lane]] = current_time            
             elif action == 1:  # Next phase
                 next_phase = (current_phase + 1) % self._get_phase_count(tl_id)
                 traci.trafficlight.setPhase(tl_id, next_phase)
