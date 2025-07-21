@@ -800,6 +800,23 @@ class AdaptivePhaseController:
                 )
         print(f"[PRELOAD] Preloaded {len(phases)} SUMO phases into PKL.")
 
+    def update_phase_duration_record(self, phase_idx, new_duration):
+        """Update PKL and event log with the latest duration for the given phase index."""
+        updated = False
+        for p in self.apc_state.get("phases", []):
+            if p["phase_idx"] == phase_idx:
+                p["duration"] = new_duration
+                updated = True
+        if updated:
+            self._save_apc_state()
+        # Log an event for GUI (optional, but helps event log-based GUIs)
+        self._log_apc_event({
+            "action": "phase_duration_update",
+            "phase_idx": phase_idx,
+            "duration": new_duration,
+            "tls_id": self.tls_id
+        })
+
     def set_phase_from_pkl(self, phase_idx, requested_duration=None):
         """
         Try to set a phase by PKL index, falling back to SUMO logic, and
@@ -812,20 +829,12 @@ class AdaptivePhaseController:
             duration = requested_duration if requested_duration is not None else phase_record["duration"]
             traci.trafficlight.setPhase(self.tls_id, phase_record["phase_idx"])
             traci.trafficlight.setPhaseDuration(self.tls_id, duration)
-            # Update PKL record if duration changed
-            if requested_duration is not None:
-                phase_record["duration"] = requested_duration
-                self._save_apc_state()
+            # PATCH: Always update PKL/event log after duration set
+            self.update_phase_duration_record(phase_record["phase_idx"], duration)
             if hasattr(self, "update_display"):
                 current_time = traci.simulation.getTime()
                 next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
                 self.update_display(phase_idx, duration, current_time, next_switch)
-            self._log_apc_event({
-                "action": "set_phase_from_pkl",
-                "phase_idx": phase_idx,
-                "duration": duration,
-                "tls_id": self.tls_id
-            })
             return True
         else:
             print(f"[APC-RL] Phase {phase_idx} not found in PKL, attempting to create or substitute.")
@@ -834,7 +843,6 @@ class AdaptivePhaseController:
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
             phases = logic.getPhases()
             if 0 <= phase_idx < len(phases):
-                # Save this SUMO phase to PKL
                 self.save_phase_to_pkl(
                     phase_idx=phase_idx,
                     duration=phases[phase_idx].duration,
@@ -844,7 +852,7 @@ class AdaptivePhaseController:
                     penalty=0
                 )
                 print(f"[PKL][AUTO-SAVE] Saved missing SUMO phase {phase_idx} to PKL.")
-                self.set_phase_from_pkl(phase_idx, requested_duration=duration)                
+                self.set_phase_from_pkl(phase_idx, requested_duration=duration)
                 if hasattr(self, "update_display"):
                     self.update_display(phase_idx, phases[phase_idx].duration)
                 return True
@@ -1091,7 +1099,6 @@ class AdaptivePhaseController:
             old_phase = traci.trafficlight.getPhase(self.tls_id)
             old_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
             current_sim_time = traci.simulation.getTime()
-
             # Enforce min green
             if not self.enforce_min_green():
                 print(f"[PHASE SWITCH BLOCKED] Minimum green not elapsed ({current_sim_time - self.last_phase_switch_sim_time:.2f}s < {self.min_green}s)")
@@ -1099,15 +1106,17 @@ class AdaptivePhaseController:
 
             # --- PATCH: Allow duration update even if phase index is the same ---
             if self.last_phase_idx == new_phase_idx:
-                # Check if duration needs to be updated
                 current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
                 if requested_duration is not None and abs(current_duration - requested_duration) > 0.5:
                     traci.trafficlight.setPhaseDuration(self.tls_id, requested_duration)
                     print(f"[PHASE DURATION UPDATED] {self.tls_id}: Phase {new_phase_idx} duration updated {current_duration:.2f} -> {requested_duration:.2f}")
                     self.last_phase_switch_sim_time = current_sim_time
+                    # *** Always update the display with the new value ***
+                    if hasattr(self, "update_display"):
+                        now = traci.simulation.getTime()
+                        next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
+                        self.update_display(new_phase_idx, requested_duration, now, next_switch)
                     return True
-                print(f"[PHASE SWITCH BLOCKED] Flicker prevention triggered for {self.tls_id}")
-                return False
 
             self.insert_yellow_phase_if_needed(new_phase_idx)
             traci.trafficlight.setPhase(self.tls_id, new_phase_idx)
@@ -1161,7 +1170,14 @@ class AdaptivePhaseController:
                 print(f"[WARNING] Tried to set duration {new_duration}s < min_green {self.min_green}s! Forcing min_green.")
                 new_duration = self.min_green
 
+            # SET THE NEW DURATION FIRST
             traci.trafficlight.setPhaseDuration(self.tls_id, new_duration)
+
+            # THEN UPDATE THE DISPLAY
+            if hasattr(self, "update_display"):
+                current_time = traci.simulation.getTime()
+                next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
+                self.update_display(old_phase, new_duration, current_time, next_switch)
 
             event = {
                 "action": "adjust_phase_duration",
@@ -1169,7 +1185,7 @@ class AdaptivePhaseController:
                 "delta_t": delta_t,
                 "old_duration": current_duration,
                 "new_duration": new_duration,
-                "duration": new_duration,  # <-- ADD THIS FIELD!
+                "duration": new_duration,
                 "reward": self.last_R,
                 "weights": self.weights.tolist(),
                 "bonus": getattr(self, "last_bonus", 0),
@@ -1180,15 +1196,10 @@ class AdaptivePhaseController:
             print(f"\n[PHASE ADJUST] Phase {old_phase}: {current_duration:.1f}s → {new_duration:.1f}s")
             print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
 
-            if hasattr(self, "update_display"):
-                current_time = traci.simulation.getTime()
-                next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
-                self.update_display(old_phase, new_duration, current_time, next_switch)
-
             return new_duration
         except traci.TraCIException as e:
             print(f"[ERROR] Duration adjustment failed: {e}")
-            return traci.trafficlight.getPhaseDuration(self.tls_id)
+            return traci.trafficlight.getPhaseDuration(self.tls_id)    
     def control_step(self):
         self.phase_count += 1
         current_time = traci.simulation.getTime()

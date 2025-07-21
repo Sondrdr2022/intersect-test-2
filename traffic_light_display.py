@@ -75,16 +75,16 @@ class TrafficLightPhaseDisplay:
                     curr_time = self.elapsed
                     next_time = self.remaining
                 else:
-                    # Try event log's duration
-                    if curr_phase_record and "duration" in curr_phase_record:
-                        curr_time = curr_phase_record["duration"]
-                    else:
-                        # Fallback to live SUMO duration
-                        curr_time = traci.trafficlight.getPhaseDuration(tl_id)
+                    # PATCH: Always use live SUMO phase duration for current phase
+                    curr_time = traci.trafficlight.getPhaseDuration(tl_id)
+                    # Next phase duration: still try event log, else live, else phase object
                     if next_phase_record and "duration" in next_phase_record:
                         next_time = next_phase_record["duration"]
                     else:
-                        next_time = phases[next_phase].duration if next_phase < len(phases) else "-"
+                        if next_phase < len(phases):
+                            next_time = phases[next_phase].duration
+                        else:
+                            next_time = "-"
 
                 event_type = curr_phase_record["action"] if curr_phase_record and "action" in curr_phase_record else self.get_event_type_for(tl_id, current_phase)
                 action_taken = curr_phase_record.get("action_taken", event_type) if curr_phase_record else self.get_action_taken_for(tl_id, current_phase)
@@ -129,6 +129,7 @@ class TrafficLightPhaseDisplay:
         self.elapsed = max(0, current_time - (next_switch_time - duration))
         self.remaining = max(0, next_switch_time - current_time)
 
+        # ADD THIS LINE TO FORCE IMMEDIATE REDRAW
         self.redraw()
 
     def redraw(self):
