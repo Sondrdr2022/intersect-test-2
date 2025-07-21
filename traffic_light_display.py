@@ -14,6 +14,7 @@ class TrafficLightPhaseDisplay:
                 "tl_id",
                 "time left",
                 "phase duration",
+                "extended time",
                 "event type",
                 "phase index",
                 "phase state",
@@ -24,7 +25,7 @@ class TrafficLightPhaseDisplay:
             show="headings"
         )
         for col in [
-            "tl_id", "time left", "phase duration", "event type", "phase index",
+            "tl_id", "time left", "phase duration", "extended time", "event type", "phase index",
             "phase state", "action taken", "protected left", "blocked"
         ]:
             self.tree.heading(col, text=col.replace("_", " ").title())
@@ -45,6 +46,7 @@ class TrafficLightPhaseDisplay:
         self.next_switch_time = None
         self.elapsed = None
         self.remaining = None
+        self.extended_time = None
 
     def update_table(self):
         if not getattr(self, "ready", True):
@@ -92,6 +94,7 @@ class TrafficLightPhaseDisplay:
                                       else self.is_protected_left(tl_id, current_phase))
                     blocked = (curr_phase_record.get("blocked", False) if curr_phase_record
                                else self.is_blocked(tl_id, current_phase))
+                    extended_time = curr_phase_record.get("extended_time", 0) if curr_phase_record else 0  # NEW
                     if event_type is None or event_type == "":
                         event_type = "No Event"
                     if action_taken is None or action_taken == "":
@@ -104,6 +107,7 @@ class TrafficLightPhaseDisplay:
                             tl_id,
                             int(round(time_left)) if isinstance(time_left, (float, int)) else time_left,
                             round(phase_duration, 2) if isinstance(phase_duration, (float, int)) else phase_duration,
+                            round(extended_time, 2) if isinstance(extended_time, (float, int)) else extended_time,  # NEW
                             event_type,
                             current_phase,
                             phase_state,
@@ -125,13 +129,14 @@ class TrafficLightPhaseDisplay:
         if self.running:
             self.root.after(self.poll_interval, self.update_table)
 
-    def update_phase_duration(self, phase_idx, duration, current_time, next_switch_time):
+    def update_phase_duration(self, phase_idx, duration, current_time, next_switch_time, extended_time=0):
         self.phase_idx = phase_idx
         self.duration = duration
         self.current_time = current_time
         self.next_switch_time = next_switch_time
         self.elapsed = max(0, current_time - (next_switch_time - duration))
         self.remaining = max(0, next_switch_time - current_time)
+        self.extended_time = extended_time  # NEW
         self.redraw()
 
     def redraw(self):
