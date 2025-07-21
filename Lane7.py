@@ -229,17 +229,16 @@ class AdaptivePhaseController:
             "event_type": event_type,
             "lanes": lanes if lanes is not None else self.lane_ids[:],
         }
-        existing = [p for p in self.apc_state.setdefault("phases", []) if p["phase_idx"] == phase_idx]
-        if existing:
-            # PATCH: Update in-place instead of append
-            for i, p in enumerate(self.apc_state["phases"]):
-                if p["phase_idx"] == phase_idx:
-                    self.apc_state["phases"][i] = entry
-        else:
+        found = False
+        for i, p in enumerate(self.apc_state.setdefault("phases", [])):
+            if p["phase_idx"] == phase_idx:
+                self.apc_state["phases"][i] = entry
+                found = True
+                break
+        if not found:
             self.apc_state["phases"].append(entry)
         self._save_apc_state()
-        all_indices = [p["phase_idx"] for p in self.apc_state["phases"]]
-        print(f"[PKL][SAVE] All PKL phase indices now: {all_indices}")    
+        print(f"[PKL][SAVE] All PKL phase indices now: {[p['phase_idx'] for p in self.apc_state['phases']]}")
     def create_or_extend_phase(self, green_lanes, delta_t):
         print(f"[DEBUG] create_or_extend_phase called with green_lanes={green_lanes}, delta_t={delta_t}")
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -869,7 +868,6 @@ class AdaptivePhaseController:
         print(f"[PRELOAD] Preloaded {len(phases)} SUMO phases into PKL.")
 
     def update_phase_duration_record(self, phase_idx, new_duration):
-        """Update PKL and event log with the latest duration for the given phase index."""
         updated = False
         for p in self.apc_state.get("phases", []):
             if p["phase_idx"] == phase_idx:
@@ -877,7 +875,6 @@ class AdaptivePhaseController:
                 updated = True
         if updated:
             self._save_apc_state()
-        # Log an event for GUI/event log syncing
         self._log_apc_event({
             "action": "phase_duration_update",
             "phase_idx": phase_idx,
@@ -893,7 +890,6 @@ class AdaptivePhaseController:
             duration = requested_duration if requested_duration is not None else phase_record["duration"]
             traci.trafficlight.setPhase(self.tls_id, phase_record["phase_idx"])
             traci.trafficlight.setPhaseDuration(self.tls_id, duration)
-            # PATCH: Always update PKL/event log after duration set
             self.update_phase_duration_record(phase_record["phase_idx"], duration)
             if hasattr(self, "update_display"):
                 current_time = traci.simulation.getTime()
@@ -902,8 +898,6 @@ class AdaptivePhaseController:
             return True
         else:
             print(f"[APC-RL] Phase {phase_idx} not found in PKL, attempting to create or substitute.")
-
-            # (1) Try to get the phase from SUMO logic (by index) and save it to PKL
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
             phases = logic.getPhases()
             if 0 <= phase_idx < len(phases):
@@ -920,9 +914,6 @@ class AdaptivePhaseController:
                 if hasattr(self, "update_display"):
                     self.update_display(phase_idx, phases[phase_idx].duration)
                 return True
-
-            # (2) Substitute: find a phase in PKL with the same state string
-            controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
             if 0 <= phase_idx < len(phases):
                 target_state = phases[phase_idx].state
                 for p in self.apc_state.get("phases", []):
@@ -934,8 +925,6 @@ class AdaptivePhaseController:
                         if hasattr(self, "update_display"):
                             self.update_display(p["phase_idx"], p["duration"])
                         return True
-
-            # (3) As last resort, create and save new phase with max_green and a valid state (first SUMO phase or first available PKL phase)
             if len(phases) > 0:
                 fallback_idx = phase_idx if 0 <= phase_idx < len(phases) else 0
                 fallback_state = phases[fallback_idx].state
@@ -955,7 +944,6 @@ class AdaptivePhaseController:
                 if hasattr(self, "update_display"):
                     self.update_display(phase_idx, fallback_duration)
                 return True
-
             print(f"[ERROR] Could not find or create a suitable phase for index {phase_idx}.")
             return False
 
@@ -1156,90 +1144,20 @@ class AdaptivePhaseController:
             return False
         return True
 
-    def log_phase_switch(self, new_phase_idx, requested_duration=None):
-        """
-        Safely switch phases, inserting yellow phase if needed, and always enforce min_green.
-        """
-        try:
-            old_phase = traci.trafficlight.getPhase(self.tls_id)
-            old_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
-            current_sim_time = traci.simulation.getTime()
-            # Enforce min green
-            if not self.enforce_min_green():
-                print(f"[PHASE SWITCH BLOCKED] Minimum green not elapsed ({current_sim_time - self.last_phase_switch_sim_time:.2f}s < {self.min_green}s)")
-                return False
-
-            # --- PATCH: Allow duration update even if phase index is the same ---
-            if self.last_phase_idx == new_phase_idx:
-                current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
-                if requested_duration is not None and abs(current_duration - requested_duration) > 0.5:
-                    traci.trafficlight.setPhaseDuration(self.tls_id, requested_duration)
-                    print(f"[PHASE DURATION UPDATED] {self.tls_id}: Phase {new_phase_idx} duration updated {current_duration:.2f} -> {requested_duration:.2f}")
-                    self.last_phase_switch_sim_time = current_sim_time
-                    # *** Always update the display with the new value ***
-                    if hasattr(self, "update_display"):
-                        now = traci.simulation.getTime()
-                        next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
-                        self.update_display(new_phase_idx, requested_duration, now, next_switch)
-                    return True
-
-            self.insert_yellow_phase_if_needed(new_phase_idx)
-            traci.trafficlight.setPhase(self.tls_id, new_phase_idx)
-            if requested_duration is not None:
-                traci.trafficlight.setPhaseDuration(self.tls_id, requested_duration)
-            else:
-                traci.trafficlight.setPhaseDuration(self.tls_id, max(self.min_green, self.max_green))
-            new_phase = traci.trafficlight.getPhase(self.tls_id)
-            new_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
-            self.last_phase_idx = new_phase_idx
-            self.last_phase_switch_sim_time = current_sim_time
-            # PATCH: Check if this phase was RL-created
-            phase_was_rl_created = False
-            phase_pkl = self.load_phase_from_pkl(new_phase_idx)
-            if phase_pkl and phase_pkl.get("rl_created"):
-                phase_was_rl_created = True
-            event = {
-                "action": "phase_switch",
-                "old_phase": old_phase,
-                "new_phase": new_phase,
-                "old_state": old_state,
-                "new_state": new_state,
-                "reward": getattr(self, "last_R", None),
-                "weights": self.weights.tolist(),
-                "bonus": getattr(self, "last_bonus", 0),
-                "penalty": getattr(self, "last_penalty", 0),
-                "rl_created": phase_was_rl_created,
-                "phase_idx": new_phase_idx
-            }
-            self._log_apc_event(event)
-            print(f"\n[PHASE SWITCH] {self.tls_id}: {old_phase}→{new_phase}")
-            print(f"  Old: {old_state}\n  New: {new_state}")
-            print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
-            if phase_was_rl_created:
-                print(f"  [INFO] RL agent's phase is now in use (phase {new_phase_idx})")
-            return True
-        except Exception as e:
-            print(f"[ERROR] Phase switch failed: {e}")
-            return False
 
     def adjust_phase_duration(self, delta_t):
         try:
             if not self.enforce_min_green():
                 print("[PHASE DURATION ADJUST BLOCKED] Minimum green not elapsed.")
                 return traci.trafficlight.getPhaseDuration(self.tls_id)
-
             old_phase = traci.trafficlight.getPhase(self.tls_id)
             current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
             new_duration = np.clip(current_duration + delta_t, self.min_green, self.max_green)
             if new_duration < self.min_green:
                 print(f"[WARNING] Tried to set duration {new_duration}s < min_green {self.min_green}s! Forcing min_green.")
                 new_duration = self.min_green
-
             traci.trafficlight.setPhaseDuration(self.tls_id, new_duration)
-
-            # PATCH: update PKL/event log
             self.update_phase_duration_record(old_phase, new_duration)
-
             event = {
                 "action": "adjust_phase_duration",
                 "phase": old_phase,
@@ -1253,19 +1171,17 @@ class AdaptivePhaseController:
                 "penalty": getattr(self, "last_penalty", 0)
             }
             self._log_apc_event(event)
-
             print(f"\n[PHASE ADJUST] Phase {old_phase}: {current_duration:.1f}s → {new_duration:.1f}s")
             print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
-
             if hasattr(self, "update_display"):
                 current_time = traci.simulation.getTime()
                 next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
                 self.update_display(old_phase, new_duration, current_time, next_switch)
-
             return new_duration
         except traci.TraCIException as e:
             print(f"[ERROR] Duration adjustment failed: {e}")
-            return traci.trafficlight.getPhaseDuration(self.tls_id)    
+            return traci.trafficlight.getPhaseDuration(self.tls_id)
+            
     def control_step(self):
         self.phase_count += 1
         current_time = traci.simulation.getTime()
@@ -2769,7 +2685,6 @@ class UniversalSmartTrafficController:
         except Exception as e:
             print(f"Error updating adaptive parameters: {e}")
 
-
 def main():
     global controller
     parser = argparse.ArgumentParser(description="Run universal SUMO RL traffic simulation")
@@ -2788,11 +2703,12 @@ def main():
         controller = None
         app.run(port=5000, debug=True)
         return
-    controller = start_universal_simulation(args.sumo, args.gui, args.max_steps, args.episodes, args.num_retries, args.retry_delay, mode=args.mode)
+    start_universal_simulation(args.sumo, args.gui, args.max_steps, args.episodes, args.num_retries, args.retry_delay, mode=args.mode)
 
 def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episodes=1, num_retries=1, retry_delay=1, mode="train"):
     global controller
 
+    # 1. Start the simulation in a background thread and initialize controller
     def simulation_loop():
         global controller
         try:
@@ -2802,7 +2718,6 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
                 sumo_cmd = [os.path.join(os.environ['SUMO_HOME'], 'bin', sumo_binary), '-c', sumocfg_path, '--start', '--quit-on-end']
                 traci.start(sumo_cmd)
                 controller = UniversalSmartTrafficController(sumocfg_path=sumocfg_path, mode=mode)
-                controller.display = TrafficLightPhaseDisplay(controller.adaptive_phase_controller.tls_id)
                 controller.initialize()
                 controller.current_episode = episode + 1
                 step, tstart = 0, time.time()
@@ -2826,17 +2741,27 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
             except: pass
             print("Simulation resources cleaned up")
 
-    # 1. Start the simulation in a background thread
     sim_thread = threading.Thread(target=simulation_loop)
     sim_thread.start()
 
-    # 2. Wait for the controller to exist before creating the display
-    while controller is None or not hasattr(controller, "phase_events"):
+    # 2. Wait for the controller and traffic lights to be available
+    while controller is None or not hasattr(controller, "adaptive_phase_controller"):
         time.sleep(0.1)
 
-    # 3. Pass the log reference to the display
-    phase_display = TrafficLightPhaseDisplay(controller.phase_events, poll_interval=500)
-    phase_display.start()
+    # Wait for at least one traffic light ID to be present
+    while True:
+        try:
+            tls_list = traci.trafficlight.getIDList()
+            if tls_list:
+                tls_id = tls_list[0]
+                break
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+    # 3. Start the display window (only ONCE, with valid tls_id)
+    display = TrafficLightPhaseDisplay(tls_id)
+    display.start()
 
     sim_thread.join()
     return controller
