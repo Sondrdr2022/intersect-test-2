@@ -6,6 +6,8 @@ class TrafficLightPhaseDisplay:
     def __init__(self, event_log, poll_interval=1000):
         self.root = tk.Tk()
         self.root.title("Phase Time")
+        self.root.minsize(1200, 200)  # Set a minimum window size
+
         self.tree = ttk.Treeview(
             self.root,
             columns=(
@@ -26,13 +28,17 @@ class TrafficLightPhaseDisplay:
             "phase state", "action taken", "protected left", "blocked"
         ]:
             self.tree.heading(col, text=col.replace("_", " ").title())
+            self.tree.column(col, minwidth=100, width=140, anchor="center")  # Set min width and center align
+
         self.tree.pack(fill=tk.BOTH, expand=True)
         self.poll_interval = poll_interval
         self.running = False
         self.ready = True
         self.event_log = event_log
 
-        # For direct phase update support:
+        self.no_data_label = tk.Label(self.root, text="Waiting for traffic light data...", font=("Arial", 16))
+        self.no_data_label.pack(pady=20)
+
         self.phase_idx = None
         self.duration = None
         self.current_time = None
@@ -47,14 +53,19 @@ class TrafficLightPhaseDisplay:
         try:
             for row in self.tree.get_children():
                 self.tree.delete(row)
-            # Defensive: Only draw if there is at least one traffic light
             tls_list = []
             try:
                 tls_list = traci.trafficlight.getIDList()
             except Exception:
                 pass
             if not tls_list:
-                return  # No traffic lights yet in simulation
+                self.no_data_label.config(text="No traffic lights found in the simulation. Waiting for data...")
+                self.no_data_label.lift()  # Bring label to front
+                self.root.after(self.poll_interval, self.update_table)
+                return
+            else:
+                self.no_data_label.pack_forget()  # Remove the label if data is present
+            inserted = False
             for tl_id in tls_list:
                 try:
                     logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(tl_id)[0]
@@ -62,20 +73,15 @@ class TrafficLightPhaseDisplay:
                     phases = logic.getPhases()
                     if not phases:
                         continue
-                    # "Time left" and "phase duration"
                     now = traci.simulation.getTime()
                     next_switch = traci.trafficlight.getNextSwitch(tl_id)
                     time_left = max(0, next_switch - now)
                     phase_duration = traci.trafficlight.getPhaseDuration(tl_id)
-
-                    # Find latest event for current phase for this tl_id
                     curr_phase_record = None
                     for p in reversed(self.event_log):
                         if p.get("tls_id") == tl_id and p.get("phase_idx") == current_phase:
                             curr_phase_record = p
                             break
-
-                    # Fill in event/log data as before
                     event_type = (curr_phase_record.get("action") if curr_phase_record and "action" in curr_phase_record
                                   else self.get_event_type_for(tl_id, current_phase))
                     action_taken = (curr_phase_record.get("action_taken", event_type) if curr_phase_record
@@ -86,14 +92,12 @@ class TrafficLightPhaseDisplay:
                                       else self.is_protected_left(tl_id, current_phase))
                     blocked = (curr_phase_record.get("blocked", False) if curr_phase_record
                                else self.is_blocked(tl_id, current_phase))
-
                     if event_type is None or event_type == "":
                         event_type = "No Event"
                     if action_taken is None or action_taken == "":
                         action_taken = event_type
                     if phase_state is None or phase_state == "":
                         phase_state = phases[current_phase].state if current_phase < len(phases) else "-"
-
                     self.tree.insert(
                         "", "end",
                         values=(
@@ -108,8 +112,14 @@ class TrafficLightPhaseDisplay:
                             "Yes" if blocked else "No"
                         )
                     )
+                    inserted = True
                 except Exception as e:
                     print(f"[TrafficLightPhaseDisplay ERROR]: Could not update for {tl_id}: {e}")
+            if not inserted:
+                self.no_data_label.config(text="Waiting for traffic light data...")
+                self.no_data_label.pack(pady=20)
+            else:
+                self.no_data_label.pack_forget()
         except Exception as e:
             print("[TrafficLightPhaseDisplay ERROR]:", e)
         if self.running:

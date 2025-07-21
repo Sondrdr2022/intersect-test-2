@@ -517,7 +517,8 @@ class AdaptivePhaseController:
     def check_special_events(self):
         """Detect special conditions with improved prioritization"""
         now = traci.simulation.getTime()
-        
+        next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
+        time_left = max(0, next_switch - now)
         # 1. Emergency vehicle detection (highest priority)
         for lane_id in self.lane_ids:
             for vid in traci.lane.getLastStepVehicleIDs(lane_id):
@@ -559,7 +560,6 @@ class AdaptivePhaseController:
             return 'severe_congestion', lane_id
 
         return None, None
-    
     def reorganize_or_create_phase(self, lane_id, event_type):
 
         try:
@@ -2760,7 +2760,8 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
         time.sleep(0.1)
 
     # 3. Start the display window (only ONCE, with valid tls_id)
-    display = TrafficLightPhaseDisplay(tls_id)
+# In your display launcher:
+    display = TrafficLightPhaseDisplay(controller.phase_events, poll_interval=200)
     display.start()
 
     sim_thread.join()
