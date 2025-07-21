@@ -50,14 +50,13 @@ def override_all_tls_with_pkl(controller):
             continue
         traci_phases = [Phase(int(d), state) for state, d in phase_seq]
         logic = Logic(
-            id=tl_id,
-            type=traci.constants.TL_LOGIC_PROG,
-            currentPhaseIndex=0,
-            phases=traci_phases
+            tl_id,         # programID
+            0,      # type
+            0,             # currentPhaseIndex
+            traci_phases   # phases
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(tl_id, logic)
         print(f"[INIT PATCH] Set PKL logic for {tl_id} ({len(traci_phases)} phases)")
-
 # --- PATCH: Remove all duration overrides in phase switching ---
 def safe_set_phase_only(tl_id, phase_idx):
     traci.trafficlight.setPhase(tl_id, phase_idx)
@@ -232,7 +231,7 @@ class AdaptivePhaseController:
         # PATCH: Use the explicit construction of new_logic and setting the definition as requested
         new_logic = traci.trafficlight.Logic(
             id=self.tls_id,
-            type=traci.constants.TL_LOGIC_PROG,
+            type="static", 
             currentPhaseIndex=len(phases) - 1,
             phases=[traci.trafficlight.Phase(duration=ph.duration, state=ph.state) for ph in phases]
         )
