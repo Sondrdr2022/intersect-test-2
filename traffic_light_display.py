@@ -21,15 +21,11 @@ class TrafficLightPhaseDisplay:
             ),
             show="headings"
         )
-        self.tree.heading("tl_id", text="tl_id")
-        self.tree.heading("current time", text="current time")
-        self.tree.heading("next", text="next")
-        self.tree.heading("event type", text="Event Type")
-        self.tree.heading("phase index", text="Phase Index")
-        self.tree.heading("phase state", text="Phase State")
-        self.tree.heading("action taken", text="Action Taken")
-        self.tree.heading("protected left", text="Protected Left Turn")
-        self.tree.heading("blocked", text="Is Blocked")
+        for col in [
+            "tl_id", "current time", "next", "event type", "phase index",
+            "phase state", "action taken", "protected left", "blocked"
+        ]:
+            self.tree.heading(col, text=col.replace("_", " ").title())
         self.tree.pack(fill=tk.BOTH, expand=True)
         self.poll_interval = poll_interval
         self.running = False
@@ -69,34 +65,58 @@ class TrafficLightPhaseDisplay:
                         next_phase_record = p
                         break
 
-                # Prefer live values if present
-                if self.phase_idx == current_phase and self.duration is not None and \
-                self.current_time is not None and self.next_switch_time is not None:
-                    curr_time = self.elapsed
-                    next_time = self.remaining
-                else:
-                    # PATCH: Always use live SUMO phase duration for current phase
-                    curr_time = traci.trafficlight.getPhaseDuration(tl_id)
-                    # Next phase duration: still try event log, else live, else phase object
-                    if next_phase_record and "duration" in next_phase_record:
-                        next_time = next_phase_record["duration"]
-                    else:
-                        if next_phase < len(phases):
-                            next_time = phases[next_phase].duration
-                        else:
-                            next_time = "-"
+                # --- PHASE TIME CORRECTION LOGIC ---
+                # Always get the actual live phase duration and time left
+                # Even if event_log has a different value!
+                try:
+                    sim_time = traci.simulation.getTime()
+                    next_switch_time = traci.trafficlight.getNextSwitch(tl_id)
+                    phase_duration_live = traci.trafficlight.getPhaseDuration(tl_id)
+                    time_remaining_live = max(0, next_switch_time - sim_time)
+                    time_elapsed_live = max(0, phase_duration_live - time_remaining_live)
+                except Exception:
+                    # Defensive fallback
+                    phase_duration_live = "-"
+                    time_remaining_live = "-"
+                    time_elapsed_live = "-"
 
-                event_type = curr_phase_record["action"] if curr_phase_record and "action" in curr_phase_record else self.get_event_type_for(tl_id, current_phase)
-                action_taken = curr_phase_record.get("action_taken", event_type) if curr_phase_record else self.get_action_taken_for(tl_id, current_phase)
-                phase_state = curr_phase_record["state"] if curr_phase_record and "state" in curr_phase_record else (phases[current_phase].state if current_phase < len(phases) else "-")
-                protected_left = curr_phase_record.get("protected_left", False) if curr_phase_record else self.is_protected_left(tl_id, current_phase)
-                blocked = curr_phase_record.get("blocked", False) if curr_phase_record else self.is_blocked(tl_id, current_phase)
+                # For current phase, always prefer live SUMO value
+                curr_time = time_elapsed_live if isinstance(time_elapsed_live, (int, float)) else phase_duration_live
+                # For next phase, prefer event log, otherwise SUMO phase definition
+                if next_phase_record and "duration" in next_phase_record:
+                    next_time = next_phase_record["duration"]
+                else:
+                    try:
+                        next_time = phases[next_phase].duration if next_phase < len(phases) else "-"
+                    except Exception:
+                        next_time = "-"
+
+                # Try to fill in missing/correct data
+                event_type = (curr_phase_record.get("action") if curr_phase_record and "action" in curr_phase_record
+                              else self.get_event_type_for(tl_id, current_phase))
+                action_taken = (curr_phase_record.get("action_taken", event_type) if curr_phase_record
+                                else self.get_action_taken_for(tl_id, current_phase))
+                phase_state = (curr_phase_record.get("state") if curr_phase_record and "state" in curr_phase_record
+                               else (phases[current_phase].state if current_phase < len(phases) else "-"))
+                protected_left = (curr_phase_record.get("protected_left", False) if curr_phase_record
+                                  else self.is_protected_left(tl_id, current_phase))
+                blocked = (curr_phase_record.get("blocked", False) if curr_phase_record
+                           else self.is_blocked(tl_id, current_phase))
+
+                # Fallbacks for display
+                if event_type is None or event_type == "":
+                    event_type = "No Event"
+                if action_taken is None or action_taken == "":
+                    action_taken = event_type
+                if phase_state is None or phase_state == "":
+                    phase_state = phases[current_phase].state if current_phase < len(phases) else "-"
+
                 self.tree.insert(
                     "", "end",
                     values=(
                         tl_id,
-                        curr_time,
-                        next_time,
+                        round(curr_time, 2) if isinstance(curr_time, (float, int)) else curr_time,
+                        round(next_time, 2) if isinstance(next_time, (float, int)) else next_time,
                         event_type,
                         current_phase,
                         phase_state,
@@ -129,7 +149,6 @@ class TrafficLightPhaseDisplay:
         self.elapsed = max(0, current_time - (next_switch_time - duration))
         self.remaining = max(0, next_switch_time - current_time)
 
-        # ADD THIS LINE TO FORCE IMMEDIATE REDRAW
         self.redraw()
 
     def redraw(self):
