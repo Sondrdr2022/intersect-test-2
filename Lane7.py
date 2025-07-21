@@ -5,11 +5,7 @@ from pyinstrument import Profiler
 warnings.filterwarnings('ignore')
 from flask import Flask, request, jsonify
 from traffic_light_display import TrafficLightPhaseDisplay
-try:
-    from traci._trafficlight import Logic, Phase
-    import traci.constants
-except ImportError:
-    Logic = Phase = None
+from traci._trafficlight import Logic, Phase
 
 app = Flask(__name__)
 controller = None  # global reference for the API
@@ -46,29 +42,25 @@ def run_episode():
 os.environ.setdefault('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
 tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
 if tools not in sys.path: sys.path.append(tools)
-def override_sumo_program_from_pkl(apc, current_phase_idx=None):
-    """
-    Replace the SUMO phase program for this controller with the PKL-defined sequence.
-    """
-    phase_seq = apc.get_full_phase_sequence()
-    if not phase_seq:
-        print(f"[PATCH] No PKL phase sequence for {apc.tls_id}, skipping override.")
-        return
+def override_all_tls_with_pkl(controller):
+    for tl_id, apc in getattr(controller, 'adaptive_phase_controllers', {}).items():
+        phase_seq = apc.get_full_phase_sequence()
+        if not phase_seq:
+            print(f"[INIT PATCH] No PKL phase sequence for {tl_id}, skipping override.")
+            continue
+        traci_phases = [Phase(int(d), state) for state, d in phase_seq]
+        logic = Logic(
+            id=tl_id,
+            type=traci.constants.TL_LOGIC_PROG,
+            currentPhaseIndex=0,
+            phases=traci_phases
+        )
+        traci.trafficlight.setCompleteRedYellowGreenDefinition(tl_id, logic)
+        print(f"[INIT PATCH] Set PKL logic for {tl_id} ({len(traci_phases)} phases)")
 
-    # Default to current SUMO phase if not given
-    if current_phase_idx is None:
-        current_phase_idx = traci.trafficlight.getPhase(apc.tls_id)
-    phases = [Phase(duration, state) for (state, duration) in phase_seq]
-    new_logic = Logic(
-        programID="PKL-OVERRIDE",
-        type=traci.constants.TL_LOGIC_PROGRAM,
-        currentPhaseIndex=current_phase_idx if 0 <= current_phase_idx < len(phases) else 0,
-        phases=phases,
-    )
-    traci.trafficlight.setCompleteRedYellowGreenDefinition(apc.tls_id, new_logic)
-    print(f"[PATCH] Overrode SUMO program for {apc.tls_id} with {len(phases)} PKL phases.")
-
-
+# --- PATCH: Remove all duration overrides in phase switching ---
+def safe_set_phase_only(tl_id, phase_idx):
+    traci.trafficlight.setPhase(tl_id, phase_idx)
 class AdaptivePhaseController:
     def __init__(self, lane_ids, tls_id, alpha=1.0, min_green=30, max_green=80,
                  r_base=0.5, r_adjust=0.1, severe_congestion_threshold=0.8, 
@@ -788,7 +780,7 @@ class AdaptivePhaseController:
         phase_record = self.load_phase_from_pkl(phase_idx)
         if phase_record:
             # PATCH: Override SUMO logic with PKL full sequence and set phase
-            override_sumo_program_from_pkl(self, current_phase_idx=phase_idx)
+            override_all_tls_with_pkl(self, current_phase_idx=phase_idx)
             print(f"[APC-RL] Phase {phase_idx} set from PKL/override: duration={phase_record['duration']}")
             return True
         else:
@@ -2555,7 +2547,6 @@ class UniversalSmartTrafficController:
         except Exception as e:
             print(f"Error updating adaptive parameters: {e}")
 
-
 def main():
     global controller
     parser = argparse.ArgumentParser(description="Run universal SUMO RL traffic simulation")
@@ -2590,6 +2581,10 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
                 controller = UniversalSmartTrafficController(sumocfg_path=sumocfg_path, mode=mode)
                 controller.initialize()
                 controller.current_episode = episode + 1
+
+                # --- PATCH: Inject PKL program logic ONCE, right after setup ---
+                override_all_tls_with_pkl(controller)
+
                 step, tstart = 0, time.time()
                 while traci.simulation.getMinExpectedNumber() > 0:
                     if max_steps and step >= max_steps:
