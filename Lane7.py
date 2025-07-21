@@ -42,24 +42,49 @@ def run_episode():
 os.environ.setdefault('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
 tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
 if tools not in sys.path: sys.path.append(tools)
-def override_all_tls_with_pkl(controller):
+def override_sumo_program_from_pkl(apc, current_phase_idx=None):
+    """
+    Replace the SUMO phase program for this controller with the PKL-defined sequence.
+    """
+    phase_seq = apc.get_full_phase_sequence()
+    if not phase_seq:
+        print(f"[PATCH] No PKL phase sequence for {apc.tls_id}, skipping override.")
+        return
+
+    # Default to current SUMO phase if not given
+    if current_phase_idx is None:
+        current_phase_idx = traci.trafficlight.getPhase(apc.tls_id)
+    phases = [Phase(duration, state) for (state, duration) in phase_seq]
+    new_logic = Logic(
+        programID="PKL-OVERRIDE",
+        type=traci.constants.TL_LOGIC_PROGRAM,
+        currentPhaseIndex=current_phase_idx if 0 <= current_phase_idx < len(phases) else 0,
+        phases=phases,
+    )
+    traci.trafficlight.setCompleteRedYellowGreenDefinition(apc.tls_id, new_logic)
+    print(f"[PATCH] Overrode SUMO program for {apc.tls_id} with {len(phases)} PKL phases.")
+def override_all_tls_with_pkl(controller, current_phase_idx=None):
+    """
+    For each traffic light controller, override SUMO logic with PKL-defined phase sequence.
+    """
+    print("[PATCH] Overriding all TLS logic from PKL files...")
     for tl_id, apc in getattr(controller, 'adaptive_phase_controllers', {}).items():
         phase_seq = apc.get_full_phase_sequence()
         if not phase_seq:
-            print(f"[INIT PATCH] No PKL phase sequence for {tl_id}, skipping override.")
+            print(f"[PATCH] No PKL phase sequence for {tl_id}, skipping override.")
             continue
-        traci_phases = [Phase(int(d), state) for state, d in phase_seq]
+        traci_phases = [Phase(duration, state) for (state, duration) in phase_seq]
+        phase_indices = [i for i, _ in enumerate(traci_phases)]
+        print(f"[PATCH] For {tl_id}: PKL has {len(traci_phases)} phases, indices: {phase_indices}")
         logic = Logic(
-            tl_id,         # programID
-            0,      # type
-            0,             # currentPhaseIndex
-            traci_phases   # phases
+            tl_id,                   # programID
+            0,                       # type (static)
+            current_phase_idx if current_phase_idx is not None else 0,
+            traci_phases             # phases
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(tl_id, logic)
-        print(f"[INIT PATCH] Set PKL logic for {tl_id} ({len(traci_phases)} phases)")
-# --- PATCH: Remove all duration overrides in phase switching ---
-def safe_set_phase_only(tl_id, phase_idx):
-    traci.trafficlight.setPhase(tl_id, phase_idx)
+        print(f"[PATCH] Set PKL logic for {tl_id} ({len(traci_phases)} phases)")
+
 class AdaptivePhaseController:
     def __init__(self, lane_ids, tls_id, alpha=1.0, min_green=30, max_green=80,
                  r_base=0.5, r_adjust=0.1, severe_congestion_threshold=0.8, 
@@ -198,85 +223,57 @@ class AdaptivePhaseController:
             "event_type": event_type,
             "lanes": lanes if lanes is not None else self.lane_ids[:],
         }
+        print(f"[PKL][SAVE] Saving phase: idx={phase_idx}, duration={duration}, state={state_str}")
         self.apc_state.setdefault("phases", []).append(entry)
         self._save_apc_state()
-        # Also log to events for easier lookup by phase
-        ev = entry.copy()
-        ev["action"] = event_type or "phase_persist"
-        self.apc_state.setdefault("events", []).append(ev)
-        self._save_apc_state()
+        # Print PKL phase indices after save
+        all_indices = [p["phase_idx"] for p in self.apc_state["phases"]]
+        print(f"[PKL][SAVE] All PKL phase indices now: {all_indices}")
     def create_or_extend_phase(self, green_lanes, delta_t):
         print(f"[DEBUG] create_or_extend_phase called with green_lanes={green_lanes}, delta_t={delta_t}")
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         new_state = self.create_phase_state(green_lanes=green_lanes)
         duration = np.clip(traci.trafficlight.getPhaseDuration(self.tls_id) + delta_t, self.min_green, self.max_green)
-        # --- Avoid duplicate phases: check if state exists ---
+        print(f"[DEBUG] About to check for existing phase: state={new_state}, duration={duration}")
         for idx, phase in enumerate(logic.getPhases()):
+            print(f"[DEBUG]   Checking phase {idx}: state={phase.state}, duration={phase.duration}")
             if phase.state == new_state:
                 print(f"[DEBUG] RL/Controller requested phase already exists: {idx}")
-                # PATCH: Log that RL agent requested an existing phase (not new)
-                self._log_apc_event({
-                    "action": "rl_phase_request_existing",
-                    "requested_green_lanes": green_lanes,
-                    "matched_phase_idx": idx,
-                    "duration": duration,
-                    "state": new_state,
-                    "delta_t": delta_t,
-                    "rl_created": False,
-                })
-                # PATCH: Update display for existing phase as well
+                # ALWAYS save/refresh PKL for existing phase!
+                self.save_phase_to_pkl(idx, duration, new_state, delta_t, delta_t, penalty=0)
                 if hasattr(self, "update_display"):
                     self.update_display(idx, duration)
                 return idx
+        print(f"[DEBUG] No existing phase matched. Creating new phase.")
         new_phase = traci.trafficlight.Phase(duration, new_state)
         phases = list(logic.getPhases()) + [new_phase]
-
-        # PATCH: Use correct Logic constructor for all SUMO/TraCI versions
         new_logic = traci.trafficlight.Logic(
-            logic.programID,   # Use programID from the original logic
-            logic.type,        # Use type as int (not "static")
-            len(phases) - 1,   # currentPhaseIndex
+            logic.programID,
+            logic.type,
+            len(phases) - 1,
             [traci.trafficlight.Phase(duration=ph.duration, state=ph.state) for ph in phases]
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
         print(f"[DEBUG] setCompleteRedYellowGreenDefinition called for {self.tls_id} with {len(phases)} phases")
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
         print(f"[DEBUG] setPhase called for {self.tls_id} to phase {len(phases) - 1}")
-        self.update_display(len(phases) - 1, duration)
-
-        # PATCH: Update the display UI
+        # ALWAYS save PKL for new phase
+        self.save_phase_to_pkl(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
         if hasattr(self, "update_display"):
             self.update_display(len(phases) - 1, duration)
-
-        # PATCH: Sanity check
         actual = traci.trafficlight.getPhaseDuration(self.tls_id)
         print(f"[SANITY] SUMO reported duration = {actual}, expected = {duration}")
-
-        reward = getattr(self, "last_R", None)
-        bonus = getattr(self, "last_bonus", 0)
-        weights = self.weights.tolist()
-        event_type = "rl_phase_created"
-        self.save_phase_to_pkl(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0, reward=reward, bonus=bonus, weights=weights, event_type=event_type, lanes=green_lanes)
-        print(f"[DEBUG] save_phase_to_pkl called for phase index {len(phases) - 1}")
-        # PATCH: Explicitly log RL-created phase
-        event = {
-            "action": "rl_phase_created",
-            "tls_id": self.tls_id,
-            "green_lanes": green_lanes,
-            "duration": duration,
-            "phase_idx": len(phases) - 1,
-            "state": new_state,
-            "delta_t": delta_t,
-            "rl_created": True,
-        }
-        self._log_apc_event(event)
-        print(f"[DEBUG] RL/Controller created new phase: {event}")
-        return len(phases) - 1    
+        return len(phases) - 1
     def load_phase_from_pkl(self, phase_idx=None):
-            for p in self.apc_state.get("phases", []):
-                if p["phase_idx"] == phase_idx:
-                    return p
-            return None
+        available = [p["phase_idx"] for p in self.apc_state.get("phases", [])]
+        print(f"[PKL][LOAD] Looking for phase_idx={phase_idx}. Available: {available}")
+        for p in self.apc_state.get("phases", []):
+            if p["phase_idx"] == phase_idx:
+                print(f"[PKL][FOUND] phase_idx={phase_idx}, duration={p['duration']}, state={p['state']}")
+                return p
+        print(f"[PKL][MISSING] phase_idx={phase_idx} not found!")
+        return None
+    
     def calculate_delta_t_and_penalty(self, R):
         raw_delta_t = self.alpha * (R - self.R_target)
         penalty = max(0, abs(raw_delta_t) - 10)
@@ -284,14 +281,7 @@ class AdaptivePhaseController:
         delta_t = np.clip(delta_t, -10, 10)
         print(f"[DEBUG] [DELTA_T_PENALTY] R={R:.2f}, R_target={self.R_target:.2f}, raw_delta_t={raw_delta_t:.2f}, delta_t={delta_t:.2f}, penalty={penalty:.2f}")
         return raw_delta_t, delta_t, penalty
-    
-    def update_display(self, phase_idx, duration):
-        """Notify TrafficLightPhaseDisplay to refresh with new phase info."""
-        try:
-            if hasattr(self, "display") and self.display is not None:
-                self.display.force_update(self.tls_id, phase_idx, duration)
-        except Exception as e:
-            print(f"[APC] Display update failed: {e}")
+ 
     def _log_apc_event(self, event):
         import traci
         event["timestamp"] = datetime.datetime.now().isoformat()
@@ -792,22 +782,21 @@ class AdaptivePhaseController:
         return conflicting_straight
     
     def set_phase_from_pkl(self, phase_idx):
-        """
-        Force SUMO to use RL agent's phase and duration from PKL, replacing any built-in SUMO logic.
-        This should be the ONLY way phases/durations are set in RL mode.
-        """
+        print(f"[PKL][SET] set_phase_from_pkl({phase_idx}) called")
         phase_record = self.load_phase_from_pkl(phase_idx)
         if phase_record:
-            # PATCH: Override SUMO logic with PKL full sequence and set phase
+            print(f"[PKL][SET] Found. Overriding SUMO logic with PKL sequence and setting phase.")
             override_all_tls_with_pkl(self, current_phase_idx=phase_idx)
-            print(f"[APC-RL] Phase {phase_idx} set from PKL/override: duration={phase_record['duration']}")
+            if hasattr(self, "update_display"):
+                self.update_display(phase_idx, phase_record["duration"])
             return True
         else:
             print(f"[APC-RL] Phase {phase_idx} not found in PKL, fallback to max_green")
             traci.trafficlight.setPhase(self.tls_id, phase_idx)
             traci.trafficlight.setPhaseDuration(self.tls_id, self.max_green)
+            if hasattr(self, "update_display"):
+                self.update_display(phase_idx, self.max_green)
             return False
-
     def ensure_true_protected_left_phase(self, left_lane):
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -1071,7 +1060,10 @@ class AdaptivePhaseController:
                 new_duration = self.min_green
 
             traci.trafficlight.setPhaseDuration(self.tls_id, new_duration)
-            self.update_display(old_phase, new_duration)
+
+            if hasattr(self, "update_display"):
+                self.update_display(old_phase, new_duration)
+
 
             event = {
                 "action": "adjust_phase_duration",
@@ -1134,6 +1126,7 @@ class EnhancedQLearningAgent:
         self.q_table_file, self._loaded_training_count = q_table_file, 0
         self.reward_history = []
         self.mode = mode
+        
         self.adaptive_params = adaptive_params or {
             'min_green': 30, 'max_green': 80, 'starvation_threshold': 40, 'reward_scale': 40,
             'queue_weight': 0.6, 'wait_weight': 0.3, 'flow_weight': 0.5, 'speed_weight': 0.2, 
@@ -1173,20 +1166,16 @@ class EnhancedQLearningAgent:
 
 
     def switch_or_extend_phase(self, state, green_lanes, force_protected_left=False):
-        """
-        RL agent: set phase/duration for SUMO via PKL, fully overriding SUMO built-in logic.
-        """
-        print(f"[DEBUG] RL Agent switch_or_extend_phase called with state={state}, green_lanes={green_lanes}, force_protected_left={force_protected_left}")
+        print(f"[DEBUG][RL Agent] switch_or_extend_phase called with state={state}, green_lanes={green_lanes}, force_protected_left={force_protected_left}")
         R = self.adaptive_controller.calculate_reward()
         raw_delta_t, delta_t, penalty = self.adaptive_controller.calculate_delta_t_and_penalty(R)
-
+        print(f"[DEBUG][RL Agent] R={R}, delta_t={delta_t}, penalty={penalty}")
         if force_protected_left and len(green_lanes) == 1:
             phase_idx = self.adaptive_controller.create_or_extend_protected_left_phase(green_lanes[0], delta_t)
             rl_phase_type = "protected_left"
         else:
             phase_idx = self.adaptive_controller.create_or_extend_phase(green_lanes, delta_t)
             rl_phase_type = "general"
-
         self.adaptive_controller._log_apc_event({
             "action": "rl_phase_request",
             "rl_phase_type": rl_phase_type,
@@ -1196,8 +1185,7 @@ class EnhancedQLearningAgent:
             "penalty": penalty,
             "state": str(state),
         })
-
-        # --- MAIN PATCH: This is the only place SUMO logic is overridden ---
+        print(f"[DEBUG][RL Agent] Will now set phase from PKL: phase_idx={phase_idx}")
         self.adaptive_controller.set_phase_from_pkl(phase_idx)
         phase_record = self.adaptive_controller.load_phase_from_pkl(phase_idx)
         if phase_record:
@@ -1209,7 +1197,9 @@ class EnhancedQLearningAgent:
             print(f"[APC-RL] No PKL record for RL agent phase {phase_idx}, fallback to default.")
             traci.trafficlight.setPhase(self.adaptive_controller.tls_id, phase_idx)
             traci.trafficlight.setPhaseDuration(self.adaptive_controller.tls_id, self.adaptive_controller.max_green)
+            self.adaptive_controller.update_display(phase_idx, self.adaptive_controller.max_green)
         return phase_idx
+    
     def switch_to_best_phase(self, state, lane_data, left_turn_lanes=None):
         """
         New method: RL agent picks best phase (possibly protected left) based on state and lane_data.
@@ -1244,7 +1234,16 @@ class EnhancedQLearningAgent:
         all_lanes = list(lane_data.keys())
         return self.switch_or_extend_phase(state, all_lanes)
     
-
+    def update_display(self, phase_idx, new_duration):
+        now = traci.simulation.getTime()
+        next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
+        # send (*absolute*) wall‑clock times into the display widget
+        self.display.update_phase_duration(
+            phase_idx,
+            duration=new_duration,
+            current_time=now,
+            next_switch_time=next_switch
+        )
     def create_or_extend_protected_left_phase(self, left_lane, delta_t):
         """
         Create or extend a protected left turn phase for the given lane.
@@ -1665,6 +1664,14 @@ class UniversalSmartTrafficController:
             else:
                 traci.trafficlight.setPhase(apc.tls_id, phase_idx)
                 traci.trafficlight.setPhaseDuration(apc.tls_id, apc.max_green)
+            
+            if phase_record:
+                traci.trafficlight.setPhase(self.adaptive_controller.tls_id, phase_record["phase_idx"])
+                traci.trafficlight.setPhaseDuration(self.adaptive_controller.tls_id, phase_record["duration"])
+                # Add display update here
+                if hasattr(self.adaptive_controller, 'update_display'):
+                    self.adaptive_controller.update_display(phase_record["phase_idx"], phase_record["duration"])
+
             self.last_phase_change[tl_id] = current_time
             self.phase_utilization[(tl_id, phase_idx)] = self.phase_utilization.get((tl_id, phase_idx), 0) + 1
             print(f"[PROTECTED LEFT] Served at {tl_id} for lane {target} (phase {phase_idx})")
@@ -2568,6 +2575,7 @@ class UniversalSmartTrafficController:
         except Exception as e:
             print(f"Error updating adaptive parameters: {e}")
 
+
 def main():
     global controller
     parser = argparse.ArgumentParser(description="Run universal SUMO RL traffic simulation")
@@ -2600,12 +2608,9 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
                 sumo_cmd = [os.path.join(os.environ['SUMO_HOME'], 'bin', sumo_binary), '-c', sumocfg_path, '--start', '--quit-on-end']
                 traci.start(sumo_cmd)
                 controller = UniversalSmartTrafficController(sumocfg_path=sumocfg_path, mode=mode)
+                controller.display = TrafficLightPhaseDisplay(controller.adaptive_phase_controller.tls_id)
                 controller.initialize()
                 controller.current_episode = episode + 1
-
-                # --- PATCH: Inject PKL program logic ONCE, right after setup ---
-                override_all_tls_with_pkl(controller)
-
                 step, tstart = 0, time.time()
                 while traci.simulation.getMinExpectedNumber() > 0:
                     if max_steps and step >= max_steps:
@@ -2637,12 +2642,6 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
 
     # 3. Pass the log reference to the display
     phase_display = TrafficLightPhaseDisplay(controller.phase_events, poll_interval=500)
-
-    # PATCH: Wire the display into all APCs (and the main one)
-    controller.adaptive_phase_controller.display = phase_display
-    for apc in controller.adaptive_phase_controllers.values():
-        apc.display = phase_display
-
     phase_display.start()
 
     sim_thread.join()
