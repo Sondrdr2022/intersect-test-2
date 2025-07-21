@@ -176,15 +176,20 @@ class AdaptivePhaseController:
         return left, right    
     def _load_apc_state(self):
         if not self.apc_data_file or not os.path.exists(self.apc_data_file):
+            self.apc_state = {"events": [], "phases": []}
             return
         try:
             with open(self.apc_data_file, "rb") as f:
-                self.apc_state = pickle.load(f)
-            # Ensure both keys
+                state = pickle.load(f)
+            if not isinstance(state, dict):
+                raise ValueError("APC PKL file is not a dictionary -- resetting.")
+            self.apc_state = state
             if "events" not in self.apc_state: self.apc_state["events"] = []
             if "phases" not in self.apc_state: self.apc_state["phases"] = []
         except Exception as e:
-            print(f"[APC] State load failed: {e}")
+            print(f"[APC] State load failed: {e}. PKL file may be corrupted! Resetting.")
+            self.apc_state = {"events": [], "phases": []}   
+            
     def _save_apc_state(self):
         if not self.apc_data_file:
             return
@@ -208,6 +213,7 @@ class AdaptivePhaseController:
         # Build the full sequence
         return [(rec["state"], rec["duration"]) for rec in phase_records]
     def save_phase_to_pkl(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty, reward=None, bonus=None, weights=None, event_type=None, lanes=None):
+        # PATCH: Overwrite existing record for phase_idx instead of always appending.
         entry = {
             "phase_idx": phase_idx,
             "duration": duration,
@@ -223,23 +229,81 @@ class AdaptivePhaseController:
             "event_type": event_type,
             "lanes": lanes if lanes is not None else self.lane_ids[:],
         }
-        print(f"[PKL][SAVE] Saving phase: idx={phase_idx}, duration={duration}, state={state_str}")
-        self.apc_state.setdefault("phases", []).append(entry)
+        existing = [p for p in self.apc_state.setdefault("phases", []) if p["phase_idx"] == phase_idx]
+        if existing:
+            # PATCH: Update in-place instead of append
+            for i, p in enumerate(self.apc_state["phases"]):
+                if p["phase_idx"] == phase_idx:
+                    self.apc_state["phases"][i] = entry
+        else:
+            self.apc_state["phases"].append(entry)
         self._save_apc_state()
-        # Print PKL phase indices after save
         all_indices = [p["phase_idx"] for p in self.apc_state["phases"]]
-        print(f"[PKL][SAVE] All PKL phase indices now: {all_indices}")
+        print(f"[PKL][SAVE] All PKL phase indices now: {all_indices}")    
     def create_or_extend_phase(self, green_lanes, delta_t):
         print(f"[DEBUG] create_or_extend_phase called with green_lanes={green_lanes}, delta_t={delta_t}")
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
-        new_state = self.create_phase_state(green_lanes=green_lanes)
-        duration = np.clip(traci.trafficlight.getPhaseDuration(self.tls_id) + delta_t, self.min_green, self.max_green)
+        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+
+        # PATCH #1: Defensive: Only process lanes that actually exist in controlled_lanes
+        valid_green_lanes = [lane for lane in green_lanes if lane in controlled_lanes]
+        if not valid_green_lanes:
+            print(f"[BUG] No valid green lanes found in {green_lanes}. controlled_lanes={controlled_lanes}")
+            return None
+
+        # PATCH #2: Defensive: traci.trafficlight.getPhaseDuration may fail if phase index is out of range
+        try:
+            current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
+        except Exception as e:
+            print(f"[BUG] getPhaseDuration failed, using min_green. Error: {e}")
+            current_duration = self.min_green
+
+        # --- PATCH: If any green_lane is a protected left, create a protected left phase! ---
+        for lane in valid_green_lanes:
+            try:
+                links = traci.lane.getLinks(lane)
+            except Exception as e:
+                print(f"[BUG] Could not get links for lane {lane}: {e}")
+                continue
+            is_left = any(len(link) > 6 and link[6] == 'l' for link in links)
+            if is_left:
+                left_idx = controlled_lanes.index(lane)
+                protected_state = ''.join(['G' if i == left_idx else 'r' for i in range(len(controlled_lanes))])
+                duration = np.clip(current_duration + delta_t, self.min_green, self.max_green)
+                # Check if phase already exists
+                for idx, phase in enumerate(logic.getPhases()):
+                    if phase.state == protected_state:
+                        print(f"[DEBUG] Protected left requested phase already exists: {idx}")
+                        self.save_phase_to_pkl(idx, duration, protected_state, delta_t, delta_t, penalty=0)
+                        if hasattr(self, "update_display"):
+                            self.update_display(idx, duration)
+                        return idx
+                # Otherwise, create it
+                new_phase = traci.trafficlight.Phase(duration, protected_state)
+                phases = list(logic.getPhases()) + [new_phase]
+                new_logic = traci.trafficlight.Logic(
+                    logic.programID,
+                    logic.type,
+                    len(phases) - 1,
+                    [traci.trafficlight.Phase(duration=ph.duration, state=ph.state) for ph in phases]
+                )
+                traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
+                traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
+                self.save_phase_to_pkl(len(phases) - 1, duration, protected_state, delta_t, delta_t, penalty=0)
+                if hasattr(self, "update_display"):
+                    self.update_display(len(phases) - 1, duration)
+                print(f"[PATCH][PROT LEFT] Created protected left phase for {lane} (idx {len(phases) - 1})")
+                return len(phases) - 1
+
+        # --- Otherwise, original logic (not a protected left turn) ---
+        new_state = self.create_phase_state(green_lanes=valid_green_lanes)
+        duration = np.clip(current_duration + delta_t, self.min_green, self.max_green)
         print(f"[DEBUG] About to check for existing phase: state={new_state}, duration={duration}")
         for idx, phase in enumerate(logic.getPhases()):
             print(f"[DEBUG]   Checking phase {idx}: state={phase.state}, duration={phase.duration}")
             if phase.state == new_state:
                 print(f"[DEBUG] RL/Controller requested phase already exists: {idx}")
-                # ALWAYS save/refresh PKL for existing phase!
+                # PATCH #3: Overwrite, not append, to PKL for this phase_idx
                 self.save_phase_to_pkl(idx, duration, new_state, delta_t, delta_t, penalty=0)
                 if hasattr(self, "update_display"):
                     self.update_display(idx, duration)
@@ -257,11 +321,15 @@ class AdaptivePhaseController:
         print(f"[DEBUG] setCompleteRedYellowGreenDefinition called for {self.tls_id} with {len(phases)} phases")
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
         print(f"[DEBUG] setPhase called for {self.tls_id} to phase {len(phases) - 1}")
-        # ALWAYS save PKL for new phase
+        # PATCH #3: Overwrite, not append, to PKL for this phase_idx
         self.save_phase_to_pkl(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
         if hasattr(self, "update_display"):
             self.update_display(len(phases) - 1, duration)
-        actual = traci.trafficlight.getPhaseDuration(self.tls_id)
+        try:
+            actual = traci.trafficlight.getPhaseDuration(self.tls_id)
+        except Exception as e:
+            print(f"[BUG] getPhaseDuration failed after set, using duration. Error: {e}")
+            actual = duration
         print(f"[SANITY] SUMO reported duration = {actual}, expected = {duration}")
         return len(phases) - 1
     def load_phase_from_pkl(self, phase_idx=None):
@@ -809,7 +877,7 @@ class AdaptivePhaseController:
                 updated = True
         if updated:
             self._save_apc_state()
-        # Log an event for GUI (optional, but helps event log-based GUIs)
+        # Log an event for GUI/event log syncing
         self._log_apc_event({
             "action": "phase_duration_update",
             "phase_idx": phase_idx,
@@ -817,12 +885,8 @@ class AdaptivePhaseController:
             "tls_id": self.tls_id
         })
 
+
     def set_phase_from_pkl(self, phase_idx, requested_duration=None):
-        """
-        Try to set a phase by PKL index, falling back to SUMO logic, and
-        auto-create/save phase in PKL if missing.
-        PATCH: Pass requested_duration to log_phase_switch to allow duration updates.
-        """
         print(f"[PKL][SET] set_phase_from_pkl({phase_idx}, requested_duration={requested_duration}) called")
         phase_record = self.load_phase_from_pkl(phase_idx)
         if phase_record:
@@ -852,7 +916,7 @@ class AdaptivePhaseController:
                     penalty=0
                 )
                 print(f"[PKL][AUTO-SAVE] Saved missing SUMO phase {phase_idx} to PKL.")
-                self.set_phase_from_pkl(phase_idx, requested_duration=duration)
+                self.set_phase_from_pkl(phase_idx, requested_duration=phases[phase_idx].duration)
                 if hasattr(self, "update_display"):
                     self.update_display(phase_idx, phases[phase_idx].duration)
                 return True
@@ -866,6 +930,7 @@ class AdaptivePhaseController:
                         print(f"[PKL][SUBSTITUTE] Found PKL phase with matching state. Using phase_idx={p['phase_idx']}.")
                         traci.trafficlight.setPhase(self.tls_id, p["phase_idx"])
                         traci.trafficlight.setPhaseDuration(self.tls_id, p["duration"])
+                        self.update_phase_duration_record(p["phase_idx"], p["duration"])
                         if hasattr(self, "update_display"):
                             self.update_display(p["phase_idx"], p["duration"])
                         return True
@@ -886,13 +951,13 @@ class AdaptivePhaseController:
                 print(f"[PKL][FALLBACK] Created and saved fallback phase {phase_idx} with max_green to PKL.")
                 traci.trafficlight.setPhase(self.tls_id, phase_idx)
                 traci.trafficlight.setPhaseDuration(self.tls_id, fallback_duration)
+                self.update_phase_duration_record(phase_idx, fallback_duration)
                 if hasattr(self, "update_display"):
                     self.update_display(phase_idx, fallback_duration)
                 return True
 
             print(f"[ERROR] Could not find or create a suitable phase for index {phase_idx}.")
             return False
-
 
     def ensure_true_protected_left_phase(self, left_lane):
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
@@ -1170,14 +1235,10 @@ class AdaptivePhaseController:
                 print(f"[WARNING] Tried to set duration {new_duration}s < min_green {self.min_green}s! Forcing min_green.")
                 new_duration = self.min_green
 
-            # SET THE NEW DURATION FIRST
             traci.trafficlight.setPhaseDuration(self.tls_id, new_duration)
 
-            # THEN UPDATE THE DISPLAY
-            if hasattr(self, "update_display"):
-                current_time = traci.simulation.getTime()
-                next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
-                self.update_display(old_phase, new_duration, current_time, next_switch)
+            # PATCH: update PKL/event log
+            self.update_phase_duration_record(old_phase, new_duration)
 
             event = {
                 "action": "adjust_phase_duration",
@@ -1195,6 +1256,11 @@ class AdaptivePhaseController:
 
             print(f"\n[PHASE ADJUST] Phase {old_phase}: {current_duration:.1f}s → {new_duration:.1f}s")
             print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
+
+            if hasattr(self, "update_display"):
+                current_time = traci.simulation.getTime()
+                next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
+                self.update_display(old_phase, new_duration, current_time, next_switch)
 
             return new_duration
         except traci.TraCIException as e:
