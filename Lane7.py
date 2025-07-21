@@ -94,6 +94,7 @@ class AdaptivePhaseController:
         self.tls_id = tls_id
         self.alpha = alpha
         self.min_green = min_green
+        self.last_phase_switch_sim_time = 0
         self.max_green = max_green
         self.r_base = r_base
         self.r_adjust = r_adjust
@@ -398,39 +399,42 @@ class AdaptivePhaseController:
         print(f"[ADAPTIVE WEIGHTS] {self.tls_id}: {self.weights}")    
     
     def log_phase_switch(self, new_phase_idx):
-        """
-        Safely switch phases, inserting yellow phase if needed, and always enforce min_green.
-        Returns True if switch happened, else False.
-        Logs whether this phase was RL-created or not.
-        """
         import traci
+        current_time = traci.simulation.getTime()
+        elapsed = current_time - self.last_phase_switch_sim_time
+
+        # Block switch if min green not met and no priority
+        if elapsed < self.min_green and not self.check_priority_conditions():
+            print(f"[MIN_GREEN BLOCK] Phase switch blocked (elapsed: {elapsed:.1f}s < {self.min_green}s)")
+            return False
+
+        # Flicker prevention: block if same as last phase
+        if self.last_phase_idx == new_phase_idx:
+            print(f"[PHASE SWITCH BLOCKED] Flicker prevention triggered for {self.tls_id}")
+            return False
+
+        # Insert yellow phase if needed
+        self.insert_yellow_phase_if_needed(new_phase_idx)
+
         try:
-            old_phase = traci.trafficlight.getPhase(self.tls_id)
-            old_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
-            current_sim_time = traci.simulation.getTime()
-            if not self.enforce_min_green():
-                print(f"[PHASE SWITCH BLOCKED] Minimum green not elapsed ({current_sim_time - self.last_phase_switch_sim_time:.2f}s < {self.min_green}s)")
-                return False
-            if self.last_phase_idx == new_phase_idx:
-                print(f"[PHASE SWITCH BLOCKED] Flicker prevention triggered for {self.tls_id}")
-                return False
-            self.insert_yellow_phase_if_needed(new_phase_idx)
             traci.trafficlight.setPhase(self.tls_id, new_phase_idx)
             traci.trafficlight.setPhaseDuration(self.tls_id, max(self.min_green, self.max_green))
             new_phase = traci.trafficlight.getPhase(self.tls_id)
             new_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
             self.last_phase_idx = new_phase_idx
-            self.last_phase_switch_sim_time = current_sim_time
+            self.last_phase_switch_sim_time = current_time
+
             # PATCH: Check if this phase was RL-created
             phase_was_rl_created = False
             phase_pkl = self.load_phase_from_pkl(new_phase_idx)
             if phase_pkl and phase_pkl.get("rl_created"):
                 phase_was_rl_created = True
+
             event = {
                 "action": "phase_switch",
-                "old_phase": old_phase,
+                "old_phase": self.last_phase_idx,
                 "new_phase": new_phase,
-                "old_state": old_state,
+                "old_state": "",  # Optional: populate if needed
                 "new_state": new_state,
                 "reward": getattr(self, "last_R", None),
                 "weights": self.weights.tolist(),
@@ -440,8 +444,8 @@ class AdaptivePhaseController:
                 "phase_idx": new_phase_idx
             }
             self._log_apc_event(event)
-            print(f"\n[PHASE SWITCH] {self.tls_id}: {old_phase}→{new_phase}")
-            print(f"  Old: {old_state}\n  New: {new_state}")
+            print(f"\n[PHASE SWITCH] {self.tls_id}: {self.last_phase_idx}→{new_phase}")
+            print(f"  New state: {new_state}")
             print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
             if phase_was_rl_created:
                 print(f"  [INFO] RL agent's phase is now in use (phase {new_phase_idx})")
@@ -449,6 +453,16 @@ class AdaptivePhaseController:
         except Exception as e:
             print(f"[ERROR] Phase switch failed: {e}")
             return False
+
+    def check_priority_conditions(self):
+        # Returns True if there is a priority event that allows preemption of min green
+        # You may want to expand this as needed (emergency, protected left, etc)
+        event_type, event_lane = self.check_special_events()
+        if event_type == "emergency_vehicle":
+            return True
+        if self.serve_true_protected_left_if_needed():
+            return True
+        return False
     def create_phase_state(self, green_lanes=None, yellow_lanes=None, red_lanes=None):
         import traci
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
@@ -1150,9 +1164,9 @@ class AdaptivePhaseController:
 
     def adjust_phase_duration(self, delta_t):
         try:
-            if not self.enforce_min_green():
-                print("[PHASE DURATION ADJUST BLOCKED] Minimum green not elapsed.")
-                return traci.trafficlight.getPhaseDuration(self.tls_id)
+            if not self.enforce_min_green() and not self.check_priority_conditions():
+                print("[ADJUST BLOCKED] Min green active")
+                return current_duration
             old_phase = traci.trafficlight.getPhase(self.tls_id)
             current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
             new_duration = np.clip(current_duration + delta_t, self.min_green, self.max_green)
@@ -1187,22 +1201,38 @@ class AdaptivePhaseController:
         except traci.TraCIException as e:
             print(f"[ERROR] Duration adjustment failed: {e}")
             return traci.trafficlight.getPhaseDuration(self.tls_id)
+        
 
+        # Blocked left turn detection
+        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+        for lane_id in controlled_lanes:
+            links = traci.lane.getLinks(lane_id)
+            is_left = any(len(link) > 6 and link[6] == 'l' for link in links)
+            if is_left:
+                vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
+                speeds = [traci.vehicle.getSpeed(vid) for vid in vehicles]
+                if speeds and max(speeds) < 0.2:
+                    return True
+        return False
 # Do NOT call log_phase_switch or adjust_phase_duration here!        # Do NOT update last_phase_switch_sim_time here!
     def control_step(self):
-        import traci
+
         self.phase_count += 1
         current_time = traci.simulation.getTime()
-
-        # Serve protected left-turn if blocked/conflict detected (highest priority)
-        if self.serve_true_protected_left_if_needed():
-            return
-
-        # Emergency vehicle preemption
-        event_type, event_lane = self.check_special_events()
-        if event_type == 'emergency_vehicle':
-            self.reorganize_or_create_phase(event_lane, event_type)
-            return
+        
+        # Check if min green time has elapsed since last switch
+        elapsed = current_time - self.last_phase_switch_sim_time
+        min_green_elapsed = elapsed >= self.min_green
+        
+        # Allow interruption only for priority conditions
+        if min_green_elapsed or self.check_priority_conditions():
+            # Existing priority handling and phase switching logic
+            if self.serve_true_protected_left_if_needed():
+                return
+            event_type, event_lane = self.check_special_events()
+            if event_type == 'emergency_vehicle':
+                self.reorganize_or_create_phase(event_lane, event_type)
+                return
 
         # Wait for the current phase to run out
         now = traci.simulation.getTime()

@@ -6,12 +6,13 @@ class TrafficLightPhaseDisplay:
     def __init__(self, event_log, poll_interval=500):
         self.root = tk.Tk()
         self.root.title("Phase Time")
-        self.root.minsize(1200, 200)  # Set a minimum window size
+        self.root.minsize(1200, 200)
 
         self.tree = ttk.Treeview(
             self.root,
             columns=(
                 "tl_id",
+                "lane",
                 "time left",
                 "phase duration",
                 "extended time",
@@ -25,18 +26,16 @@ class TrafficLightPhaseDisplay:
             show="headings"
         )
         for col in [
-            "tl_id", "time left", "phase duration", "extended time", "event type", "phase index",
+            "tl_id", "lane", "time left", "phase duration", "extended time", "event type", "phase index",
             "phase state", "action taken", "protected left", "blocked"
         ]:
             self.tree.heading(col, text=col.replace("_", " ").title())
-            self.tree.column(col, minwidth=100, width=140, anchor="center")  # Set min width and center align
-
+            self.tree.column(col, minwidth=80, width=120, anchor="center")
         self.tree.pack(fill=tk.BOTH, expand=True)
         self.poll_interval = poll_interval
         self.running = False
         self.ready = True
         self.event_log = event_log
-
         self.no_data_label = tk.Label(self.root, text="Waiting for traffic light data...", font=("Arial", 16))
         self.no_data_label.pack(pady=20)
 
@@ -62,11 +61,11 @@ class TrafficLightPhaseDisplay:
                 pass
             if not tls_list:
                 self.no_data_label.config(text="No traffic lights found in the simulation. Waiting for data...")
-                self.no_data_label.lift()  # Bring label to front
+                self.no_data_label.lift()
                 self.root.after(self.poll_interval, self.update_table)
                 return
             else:
-                self.no_data_label.pack_forget()  # Remove the label if data is present
+                self.no_data_label.pack_forget()
             inserted = False
             for tl_id in tls_list:
                 try:
@@ -77,7 +76,6 @@ class TrafficLightPhaseDisplay:
                         continue
                     now = traci.simulation.getTime()
                     next_switch = traci.trafficlight.getNextSwitch(tl_id)
-                    time_left = max(0, next_switch - now)
                     phase_duration = traci.trafficlight.getPhaseDuration(tl_id)
                     curr_phase_record = None
                     for p in reversed(self.event_log):
@@ -94,55 +92,51 @@ class TrafficLightPhaseDisplay:
                                       else self.is_protected_left(tl_id, current_phase))
                     blocked = (curr_phase_record.get("blocked", False) if curr_phase_record
                                else self.is_blocked(tl_id, current_phase))
-                    extended_time = curr_phase_record.get("extended_time", 0) if curr_phase_record else 0  # NEW
+                    extended_time = curr_phase_record.get("extended_time", 0) if curr_phase_record else 0
 
-                    # --- Lane times calculation, insert here ---
+                    # For each lane, show its own row
                     controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
-                    lane_times = {}
-                    for idx, lane in enumerate(controlled_lanes):
-                        color = phase_state[idx] if idx < len(phase_state) else "-"
+                    # Deduplicate and sort for consistent display
+                    unique_lanes = sorted(set(controlled_lanes), key=controlled_lanes.index)
+                    for lane in unique_lanes:
+                        orig_idx = controlled_lanes.index(lane)
+                        color = phase_state[orig_idx] if orig_idx < len(phase_state) else "-"
+                        # Smoother time left logic:
+                        # If lane is green now, show countdown (time left in phase, smooth)
+                        # If not green, show time until next green (may jump)
                         if color.upper() == 'G':
-                            lane_times[lane] = round(next_switch - now, 2)
+                            lane_time_left = max(0, round(next_switch - now, 2))
                         else:
+                            # Find when this lane will next get green
                             t = next_switch
                             found = False
                             for offset in range(1, len(phases) + 1):
                                 phase_idx = (current_phase + offset) % len(phases)
                                 phase = phases[phase_idx]
-                                if idx < len(phase.state) and phase.state[idx].upper() == 'G':
-                                    lane_times[lane] = round(t - now, 2)
+                                if orig_idx < len(phase.state) and phase.state[orig_idx].upper() == 'G':
+                                    lane_time_left = max(0, round(t - now, 2))
                                     found = True
                                     break
                                 t += phase.duration
                             if not found:
-                                lane_times[lane] = "-"
-                    lane_times_str = ', '.join(f'{lane}:{lane_times[lane]}' for lane in lane_times)
-                    # --- End lane times calculation ---
-
-                    if event_type is None or event_type == "":
-                        event_type = "No Event"
-                    if action_taken is None or action_taken == "":
-                        action_taken = event_type
-                    if phase_state is None or phase_state == "":
-                        phase_state = phases[current_phase].state if current_phase < len(phases) else "-"
-
-                    self.tree.insert(
-                        "", "end",
-                        values=(
-                            tl_id,
-                            int(round(time_left)) if isinstance(time_left, (float, int)) else time_left,
-                            round(phase_duration, 2) if isinstance(phase_duration, (float, int)) else phase_duration,
-                            round(extended_time, 2) if isinstance(extended_time, (float, int)) else extended_time,
-                            event_type,
-                            current_phase,
-                            phase_state,
-                            action_taken,
-                            "Yes" if protected_left else "No",
-                            "Yes" if blocked else "No",
-                            lane_times_str  # <--- new column for lane times
+                                lane_time_left = "-"
+                        self.tree.insert(
+                            "", "end",
+                            values=(
+                                tl_id,
+                                lane,
+                                lane_time_left,
+                                round(phase_duration, 2) if isinstance(phase_duration, (float, int)) else phase_duration,
+                                round(extended_time, 2) if isinstance(extended_time, (float, int)) else extended_time,
+                                event_type,
+                                current_phase,
+                                phase_state,
+                                action_taken,
+                                "Yes" if protected_left else "No",
+                                "Yes" if blocked else "No"
+                            )
                         )
-                    )
-                    inserted = True
+                        inserted = True
                 except Exception as e:
                     print(f"[TrafficLightPhaseDisplay ERROR]: Could not update for {tl_id}: {e}")
             if not inserted:
@@ -154,6 +148,7 @@ class TrafficLightPhaseDisplay:
             print("[TrafficLightPhaseDisplay ERROR]:", e)
         if self.running:
             self.root.after(self.poll_interval, self.update_table)
+
     def update_phase_duration(self, phase_idx, duration, current_time, next_switch_time, extended_time=0):
         self.phase_idx = phase_idx
         self.duration = duration
