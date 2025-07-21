@@ -1187,38 +1187,65 @@ class AdaptivePhaseController:
         except traci.TraCIException as e:
             print(f"[ERROR] Duration adjustment failed: {e}")
             return traci.trafficlight.getPhaseDuration(self.tls_id)
+
+# Do NOT call log_phase_switch or adjust_phase_duration here!        # Do NOT update last_phase_switch_sim_time here!
     def control_step(self):
+        import traci
         self.phase_count += 1
         current_time = traci.simulation.getTime()
+
+        # Serve protected left-turn if blocked/conflict detected (highest priority)
+        if self.serve_true_protected_left_if_needed():
+            return
+
+        # Emergency vehicle preemption
+        event_type, event_lane = self.check_special_events()
+        if event_type == 'emergency_vehicle':
+            self.reorganize_or_create_phase(event_lane, event_type)
+            return
+
+        # Wait for the current phase to run out
+        now = traci.simulation.getTime()
+        next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
+        time_left = max(0, next_switch - now)
+        if time_left > 0.1:
+            return
+
+        # --- At this point, phase is expiring, time to pick the next phase ---
+        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+        num_phases = len(logic.getPhases())
+        current_phase = traci.trafficlight.getPhase(self.tls_id)
+
+        # RL/Adaptive state vector creation (you may need to adapt this to your actual state interface)
+        # Here we use a simple state: current phase, phase count, etc. You can improve this.
+        rl_state = np.array([current_phase, num_phases, self.phase_count])
+        try:
+            # Use RL agent to select next phase
+            # If you have a richer state, use a richer state here.
+            next_phase = self.rl_agent.get_action(rl_state, tl_id=self.tls_id, action_size=num_phases)
+            if isinstance(next_phase, np.ndarray) or isinstance(next_phase, list):
+                next_phase = int(next_phase[0])
+        except Exception as e:
+            print(f"[RL] Fallback to round-robin due to error: {e}")
+            next_phase = (current_phase + 1) % num_phases
+
+        # Compute reward and adaptive duration for next phase
         bonus, penalty = self.compute_status_and_bonus_penalty()
         R = self.calculate_reward(bonus, penalty)
         self.reward_history.append(R)
         if self.phase_count % 10 == 0:
             self.update_R_target()
         delta_t = self.calculate_delta_t(R)
-        elapsed_green = current_time - self.last_phase_switch_sim_time
+        # Use PKL or default duration for next phase:
+        phase_record = self.load_phase_from_pkl(next_phase)
+        if phase_record:
+            base_next_duration = phase_record["duration"]
+        else:
+            base_next_duration = self.min_green
+        next_duration = np.clip(base_next_duration + delta_t, self.min_green, self.max_green)
 
-        if elapsed_green < self.min_green:
-            print(f"[CONTROL STEP BLOCKED] {self.tls_id}: Only {elapsed_green:.2f}s since last switch (min_green={self.min_green}s)")
-            return
-
-        # Serve protected left-turn if blocked/conflict detected (highest priority)
-        if self.serve_true_protected_left_if_needed():
-            return
-
-        # Handle other special events as normal
-        event_type, event_lane = self.check_special_events()
-        if event_type:
-            switched = self.reorganize_or_create_phase(event_lane, event_type)
-            # Only update timer if switch succeeded (but log_phase_switch now owns this)
-            return
-
-        # Otherwise, adjust phase duration as usual (only via log_phase_switch)
-        current_phase = traci.trafficlight.getPhase(self.tls_id)
-        current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
-        new_duration = np.clip(current_duration + delta_t, self.min_green, self.max_green)
-        self.set_phase_from_pkl(current_phase, requested_duration=new_duration)
-    # Do NOT call log_phase_switch or adjust_phase_duration here!        # Do NOT update last_phase_switch_sim_time here!
+        # Switch to next phase with computed duration
+        self.set_phase_from_pkl(next_phase, requested_duration=next_duration)
 
 class EnhancedQLearningAgent:
     def __init__(self, state_size, action_size, adaptive_controller, learning_rate=0.1, discount_factor=0.95, 

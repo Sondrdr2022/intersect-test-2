@@ -95,25 +95,51 @@ class TrafficLightPhaseDisplay:
                     blocked = (curr_phase_record.get("blocked", False) if curr_phase_record
                                else self.is_blocked(tl_id, current_phase))
                     extended_time = curr_phase_record.get("extended_time", 0) if curr_phase_record else 0  # NEW
+
+                    # --- Lane times calculation, insert here ---
+                    controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
+                    lane_times = {}
+                    for idx, lane in enumerate(controlled_lanes):
+                        color = phase_state[idx] if idx < len(phase_state) else "-"
+                        if color.upper() == 'G':
+                            lane_times[lane] = round(next_switch - now, 2)
+                        else:
+                            t = next_switch
+                            found = False
+                            for offset in range(1, len(phases) + 1):
+                                phase_idx = (current_phase + offset) % len(phases)
+                                phase = phases[phase_idx]
+                                if idx < len(phase.state) and phase.state[idx].upper() == 'G':
+                                    lane_times[lane] = round(t - now, 2)
+                                    found = True
+                                    break
+                                t += phase.duration
+                            if not found:
+                                lane_times[lane] = "-"
+                    lane_times_str = ', '.join(f'{lane}:{lane_times[lane]}' for lane in lane_times)
+                    # --- End lane times calculation ---
+
                     if event_type is None or event_type == "":
                         event_type = "No Event"
                     if action_taken is None or action_taken == "":
                         action_taken = event_type
                     if phase_state is None or phase_state == "":
                         phase_state = phases[current_phase].state if current_phase < len(phases) else "-"
+
                     self.tree.insert(
                         "", "end",
                         values=(
                             tl_id,
                             int(round(time_left)) if isinstance(time_left, (float, int)) else time_left,
                             round(phase_duration, 2) if isinstance(phase_duration, (float, int)) else phase_duration,
-                            round(extended_time, 2) if isinstance(extended_time, (float, int)) else extended_time,  # NEW
+                            round(extended_time, 2) if isinstance(extended_time, (float, int)) else extended_time,
                             event_type,
                             current_phase,
                             phase_state,
                             action_taken,
                             "Yes" if protected_left else "No",
-                            "Yes" if blocked else "No"
+                            "Yes" if blocked else "No",
+                            lane_times_str  # <--- new column for lane times
                         )
                     )
                     inserted = True
@@ -128,7 +154,6 @@ class TrafficLightPhaseDisplay:
             print("[TrafficLightPhaseDisplay ERROR]:", e)
         if self.running:
             self.root.after(self.poll_interval, self.update_table)
-
     def update_phase_duration(self, phase_idx, duration, current_time, next_switch_time, extended_time=0):
         self.phase_idx = phase_idx
         self.duration = duration
