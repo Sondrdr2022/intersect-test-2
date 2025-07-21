@@ -781,7 +781,30 @@ class AdaptivePhaseController:
                         conflicting_straight.append(lane)
         return conflicting_straight
     
+
+    def preload_phases_from_sumo(self):
+        """
+        Ensure all SUMO phases are loaded into PKL with correct indices at startup.
+        """
+        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+        phases = logic.getPhases()
+        for idx, phase in enumerate(phases):
+            if not any(p['phase_idx'] == idx for p in self.apc_state.get('phases', [])):
+                self.save_phase_to_pkl(
+                    phase_idx=idx,
+                    duration=phase.duration,
+                    state_str=phase.state,
+                    delta_t=0,
+                    raw_delta_t=0,
+                    penalty=0
+                )
+        print(f"[PRELOAD] Preloaded {len(phases)} SUMO phases into PKL.")
+
     def set_phase_from_pkl(self, phase_idx):
+        """
+        Try to set a phase by PKL index, falling back to SUMO logic, and
+        auto-create/save phase in PKL if missing.
+        """
         print(f"[PKL][SET] set_phase_from_pkl({phase_idx}) called")
         phase_record = self.load_phase_from_pkl(phase_idx)
         if phase_record:
@@ -791,12 +814,65 @@ class AdaptivePhaseController:
                 self.update_display(phase_idx, phase_record["duration"])
             return True
         else:
-            print(f"[APC-RL] Phase {phase_idx} not found in PKL, fallback to max_green")
-            traci.trafficlight.setPhase(self.tls_id, phase_idx)
-            traci.trafficlight.setPhaseDuration(self.tls_id, self.max_green)
-            if hasattr(self, "update_display"):
-                self.update_display(phase_idx, self.max_green)
+            print(f"[APC-RL] Phase {phase_idx} not found in PKL, attempting to create or substitute.")
+
+            # (1) Try to get the phase from SUMO logic (by index) and save it to PKL
+            logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+            phases = logic.getPhases()
+            if 0 <= phase_idx < len(phases):
+                # Save this SUMO phase to PKL
+                self.save_phase_to_pkl(
+                    phase_idx=phase_idx,
+                    duration=phases[phase_idx].duration,
+                    state_str=phases[phase_idx].state,
+                    delta_t=0,
+                    raw_delta_t=0,
+                    penalty=0
+                )
+                print(f"[PKL][AUTO-SAVE] Saved missing SUMO phase {phase_idx} to PKL.")
+                traci.trafficlight.setPhase(self.tls_id, phase_idx)
+                traci.trafficlight.setPhaseDuration(self.tls_id, phases[phase_idx].duration)
+                if hasattr(self, "update_display"):
+                    self.update_display(phase_idx, phases[phase_idx].duration)
+                return True
+
+            # (2) Substitute: find a phase in PKL with the same state string
+            controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+            if 0 <= phase_idx < len(phases):
+                target_state = phases[phase_idx].state
+                for p in self.apc_state.get("phases", []):
+                    if p["state"] == target_state:
+                        print(f"[PKL][SUBSTITUTE] Found PKL phase with matching state. Using phase_idx={p['phase_idx']}.")
+                        traci.trafficlight.setPhase(self.tls_id, p["phase_idx"])
+                        traci.trafficlight.setPhaseDuration(self.tls_id, p["duration"])
+                        if hasattr(self, "update_display"):
+                            self.update_display(p["phase_idx"], p["duration"])
+                        return True
+
+            # (3) As last resort, create and save new phase with max_green and a valid state (first SUMO phase or first available PKL phase)
+            if len(phases) > 0:
+                fallback_idx = phase_idx if 0 <= phase_idx < len(phases) else 0
+                fallback_state = phases[fallback_idx].state
+                fallback_duration = self.max_green
+                self.save_phase_to_pkl(
+                    phase_idx=phase_idx,
+                    duration=fallback_duration,
+                    state_str=fallback_state,
+                    delta_t=0,
+                    raw_delta_t=0,
+                    penalty=0
+                )
+                print(f"[PKL][FALLBACK] Created and saved fallback phase {phase_idx} with max_green to PKL.")
+                traci.trafficlight.setPhase(self.tls_id, phase_idx)
+                traci.trafficlight.setPhaseDuration(self.tls_id, fallback_duration)
+                if hasattr(self, "update_display"):
+                    self.update_display(phase_idx, fallback_duration)
+                return True
+
+            print(f"[ERROR] Could not find or create a suitable phase for index {phase_idx}.")
             return False
+
+
     def ensure_true_protected_left_phase(self, left_lane):
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -1578,13 +1654,22 @@ class UniversalSmartTrafficController:
             print(f"Error initializing left-turn lanes: {e}")
 
     def _is_in_dilemma_zone(self, tl_id, controlled_lanes, lane_data):
-        """Return True if any vehicle is in the dilemma zone for lanes about to switch from green to red."""
+        """Return True if any vehicle is in the dilemma zone for lanes about to switch from green to red.
+        PATCH: Avoid tuple index out of range if phase state length < controlled_lanes."""
         try:
             logic = self._get_traffic_light_logic(tl_id)
-            if not logic: return False
-            state = logic.phases[traci.trafficlight.getPhase(tl_id)].state
-            for lane_idx, lane in enumerate(controlled_lanes):
-                if lane_idx < len(state) and state[lane_idx].upper() == 'G':
+            if not logic:
+                return False
+            current_phase_index = traci.trafficlight.getPhase(tl_id)
+            phases = getattr(logic, "phases", None)
+            if phases is None or current_phase_index >= len(phases) or current_phase_index < 0:
+                print(f"Error in _is_in_dilemma_zone: current_phase_index {current_phase_index} out of range for {tl_id} (phases: {len(phases) if phases else 'N/A'})")
+                return False
+            state = phases[current_phase_index].state
+            n = min(len(state), len(controlled_lanes))
+            for lane_idx in range(n):
+                lane = controlled_lanes[lane_idx]
+                if state[lane_idx].upper() == 'G':
                     for vid in traci.lane.getLastStepVehicleIDs(lane):
                         dist = traci.lane.getLength(lane) - traci.vehicle.getLanePosition(vid)
                         if 0 < dist <= self.DILEMMA_ZONE_THRESHOLD:
