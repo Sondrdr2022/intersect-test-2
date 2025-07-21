@@ -2761,7 +2761,7 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
 
     # 3. Start the display window (only ONCE, with valid tls_id)
 # In your display launcher:
-    display = TrafficLightPhaseDisplay(controller.phase_events, poll_interval=200)
+    display = TrafficLightPhaseDisplay(controller.phase_events, poll_interval=500)
     display.start()
 
     sim_thread.join()

@@ -3,7 +3,7 @@ from tkinter import ttk
 import traci
 
 class TrafficLightPhaseDisplay:
-    def __init__(self, event_log, poll_interval=1000):
+    def __init__(self, event_log, poll_interval=500):
         self.root = tk.Tk()
         self.root.title("Phase Time")
         self.root.minsize(1200, 200)  # Set a minimum window size
@@ -102,7 +102,7 @@ class TrafficLightPhaseDisplay:
                         "", "end",
                         values=(
                             tl_id,
-                            round(time_left, 2) if isinstance(time_left, (float, int)) else time_left,
+                            int(round(time_left)) if isinstance(time_left, (float, int)) else time_left,
                             round(phase_duration, 2) if isinstance(phase_duration, (float, int)) else phase_duration,
                             event_type,
                             current_phase,
