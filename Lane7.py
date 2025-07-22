@@ -10,7 +10,7 @@ from supabase import create_client
 import os, json, datetime
 
 SUPABASE_URL = "https://zckiwulodojgcfwyjrcx.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc"
+SUPABASE_KEY = "sb_publishable_LppST2vz15vZZ0_aykC_lA_tIG6P5vb"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = Flask(__name__)
 controller = None  # global reference for the API
@@ -238,7 +238,7 @@ class AdaptivePhaseController:
         if not found:
             self.apc_state["phases"].append(entry)
         self._save_apc_state()
-        print(f"[PKL][SAVE] All PKL phase indices now: {[p['phase_idx'] for p in self.apc_state['phases']]}")
+        print(f"[DB]/[Supabase][SAVE] All PKL phase indices now: {[p['phase_idx'] for p in self.apc_state['phases']]}")
     def create_or_extend_phase(self, green_lanes, delta_t):
         print(f"[DEBUG] create_or_extend_phase called with green_lanes={green_lanes}, delta_t={delta_t}")
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -333,12 +333,12 @@ class AdaptivePhaseController:
         return len(phases) - 1
     def load_phase_from_pkl(self, phase_idx=None):
         available = [p["phase_idx"] for p in self.apc_state.get("phases", [])]
-        print(f"[PKL][LOAD] Looking for phase_idx={phase_idx}. Available: {available}")
+        print(f"[DB]/[Supabase][LOAD] Looking for phase_idx={phase_idx}. Available: {available}")
         for p in self.apc_state.get("phases", []):
             if p["phase_idx"] == phase_idx:
-                print(f"[PKL][FOUND] phase_idx={phase_idx}, duration={p['duration']}, state={p['state']}")
+                print(f"[DB]/[Supabase][FOUND] phase_idx={phase_idx}, duration={p['duration']}, state={p['state']}")
                 return p
-        print(f"[PKL][MISSING] phase_idx={phase_idx} not found!")
+        print(f"[DB]/[Supabase][MISSING] phase_idx={phase_idx} not found!")
         return None
     
     def calculate_delta_t_and_penalty(self, R):
@@ -898,7 +898,7 @@ class AdaptivePhaseController:
         })
 
     def set_phase_from_pkl(self, phase_idx, requested_duration=None):
-        print(f"[PKL][SET] set_phase_from_pkl({phase_idx}, requested_duration={requested_duration}) called")
+        print(f"[DB]/[Supabase][SET] set_phase_from_pkl({phase_idx}, requested_duration={requested_duration}) called")
         phase_record = self.load_phase_from_pkl(phase_idx)
         if phase_record:
             duration = requested_duration if requested_duration is not None else phase_record["duration"]
@@ -924,7 +924,7 @@ class AdaptivePhaseController:
                     raw_delta_t=0,
                     penalty=0
                 )
-                print(f"[PKL][AUTO-SAVE] Saved missing SUMO phase {phase_idx} to PKL.")
+                print(f"[DB]/[Supabase][AUTO-SAVE] Saved missing SUMO phase {phase_idx} to PKL.")
                 self.set_phase_from_pkl(phase_idx, requested_duration=phases[phase_idx].duration)
                 if hasattr(self, "update_display"):
                     self.update_display(phase_idx, phases[phase_idx].duration)
@@ -933,7 +933,7 @@ class AdaptivePhaseController:
                 target_state = phases[phase_idx].state
                 for p in self.apc_state.get("phases", []):
                     if p["state"] == target_state:
-                        print(f"[PKL][SUBSTITUTE] Found PKL phase with matching state. Using phase_idx={p['phase_idx']}.")
+                        print(f"[DB]/[Supabase][SUBSTITUTE] Found PKL phase with matching state. Using phase_idx={p['phase_idx']}.")
                         traci.trafficlight.setPhase(self.tls_id, p["phase_idx"])
                         traci.trafficlight.setPhaseDuration(self.tls_id, p["duration"])
                         self.update_phase_duration_record(p["phase_idx"], p["duration"])
@@ -952,7 +952,7 @@ class AdaptivePhaseController:
                     raw_delta_t=0,
                     penalty=0
                 )
-                print(f"[PKL][FALLBACK] Created and saved fallback phase {phase_idx} with max_green to PKL.")
+                print(f"[DB]/[Supabase][FALLBACK] Created and saved fallback phase {phase_idx} with max_green to PKL.")
                 traci.trafficlight.setPhase(self.tls_id, phase_idx)
                 traci.trafficlight.setPhaseDuration(self.tls_id, fallback_duration)
                 self.update_phase_duration_record(phase_idx, fallback_duration)
