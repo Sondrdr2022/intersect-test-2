@@ -10,7 +10,7 @@ from supabase import create_client
 import os, json, datetime
 
 SUPABASE_URL = "https://zckiwulodojgcfwyjrcx.supabase.co"
-SUPABASE_KEY = "sb_publishable_LppST2vz15vZZ0_aykC_lA_tIG6P5vb"
+SUPABASE_KEY = ""
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = Flask(__name__)
 controller = None  # global reference for the API
