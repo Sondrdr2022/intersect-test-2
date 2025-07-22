@@ -10,6 +10,7 @@ from supabase import create_client
 import os, json, datetime
 
 SUPABASE_URL = "https://zckiwulodojgcfwyjrcx.supabase.co"
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = Flask(__name__)
 controller = None  # global reference for the API
@@ -21,9 +22,9 @@ def health_check():
 @app.route('/api/agent_params', methods=['GET'])
 def get_agent_params():
     global controller
+    if controller is None:
+        return jsonify({'error': 'Controller not initialized'}), 503
     try:
-        if controller is None:
-            return jsonify({'error': 'Controller not initialized'}), 503
         params = controller.rl_agent.adaptive_params
         return jsonify(params)
     except Exception as e:
@@ -32,27 +33,30 @@ def get_agent_params():
 @app.route('/api/epsilon', methods=['GET'])
 def get_epsilon():
     global controller
+    if controller is None:
+        return jsonify({'error': 'Controller not initialized'}), 503
     try:
-        if controller is None:
-            return jsonify({'error': 'Controller not initialized'}), 503
         return jsonify({'epsilon': controller.rl_agent.epsilon})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/run_episode', methods=['POST'])
 def run_episode():
+    # You can expand this later to trigger episode logic
     return jsonify({'message': 'Episode run (not implemented in placeholder)'})
 
 os.environ.setdefault('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
 tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
-if tools not in sys.path: sys.path.append(tools)
-def override_sumo_program_from_pkl(apc, current_phase_idx=None):
+if tools not in sys.path:
+    sys.path.append(tools)
+
+def override_sumo_program_from_supabase(apc, current_phase_idx=None):
     """
-    Replace the SUMO phase program for this controller with the PKL-defined sequence.
+    Replace the SUMO phase program for this controller with the Supabase-defined sequence.
     """
     phase_seq = apc.get_full_phase_sequence()
     if not phase_seq:
-        print(f"[PATCH] No PKL phase sequence for {apc.tls_id}, skipping override.")
+        print(f"[PATCH] No Supabase phase sequence for {apc.tls_id}, skipping override.")
         return
 
     # Default to current SUMO phase if not given
@@ -60,26 +64,27 @@ def override_sumo_program_from_pkl(apc, current_phase_idx=None):
         current_phase_idx = traci.trafficlight.getPhase(apc.tls_id)
     phases = [Phase(duration, state) for (state, duration) in phase_seq]
     new_logic = Logic(
-        programID="PKL-OVERRIDE",
+        programID="SUPABASE-OVERRIDE",
         type=traci.constants.TL_LOGIC_PROGRAM,
         currentPhaseIndex=current_phase_idx if 0 <= current_phase_idx < len(phases) else 0,
         phases=phases,
     )
     traci.trafficlight.setCompleteRedYellowGreenDefinition(apc.tls_id, new_logic)
-    print(f"[PATCH] Overrode SUMO program for {apc.tls_id} with {len(phases)} PKL phases.")
-def override_all_tls_with_pkl(controller, current_phase_idx=None):
+    print(f"[PATCH] Overrode SUMO program for {apc.tls_id} with {len(phases)} Supabase phases.")
+
+def override_all_tls_with_supabase(controller, current_phase_idx=None):
     """
-    For each traffic light controller, override SUMO logic with PKL-defined phase sequence.
+    For each traffic light controller, override SUMO logic with Supabase-defined phase sequence.
     """
-    print("[PATCH] Overriding all TLS logic from PKL files...")
+    print("[PATCH] Overriding all TLS logic from Supabase records...")
     for tl_id, apc in getattr(controller, 'adaptive_phase_controllers', {}).items():
         phase_seq = apc.get_full_phase_sequence()
         if not phase_seq:
-            print(f"[PATCH] No PKL phase sequence for {tl_id}, skipping override.")
+            print(f"[PATCH] No Supabase phase sequence for {tl_id}, skipping override.")
             continue
         traci_phases = [Phase(duration, state) for (state, duration) in phase_seq]
         phase_indices = [i for i, _ in enumerate(traci_phases)]
-        print(f"[PATCH] For {tl_id}: PKL has {len(traci_phases)} phases, indices: {phase_indices}")
+        print(f"[PATCH] For {tl_id}: Supabase has {len(traci_phases)} phases, indices: {phase_indices}")
         logic = Logic(
             tl_id,                   # programID
             0,                       # type (static)
@@ -87,15 +92,12 @@ def override_all_tls_with_pkl(controller, current_phase_idx=None):
             traci_phases             # phases
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(tl_id, logic)
-        print(f"[PATCH] Set PKL logic for {tl_id} ({len(traci_phases)} phases)")
-
+        print(f"[PATCH] Set Supabase logic for {tl_id} ({len(traci_phases)} phases)")
 class AdaptivePhaseController:
     def __init__(self, lane_ids, tls_id, alpha=1.0, min_green=30, max_green=80,
                  r_base=0.5, r_adjust=0.1, severe_congestion_threshold=0.8, 
                  large_delta_t=20, apc_data_file=None):
-        # --- Initialization order and state keys fixed ---
         self.lane_ids = lane_ids
-        self.rl_agent = None
         self.tls_id = tls_id
         self.alpha = alpha
         self.min_green = min_green
@@ -105,10 +107,14 @@ class AdaptivePhaseController:
         self.r_adjust = r_adjust
         self.severe_congestion_threshold = severe_congestion_threshold
         self.large_delta_t = large_delta_t
-        self.apc_data_file = apc_data_file or f"apc_{tls_id}.pkl"
-        # Always use both keys
         self.apc_state = {"events": [], "phases": []}
         self._load_apc_state()
+        self.preload_phases_from_sumo()
+
+        # ---- PATCH: Always initialize weights ----
+        self.weights = np.array([0.25, 0.25, 0.25, 0.25])
+        self.weight_history = []
+        self.metric_history = []
 
         # Cooldowns should use simulation time, not wall time!
         self.emergency_cooldown = {}  # Track emergency vehicle priority
@@ -119,9 +125,6 @@ class AdaptivePhaseController:
         # State management
         self.reward_history = []
         self.R_target = r_base
-        self.weights = np.array([0.25, 0.25, 0.25, 0.25])
-        self.weight_history = []
-        self.metric_history = []
         self.phase_count = 0
         # Event handling
         self.severe_congestion_cooldown = {}
@@ -134,12 +137,7 @@ class AdaptivePhaseController:
         # Flicker prevention
         self.last_phase_idx = None
         self.last_phase_switch_sim_time = 0
-        # Persistence (already set above)
-        # self.apc_data_file = ...
-        # self.apc_state = ...
-        # self._load_apc_state()    
     def _now(self):
-        # Use SUMO simulation time for all timing logic
 
         return traci.simulation.getTime()
 
