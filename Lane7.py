@@ -10,7 +10,6 @@ from supabase import create_client
 import os, json, datetime
 
 SUPABASE_URL = "https://zckiwulodojgcfwyjrcx.supabase.co"
-SUPABASE_KEY = "sb_publishable_LppST2vz15vZZ0_aykC_lA_tIG6P5vb"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = Flask(__name__)
 controller = None  # global reference for the API
@@ -96,6 +95,7 @@ class AdaptivePhaseController:
                  large_delta_t=20, apc_data_file=None):
         # --- Initialization order and state keys fixed ---
         self.lane_ids = lane_ids
+        self.rl_agent = None
         self.tls_id = tls_id
         self.alpha = alpha
         self.min_green = min_green
@@ -140,7 +140,7 @@ class AdaptivePhaseController:
         # self._load_apc_state()    
     def _now(self):
         # Use SUMO simulation time for all timing logic
-        import traci
+
         return traci.simulation.getTime()
 
     def log_phase_adjustment(self, action_type, phase, old_duration, new_duration):
@@ -182,7 +182,6 @@ class AdaptivePhaseController:
                     right.add(lid)
         return left, right    
     def _save_apc_state(self):
-        import json, datetime
         state_json = json.dumps(self.apc_state)
         supabase.table("apc_states").upsert({
             "tls_id": self.tls_id,
@@ -194,7 +193,6 @@ class AdaptivePhaseController:
     def _load_apc_state(self):
         response = supabase.table("apc_states").select("data").eq("tls_id", self.tls_id).eq("state_type", "full").execute()
         if response.data and len(response.data) > 0:
-            import json
             self.apc_state = json.loads(response.data[0]["data"])
         else:
             self.apc_state = {"events": [], "phases": []}
@@ -207,7 +205,6 @@ class AdaptivePhaseController:
         phase_records = sorted(self.apc_state.get("phases", []), key=lambda x: x["phase_idx"])
         # If empty, fallback
         if not phase_records:
-            import traci
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
             return [(p.state, p.duration) for p in logic.getPhases()]
         # Build the full sequence
@@ -350,7 +347,6 @@ class AdaptivePhaseController:
         return raw_delta_t, delta_t, penalty
  
     def _log_apc_event(self, event):
-        import traci
         event["timestamp"] = datetime.datetime.now().isoformat()
         event["sim_time"] = traci.simulation.getTime()
         event["tls_id"] = self.tls_id
@@ -360,7 +356,6 @@ class AdaptivePhaseController:
         self.apc_state["events"].append(event)
         self._save_apc_state()
     def get_lane_stats(self, lane_id):
-        import traci
         try:
             queue = traci.lane.getLastStepHaltingNumber(lane_id)
             waiting_time = traci.lane.getWaitingTime(lane_id)
@@ -397,7 +392,6 @@ class AdaptivePhaseController:
         print(f"[ADAPTIVE WEIGHTS] {self.tls_id}: {self.weights}")    
     
     def log_phase_switch(self, new_phase_idx):
-        import traci
         current_time = traci.simulation.getTime()
         elapsed = current_time - self.last_phase_switch_sim_time
 
@@ -462,7 +456,6 @@ class AdaptivePhaseController:
             return True
         return False
     def create_phase_state(self, green_lanes=None, yellow_lanes=None, red_lanes=None):
-        import traci
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         state = ['r'] * len(controlled_lanes)
         def set_lanes(lanes, state_char):
@@ -484,7 +477,6 @@ class AdaptivePhaseController:
                         state[idx] = 'y'
         return "".join(state)
     def add_new_phase(self, green_lanes, green_duration=20, yellow_duration=3, yellow_lanes=None):
-        import traci
         print(f"[DEBUG] add_new_phase called with green_lanes={green_lanes}, green_duration={green_duration}, yellow_duration={yellow_duration}, yellow_lanes={yellow_lanes}")
         try:
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -1572,6 +1564,7 @@ class EnhancedQLearningAgent:
 
 class UniversalSmartTrafficController:
     DILEMMA_ZONE_THRESHOLD = 12.0  # meters
+
     def __init__(self, sumocfg_path=None, mode="train"):
         self.mode = mode
         self.step_count = 0
@@ -1582,11 +1575,8 @@ class UniversalSmartTrafficController:
         self.right_turn_lanes = set()
         self.lane_id_list = []
         self.lane_id_to_idx = {}
-        self.isdx_to_lane_id = {}
         self.lane_to_tl = {}
         self.tl_action_sizes = {}
-        self.last_green_time = None
-
         self.pending_next_phase = {}
         self.lane_lengths = {}
         self.phase_event_log_file = f"phase_event_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
@@ -1607,7 +1597,14 @@ class UniversalSmartTrafficController:
             'flow': 30, 'density': 0.2, 'arrival_rate': 5,
             'time_since_green': 120
         }
-        # -- PATCH: create adaptive_phase_controller first --
+        self.lane_scores = defaultdict(float)
+        self.lane_states = defaultdict(str)
+        self.consecutive_states = defaultdict(int)
+        self.last_arrival_time = defaultdict(lambda: 0.0)
+        self.last_lane_vehicles = defaultdict(set)
+        self.last_green_time = defaultdict(float)
+
+        # PATCH: create adaptive_phase_controller and RL agent, then link them
         lane_ids = [lid for lid in traci.lane.getIDList() if not lid.startswith(":")]
         tls_id = traci.trafficlight.getIDList()[0]
         self.adaptive_phase_controller = AdaptivePhaseController(
@@ -1624,6 +1621,7 @@ class UniversalSmartTrafficController:
             adaptive_controller=self.adaptive_phase_controller,
             mode=mode
         )
+        self.adaptive_phase_controller.rl_agent = self.rl_agent
         self.rl_agent.load_model()
         self.adaptive_params = {
             'min_green': 30, 'max_green': 80, 'starvation_threshold': 40,
@@ -1631,11 +1629,10 @@ class UniversalSmartTrafficController:
             'flow_weight': 0.5, 'speed_weight': 0.2, 'left_turn_priority': 1.2,
             'empty_green_penalty': 15, 'congestion_bonus': 10
         }
+
     def log_phase_event(self, event: dict):
-        # Log to in-memory list and optionally to a separate file
         event["timestamp"] = datetime.datetime.now().isoformat()
         self.phase_events.append(event)
-        # Optionally, persist for crash robustness
         try:
             with open(self.phase_event_log_file, "wb") as f:
                 pickle.dump(self.phase_events, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -1688,6 +1685,36 @@ class UniversalSmartTrafficController:
             for i, phase in enumerate(phases):
                 print(f"  Phase {i}: {phase.state} (duration {getattr(phase, 'duration', '?')})")
 
+        self.lane_id_list = [lid for lid in traci.lane.getIDList() if not lid.startswith(":")]
+        self.tl_action_sizes = {tl_id: len(traci.trafficlight.getAllProgramLogics(tl_id)[0].phases)
+                                for tl_id in traci.trafficlight.getIDList()}
+        for tls_id in traci.trafficlight.getIDList():
+            lane_ids = traci.trafficlight.getControlledLanes(tls_id)
+            self.adaptive_phase_controllers[tls_id] = AdaptivePhaseController(
+                lane_ids=lane_ids,
+                tls_id=tls_id,
+                alpha=1.0,
+                min_green=10,
+                max_green=60
+            )
+            self.adaptive_phase_controllers[tls_id].rl_agent = self.rl_agent
+
+        self.lane_id_to_idx = {lid: i for i, lid in enumerate(self.lane_id_list)}
+        self.idx_to_lane_id = dict(enumerate(self.lane_id_list))
+        for lid in self.lane_id_list:
+            self.last_green_time[lid] = 0.0
+        self.subscribe_lanes(self.lane_id_list)
+        self.left_turn_lanes, self.right_turn_lanes = self.detect_turning_lanes()
+        self.lane_lengths = {lid: traci.lane.getLength(lid) for lid in self.lane_id_list}
+        self.lane_edge_ids = {lid: traci.lane.getEdgeID(lid) for lid in self.lane_id_list}
+
+    # ... rest of methods unchanged from user code ...
+    def initialize(self):
+        for tl_id in traci.trafficlight.getIDList():
+            phases = traci.trafficlight.getAllProgramLogics(tl_id)[0].phases
+            for i, phase in enumerate(phases):
+                print(f"  Phase {i}: {phase.state} (duration {getattr(phase, 'duration', '?')})")
+
         lane_ids = [lid for lid in traci.lane.getIDList() if not lid.startswith(":")]
         tls_id = traci.trafficlight.getIDList()[0]
 
@@ -1724,6 +1751,7 @@ class UniversalSmartTrafficController:
         self.left_turn_lanes, self.right_turn_lanes = self.detect_turning_lanes()
         self.lane_lengths = {lid: traci.lane.getLength(lid) for lid in self.lane_id_list}
         self.lane_edge_ids = {lid: traci.lane.getEdgeID(lid) for lid in self.lane_id_list}
+    
     def _init_left_turn_lanes(self):
         try:
             self.left_turn_lanes.clear()
@@ -2111,7 +2139,7 @@ class UniversalSmartTrafficController:
 
         except Exception as e:
             print(f"Error in run_step: {e}")
-            import traceback; traceback.print_exc() 
+            traceback.print_exc() 
     def _phase_has_traffic(self, logic, action, controlled_lanes, lane_data):
         """Returns True if at least one green lane in the selected phase has traffic."""
         phase_state = logic.phases[action].state
