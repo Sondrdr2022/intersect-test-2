@@ -1,65 +1,32 @@
 from collections import defaultdict
-import os, sys, traci,threading, warnings, time, argparse, traceback, pickle, datetime
+import os, sys, traci,threading, warnings, time, argparse, traceback, pickle, datetime, logging
 import numpy as np
-from pyinstrument import Profiler
 warnings.filterwarnings('ignore')
-from flask import Flask, request, jsonify
 from traffic_light_display import TrafficLightPhaseDisplay
 from traci._trafficlight import Logic, Phase
 from supabase import create_client
 import os, json, datetime
+import threading
+
+
 
 SUPABASE_URL = "https://zckiwulodojgcfwyjrcx.supabase.co"
-
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-app = Flask(__name__)
-controller = None  # global reference for the API
-
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    return jsonify({'status': 'ok'})
-
-@app.route('/api/agent_params', methods=['GET'])
-def get_agent_params():
-    global controller
-    if controller is None:
-        return jsonify({'error': 'Controller not initialized'}), 503
-    try:
-        params = controller.rl_agent.adaptive_params
-        return jsonify(params)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/epsilon', methods=['GET'])
-def get_epsilon():
-    global controller
-    if controller is None:
-        return jsonify({'error': 'Controller not initialized'}), 503
-    try:
-        return jsonify({'epsilon': controller.rl_agent.epsilon})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/run_episode', methods=['POST'])
-def run_episode():
-    # You can expand this later to trigger episode logic
-    return jsonify({'message': 'Episode run (not implemented in placeholder)'})
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("controller")
 
 os.environ.setdefault('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
 tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
 if tools not in sys.path:
     sys.path.append(tools)
 
+
 def override_sumo_program_from_supabase(apc, current_phase_idx=None):
-    """
-    Replace the SUMO phase program for this controller with the Supabase-defined sequence.
-    """
     phase_seq = apc.get_full_phase_sequence()
     if not phase_seq:
-        print(f"[PATCH] No Supabase phase sequence for {apc.tls_id}, skipping override.")
+        logger.warning(f"No Supabase phase sequence for {apc.tls_id}, skipping override.")
         return
-
-    # Default to current SUMO phase if not given
     if current_phase_idx is None:
         current_phase_idx = traci.trafficlight.getPhase(apc.tls_id)
     phases = [Phase(duration, state) for (state, duration) in phase_seq]
@@ -70,29 +37,42 @@ def override_sumo_program_from_supabase(apc, current_phase_idx=None):
         phases=phases,
     )
     traci.trafficlight.setCompleteRedYellowGreenDefinition(apc.tls_id, new_logic)
-    print(f"[PATCH] Overrode SUMO program for {apc.tls_id} with {len(phases)} Supabase phases.")
+    logger.info(f"Overrode SUMO program for {apc.tls_id} with {len(phases)} Supabase phases.")
 
 def override_all_tls_with_supabase(controller, current_phase_idx=None):
-    """
-    For each traffic light controller, override SUMO logic with Supabase-defined phase sequence.
-    """
-    print("[PATCH] Overriding all TLS logic from Supabase records...")
+    logger.info("Overriding all TLS logic from Supabase records...")
     for tl_id, apc in getattr(controller, 'adaptive_phase_controllers', {}).items():
         phase_seq = apc.get_full_phase_sequence()
         if not phase_seq:
-            print(f"[PATCH] No Supabase phase sequence for {tl_id}, skipping override.")
+            logger.warning(f"No Supabase phase sequence for {tl_id}, skipping override.")
             continue
         traci_phases = [Phase(duration, state) for (state, duration) in phase_seq]
         phase_indices = [i for i, _ in enumerate(traci_phases)]
-        print(f"[PATCH] For {tl_id}: Supabase has {len(traci_phases)} phases, indices: {phase_indices}")
+        logger.info(f"For {tl_id}: Supabase has {len(traci_phases)} phases, indices: {phase_indices}")
         logic = Logic(
-            tl_id,                   # programID
-            0,                       # type (static)
+            tl_id,
+            0,
             current_phase_idx if current_phase_idx is not None else 0,
-            traci_phases             # phases
+            traci_phases
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(tl_id, logic)
-        print(f"[PATCH] Set Supabase logic for {tl_id} ({len(traci_phases)} phases)")
+        logger.info(f"Set Supabase logic for {tl_id} ({len(traci_phases)} phases)")
+
+class AsyncSupabaseWriter(threading.Thread):
+    def __init__(self, apc, interval=2):
+        super().__init__(daemon=True)
+        self.apc = apc
+        self.interval = interval
+        self.running = True
+
+    def run(self):
+        while self.running:
+            self.apc.flush_pending_supabase_writes()
+            time.sleep(self.interval)
+
+    def stop(self):
+        self.running = False
+
 class AdaptivePhaseController:
     def __init__(self, lane_ids, tls_id, alpha=1.0, min_green=30, max_green=80,
                  r_base=0.5, r_adjust=0.1, severe_congestion_threshold=0.8,
@@ -101,43 +81,54 @@ class AdaptivePhaseController:
         self.tls_id = tls_id
         self.alpha = alpha
         self.min_green = min_green
-        self.last_phase_switch_sim_time = 0
         self.max_green = max_green
         self.r_base = r_base
         self.r_adjust = r_adjust
         self.severe_congestion_threshold = severe_congestion_threshold
         self.large_delta_t = large_delta_t
 
-        # ---- Always initialize weights ----
+        # Caching topology
+        self._links_map = {lid: traci.lane.getLinks(lid) for lid in lane_ids}
+        self._controlled_lanes = traci.trafficlight.getControlledLanes(tls_id)
+        self._phase_defs = [phase for phase in traci.trafficlight.getCompleteRedYellowGreenDefinition(tls_id)[0].getPhases()]
+
         self.weights = np.array([0.25, 0.25, 0.25, 0.25])
         self.weight_history = []
-        self.metric_history = []
-        self.reward_history = []
+        self.metric_history = deque(maxlen=50)
+        self.reward_history = deque(maxlen=50)
         self.R_target = r_base
         self.phase_count = 0
-        # Cooldowns and state management
+
         self.emergency_cooldown = {}
         self.emergency_global_cooldown = 0
         self.last_extended_time = 0
-        self.emergency_cooldown_time = 30
+        self.last_phase_switch_sim_time = 0
         self.protected_left_cooldown = defaultdict(float)
         self.severe_congestion_cooldown = {}
-        self.last_served_phase = None
         self.severe_congestion_global_cooldown = 0
         self.severe_congestion_global_cooldown_time = 30
-        self.special_event_history = defaultdict(int)
-        self.max_special_event_repeats = 2
-        self.last_special_event_lane = None
         self.last_phase_idx = None
-        self.last_phase_switch_sim_time = 0
 
-        # ---- Supabase state ----
         self.apc_state = {"events": [], "phases": []}
+        self._pending_db_ops = []
+        self._db_writer = AsyncSupabaseWriter(self)
+        self._db_writer.start()
         self._load_apc_state_supabase()
         self.preload_phases_from_sumo()
-    def _now(self):
 
-        return traci.simulation.getTime()
+    def flush_pending_supabase_writes(self):
+        if self._pending_db_ops:
+            state_json = json.dumps(self._pending_db_ops[-1])
+            try:
+                supabase.table("apc_states").upsert({
+                    "tls_id": self.tls_id,
+                    "state_type": "full",
+                    "data": state_json,
+                    "updated_at": datetime.datetime.now().isoformat()
+                }).execute()
+                self._pending_db_ops.clear()
+            except Exception as e:
+                print(f"[Supabase] Write failed: {e}")
 
     def log_phase_adjustment(self, action_type, phase, old_duration, new_duration):
         print(f"[LOG] {action_type} phase {phase}: {old_duration} -> {new_duration}")    
@@ -178,21 +169,17 @@ class AdaptivePhaseController:
                     right.add(lid)
         return left, right    
     def _save_apc_state_supabase(self):
-        state_json = json.dumps(self.apc_state)
-        supabase.table("apc_states").upsert({
-            "tls_id": self.tls_id,
-            "state_type": "full",
-            "data": state_json,
-            "updated_at": datetime.datetime.now().isoformat()
-        }).execute()
+        self._pending_db_ops.append(self.apc_state.copy())
 
     def _load_apc_state_supabase(self):
         response = supabase.table("apc_states").select("data").eq("tls_id", self.tls_id).eq("state_type", "full").execute()
         if response.data and len(response.data) > 0:
             self.apc_state = json.loads(response.data[0]["data"])
         else:
-            self.apc_state = {"events": [], "phases": []}    
-    def save_phase_to_supabase(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty, reward=None, bonus=None, weights=None, event_type=None, lanes=None):
+            self.apc_state = {"events": [], "phases": []}
+
+    def save_phase_to_supabase(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty,
+                              reward=None, bonus=None, weights=None, event_type=None, lanes=None):
         entry = {
             "phase_idx": phase_idx,
             "duration": duration,
@@ -217,14 +204,7 @@ class AdaptivePhaseController:
         if not found:
             self.apc_state["phases"].append(entry)
         self._save_apc_state_supabase()
-        print(f"[DB]/[Supabase][SAVE] All phase indices now: {[p['phase_idx'] for p in self.apc_state['phases']]}")
 
-    def get_full_phase_sequence(self):
-        phase_records = sorted(self.apc_state.get("phases", []), key=lambda x: x["phase_idx"])
-        if not phase_records:
-            logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
-            return [(p.state, p.duration) for p in logic.getPhases()]
-        return [(rec["state"], rec["duration"]) for rec in phase_records] 
     def create_or_extend_phase(self, green_lanes, delta_t):
         print(f"[DEBUG] create_or_extend_phase called with green_lanes={green_lanes}, delta_t={delta_t}")
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -317,16 +297,7 @@ class AdaptivePhaseController:
             actual = duration
         print(f"[SANITY] SUMO reported duration = {actual}, expected = {duration}")
         return len(phases) - 1
-    def load_phase_from_supabase(self, phase_idx=None):
-        available = [p["phase_idx"] for p in self.apc_state.get("phases", [])]
-        print(f"[DB]/[Supabase][LOAD] Looking for phase_idx={phase_idx}. Available: {available}")
-        for p in self.apc_state.get("phases", []):
-            if p["phase_idx"] == phase_idx:
-                print(f"[DB]/[Supabase][FOUND] phase_idx={phase_idx}, duration={p['duration']}, state={p['state']}")
-                return p
-        print(f"[DB]/[Supabase][MISSING] phase_idx={phase_idx} not found!")
-        return None
-    
+
     def calculate_delta_t_and_penalty(self, R):
         raw_delta_t = self.alpha * (R - self.R_target)
         penalty = max(0, abs(raw_delta_t) - 10)
@@ -335,6 +306,18 @@ class AdaptivePhaseController:
         print(f"[DEBUG] [DELTA_T_PENALTY] R={R:.2f}, R_target={self.R_target:.2f}, raw_delta_t={raw_delta_t:.2f}, delta_t={delta_t:.2f}, penalty={penalty:.2f}")
         return raw_delta_t, delta_t, penalty
  
+    def get_full_phase_sequence(self):
+        phase_records = sorted(self.apc_state.get("phases", []), key=lambda x: x["phase_idx"])
+        if not phase_records:
+            return [(p.state, p.duration) for p in self._phase_defs]
+        return [(rec["state"], rec["duration"]) for rec in phase_records]
+
+    def load_phase_from_supabase(self, phase_idx=None):
+        for p in self.apc_state.get("phases", []):
+            if p["phase_idx"] == phase_idx:
+                return p
+        return None
+
     def _log_apc_event(self, event):
         event["timestamp"] = datetime.datetime.now().isoformat()
         event["sim_time"] = traci.simulation.getTime()
@@ -344,6 +327,68 @@ class AdaptivePhaseController:
         event["penalty"] = getattr(self, "last_penalty", 0)
         self.apc_state["events"].append(event)
         self._save_apc_state_supabase()
+
+    def compute_reward_and_bonus(self):
+        status_score = 0
+        valid_lanes = 0
+        metrics = np.zeros(4)
+        MAX_VALUES = [0.2, 13.89, 300, 50]
+        current_max = [
+            max(0.1, max(traci.lane.getLastStepVehicleNumber(lid)/max(1, traci.lane.getLength(lid)) for lid in self.lane_ids)),
+            max(5.0, max(traci.lane.getLastStepMeanSpeed(lid) for lid in self.lane_ids)),
+            max(30.0, max(traci.lane.getWaitingTime(lid) for lid in self.lane_ids)),
+            max(5.0, max(traci.lane.getLastStepHaltingNumber(lid) for lid in self.lane_ids))
+        ]
+        max_vals = [min(MAX_VALUES[i], current_max[i]) for i in range(4)]
+        bonus, penalty = 0, 0
+        for lane_id in self.lane_ids:
+            queue, wtime, v, dens = self.get_lane_stats(lane_id)
+            if queue < 0 or wtime < 0:
+                continue
+            status_score += min(queue, 50)/10 + min(wtime, 300)/60
+            metrics += [
+                min(dens, max_vals[0]) / max_vals[0],
+                min(v, max_vals[1]) / max_vals[1],
+                min(wtime, max_vals[2]) / max_vals[2],
+                min(queue, max_vals[3]) / max_vals[3]
+            ]
+            valid_lanes += 1
+        if valid_lanes == 0:
+            avg_metrics = np.zeros(4)
+            avg_status = 0
+        else:
+            avg_metrics = metrics / valid_lanes
+            avg_status = status_score / valid_lanes
+        if avg_status >= 5 * 1.25:
+            penalty = 2
+        elif avg_status <= 2.5:
+            bonus = 1
+        self.last_bonus = bonus
+        self.last_penalty = penalty
+        self.metric_history.append(avg_metrics)
+        if self.phase_count % 5 == 0:
+            self.adjust_weights()
+        R = 100 * (
+            -self.weights[0] * avg_metrics[0] +
+            self.weights[1] * avg_metrics[1] -
+            self.weights[2] * avg_metrics[2] -
+            self.weights[3] * avg_metrics[3] +
+            bonus - penalty
+        )
+        self.last_R = np.clip(R, -100, 100)
+        self.reward_history.append(self.last_R)
+        return self.last_R, bonus, penalty
+    # Throttle congestion/emergency checks
+
+    # Only update R_target every 10 switches
+    def update_R_target(self, window=10):
+        if len(self.reward_history) < window or self.phase_count % 10 != 0:
+            return
+        avg_R = np.mean(list(self.reward_history)[-window:])
+        self.R_target = self.r_base + self.r_adjust * (avg_R - self.r_base)
+
+    def shutdown(self):
+        self._db_writer.stop()
     def get_lane_stats(self, lane_id):
         try:
             queue = traci.lane.getLastStepHaltingNumber(lane_id)
@@ -511,6 +556,9 @@ class AdaptivePhaseController:
     def check_special_events(self):
         """Detect special conditions with improved prioritization"""
         now = traci.simulation.getTime()
+        if hasattr(self, "_last_special_check") and now - self._last_special_check < 5:
+            return None, None
+        self._last_special_check = now
         next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
         time_left = max(0, next_switch - now)
         # 1. Emergency vehicle detection (highest priority)
@@ -844,9 +892,7 @@ class AdaptivePhaseController:
     
 
     def preload_phases_from_sumo(self):
-        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
-        phases = logic.getPhases()
-        for idx, phase in enumerate(phases):
+        for idx, phase in enumerate(self._phase_defs):
             if not any(p['phase_idx'] == idx for p in self.apc_state.get('phases', [])):
                 self.save_phase_to_supabase(
                     phase_idx=idx,
@@ -856,7 +902,7 @@ class AdaptivePhaseController:
                     raw_delta_t=0,
                     penalty=0
                 )
-        print(f"[PRELOAD] Preloaded {len(phases)} SUMO phases into Supabase.")
+
     def update_phase_duration_record(self, phase_idx, new_duration, extended_time=0):
         updated = False
         for p in self.apc_state.get("phases", []):
