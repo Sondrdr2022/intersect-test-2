@@ -95,8 +95,8 @@ def override_all_tls_with_supabase(controller, current_phase_idx=None):
         print(f"[PATCH] Set Supabase logic for {tl_id} ({len(traci_phases)} phases)")
 class AdaptivePhaseController:
     def __init__(self, lane_ids, tls_id, alpha=1.0, min_green=30, max_green=80,
-                 r_base=0.5, r_adjust=0.1, severe_congestion_threshold=0.8, 
-                 large_delta_t=20, apc_data_file=None):
+                 r_base=0.5, r_adjust=0.1, severe_congestion_threshold=0.8,
+                 large_delta_t=20):
         self.lane_ids = lane_ids
         self.tls_id = tls_id
         self.alpha = alpha
@@ -107,26 +107,20 @@ class AdaptivePhaseController:
         self.r_adjust = r_adjust
         self.severe_congestion_threshold = severe_congestion_threshold
         self.large_delta_t = large_delta_t
-        self.apc_state = {"events": [], "phases": []}
-        self._load_apc_state()
-        self.preload_phases_from_sumo()
 
-        # ---- PATCH: Always initialize weights ----
+        # ---- Always initialize weights ----
         self.weights = np.array([0.25, 0.25, 0.25, 0.25])
         self.weight_history = []
         self.metric_history = []
-
-        # Cooldowns should use simulation time, not wall time!
-        self.emergency_cooldown = {}  # Track emergency vehicle priority
-        self.emergency_global_cooldown = 0
-        self.last_extended_time = 0
-        self.emergency_cooldown_time = 30  # Cooldown after emergency
-        self.protected_left_cooldown = defaultdict(float)
-        # State management
         self.reward_history = []
         self.R_target = r_base
         self.phase_count = 0
-        # Event handling
+        # Cooldowns and state management
+        self.emergency_cooldown = {}
+        self.emergency_global_cooldown = 0
+        self.last_extended_time = 0
+        self.emergency_cooldown_time = 30
+        self.protected_left_cooldown = defaultdict(float)
         self.severe_congestion_cooldown = {}
         self.last_served_phase = None
         self.severe_congestion_global_cooldown = 0
@@ -134,9 +128,13 @@ class AdaptivePhaseController:
         self.special_event_history = defaultdict(int)
         self.max_special_event_repeats = 2
         self.last_special_event_lane = None
-        # Flicker prevention
         self.last_phase_idx = None
         self.last_phase_switch_sim_time = 0
+
+        # ---- Supabase state ----
+        self.apc_state = {"events": [], "phases": []}
+        self._load_apc_state_supabase()
+        self.preload_phases_from_sumo()
     def _now(self):
 
         return traci.simulation.getTime()
@@ -179,7 +177,7 @@ class AdaptivePhaseController:
                 if idx and c[idx] == 'r':
                     right.add(lid)
         return left, right    
-    def _save_apc_state(self):
+    def _save_apc_state_supabase(self):
         state_json = json.dumps(self.apc_state)
         supabase.table("apc_states").upsert({
             "tls_id": self.tls_id,
@@ -188,27 +186,13 @@ class AdaptivePhaseController:
             "updated_at": datetime.datetime.now().isoformat()
         }).execute()
 
-    def _load_apc_state(self):
+    def _load_apc_state_supabase(self):
         response = supabase.table("apc_states").select("data").eq("tls_id", self.tls_id).eq("state_type", "full").execute()
         if response.data and len(response.data) > 0:
             self.apc_state = json.loads(response.data[0]["data"])
         else:
-            self.apc_state = {"events": [], "phases": []}
-    def get_full_phase_sequence(self):
-        """
-        Return a list of (state_string, duration) tuples representing all phases
-        (in order by phase_idx) from the PKL. If not found, fall back to default logic.
-        """
-        # Get all unique phase_idx in PKL (sorted)
-        phase_records = sorted(self.apc_state.get("phases", []), key=lambda x: x["phase_idx"])
-        # If empty, fallback
-        if not phase_records:
-            logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
-            return [(p.state, p.duration) for p in logic.getPhases()]
-        # Build the full sequence
-        return [(rec["state"], rec["duration"]) for rec in phase_records]
-    def save_phase_to_pkl(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty, reward=None, bonus=None, weights=None, event_type=None, lanes=None):
-        # PATCH: Overwrite existing record for phase_idx instead of always appending.
+            self.apc_state = {"events": [], "phases": []}    
+    def save_phase_to_supabase(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty, reward=None, bonus=None, weights=None, event_type=None, lanes=None):
         entry = {
             "phase_idx": phase_idx,
             "duration": duration,
@@ -232,8 +216,15 @@ class AdaptivePhaseController:
                 break
         if not found:
             self.apc_state["phases"].append(entry)
-        self._save_apc_state()
-        print(f"[DB]/[Supabase][SAVE] All PKL phase indices now: {[p['phase_idx'] for p in self.apc_state['phases']]}")
+        self._save_apc_state_supabase()
+        print(f"[DB]/[Supabase][SAVE] All phase indices now: {[p['phase_idx'] for p in self.apc_state['phases']]}")
+
+    def get_full_phase_sequence(self):
+        phase_records = sorted(self.apc_state.get("phases", []), key=lambda x: x["phase_idx"])
+        if not phase_records:
+            logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+            return [(p.state, p.duration) for p in logic.getPhases()]
+        return [(rec["state"], rec["duration"]) for rec in phase_records] 
     def create_or_extend_phase(self, green_lanes, delta_t):
         print(f"[DEBUG] create_or_extend_phase called with green_lanes={green_lanes}, delta_t={delta_t}")
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -326,7 +317,7 @@ class AdaptivePhaseController:
             actual = duration
         print(f"[SANITY] SUMO reported duration = {actual}, expected = {duration}")
         return len(phases) - 1
-    def load_phase_from_pkl(self, phase_idx=None):
+    def load_phase_from_supabase(self, phase_idx=None):
         available = [p["phase_idx"] for p in self.apc_state.get("phases", [])]
         print(f"[DB]/[Supabase][LOAD] Looking for phase_idx={phase_idx}. Available: {available}")
         for p in self.apc_state.get("phases", []):
@@ -352,7 +343,7 @@ class AdaptivePhaseController:
         event["bonus"] = getattr(self, "last_bonus", 0)
         event["penalty"] = getattr(self, "last_penalty", 0)
         self.apc_state["events"].append(event)
-        self._save_apc_state()
+        self._save_apc_state_supabase()
     def get_lane_stats(self, lane_id):
         try:
             queue = traci.lane.getLastStepHaltingNumber(lane_id)
@@ -416,7 +407,7 @@ class AdaptivePhaseController:
 
             # PATCH: Check if this phase was RL-created
             phase_was_rl_created = False
-            phase_pkl = self.load_phase_from_pkl(new_phase_idx)
+            phase_pkl = self.load_phase_from_supabase(new_phase_idx)
             if phase_pkl and phase_pkl.get("rl_created"):
                 phase_was_rl_created = True
 
@@ -853,14 +844,11 @@ class AdaptivePhaseController:
     
 
     def preload_phases_from_sumo(self):
-        """
-        Ensure all SUMO phases are loaded into PKL with correct indices at startup.
-        """
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         phases = logic.getPhases()
         for idx, phase in enumerate(phases):
             if not any(p['phase_idx'] == idx for p in self.apc_state.get('phases', [])):
-                self.save_phase_to_pkl(
+                self.save_phase_to_supabase(
                     phase_idx=idx,
                     duration=phase.duration,
                     state_str=phase.state,
@@ -868,8 +856,7 @@ class AdaptivePhaseController:
                     raw_delta_t=0,
                     penalty=0
                 )
-        print(f"[PRELOAD] Preloaded {len(phases)} SUMO phases into PKL.")
-
+        print(f"[PRELOAD] Preloaded {len(phases)} SUMO phases into Supabase.")
     def update_phase_duration_record(self, phase_idx, new_duration, extended_time=0):
         updated = False
         for p in self.apc_state.get("phases", []):
@@ -878,7 +865,7 @@ class AdaptivePhaseController:
                 p["extended_time"] = extended_time  # <-- NEW
                 updated = True
         if updated:
-            self._save_apc_state()
+            self._save_apc_state_supabase()
         self._log_apc_event({
             "action": "phase_duration_update",
             "phase_idx": phase_idx,
@@ -889,7 +876,7 @@ class AdaptivePhaseController:
 
     def set_phase_from_pkl(self, phase_idx, requested_duration=None):
         print(f"[DB]/[Supabase][SET] set_phase_from_pkl({phase_idx}, requested_duration={requested_duration}) called")
-        phase_record = self.load_phase_from_pkl(phase_idx)
+        phase_record = self.load_phase_from_supabase(phase_idx)
         if phase_record:
             duration = requested_duration if requested_duration is not None else phase_record["duration"]
             extended_time = duration - phase_record.get("duration", duration) if requested_duration is not None else 0
@@ -1255,7 +1242,7 @@ class AdaptivePhaseController:
             self.update_R_target()
         delta_t = self.calculate_delta_t(R)
         # Use PKL or default duration for next phase:
-        phase_record = self.load_phase_from_pkl(next_phase)
+        phase_record = self.load_phase_from_supabase(next_phase)
         if phase_record:
             base_next_duration = phase_record["duration"]
         else:
@@ -1337,7 +1324,7 @@ class EnhancedQLearningAgent:
         })
         print(f"[DEBUG][RL Agent] Will now set phase from PKL: phase_idx={phase_idx}")
         self.adaptive_controller.set_phase_from_pkl(phase_idx)
-        phase_record = self.adaptive_controller.load_phase_from_pkl(phase_idx)
+        phase_record = self.adaptive_controller.load_phase_from_supabase(phase_idx)
         if phase_record:
             traci.trafficlight.setPhase(self.adaptive_controller.tls_id, phase_record["phase_idx"])
             traci.trafficlight.setPhaseDuration(self.adaptive_controller.tls_id, phase_record["duration"])
@@ -1524,6 +1511,7 @@ class EnhancedQLearningAgent:
         except Exception as e:
             print(f"Error loading model: {e}\nNo existing Q-table, starting fresh")
             return False, {}
+
 
     def save_model(self, filepath=None, adaptive_params=None):
         filepath = filepath or self.q_table_file
@@ -1853,7 +1841,7 @@ class UniversalSmartTrafficController:
                 return False
 
             # PATCH: Use phase record from APC PKL to set SUMO phase/duration
-            phase_record = apc.load_phase_from_pkl(phase_idx)
+            phase_record = apc.load_phase_from_supabase(phase_idx)
             if phase_record:
                 traci.trafficlight.setPhase(apc.tls_id, phase_record["phase_idx"])
                 traci.trafficlight.setPhaseDuration(apc.tls_id, phase_record["duration"])
@@ -2457,7 +2445,7 @@ class UniversalSmartTrafficController:
             apc = self.adaptive_phase_controllers[tl_id]
             if current_phase != target_phase:
                 # Apply adaptive phase controller's PKL-driven phase record
-                phase_record = apc.load_phase_from_pkl(target_phase)
+                phase_record = apc.load_phase_from_supabase(target_phase)
                 if phase_record:
                     traci.trafficlight.setPhase(tl_id, phase_record["phase_idx"])
                     traci.trafficlight.setPhaseDuration(tl_id, phase_record["duration"])
