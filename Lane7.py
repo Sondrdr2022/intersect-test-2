@@ -6,7 +6,12 @@ warnings.filterwarnings('ignore')
 from flask import Flask, request, jsonify
 from traffic_light_display import TrafficLightPhaseDisplay
 from traci._trafficlight import Logic, Phase
+from supabase import create_client
+import os, json, datetime
 
+SUPABASE_URL = os.environ.get('https://zckiwulodojgcfwyjrcx.supabase.co')
+SUPABASE_KEY = os.environ.get('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc')
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = Flask(__name__)
 controller = None  # global reference for the API
 
@@ -176,30 +181,23 @@ class AdaptivePhaseController:
                 if idx and c[idx] == 'r':
                     right.add(lid)
         return left, right    
-    def _load_apc_state(self):
-        if not self.apc_data_file or not os.path.exists(self.apc_data_file):
-            self.apc_state = {"events": [], "phases": []}
-            return
-        try:
-            with open(self.apc_data_file, "rb") as f:
-                state = pickle.load(f)
-            if not isinstance(state, dict):
-                raise ValueError("APC PKL file is not a dictionary -- resetting.")
-            self.apc_state = state
-            if "events" not in self.apc_state: self.apc_state["events"] = []
-            if "phases" not in self.apc_state: self.apc_state["phases"] = []
-        except Exception as e:
-            print(f"[APC] State load failed: {e}. PKL file may be corrupted! Resetting.")
-            self.apc_state = {"events": [], "phases": []}   
-            
     def _save_apc_state(self):
-        if not self.apc_data_file:
-            return
-        try:
-            with open(self.apc_data_file, "wb") as f:
-                pickle.dump(self.apc_state, f, protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception as e:
-            print(f"[APC] State save failed: {e}")
+        import json, datetime
+        state_json = json.dumps(self.apc_state)
+        supabase.table("apc_states").upsert({
+            "tls_id": self.tls_id,
+            "state_type": "full",
+            "data": state_json,
+            "updated_at": datetime.datetime.now().isoformat()
+        }).execute()
+
+    def _load_apc_state(self):
+        response = supabase.table("apc_states").select("data").eq("tls_id", self.tls_id).eq("state_type", "full").execute()
+        if response.data and len(response.data) > 0:
+            import json
+            self.apc_state = json.loads(response.data[0]["data"])
+        else:
+            self.apc_state = {"events": [], "phases": []}
     def get_full_phase_sequence(self):
         """
         Return a list of (state_string, duration) tuples representing all phases
