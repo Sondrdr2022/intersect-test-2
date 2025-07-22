@@ -175,17 +175,57 @@ class TrafficLightPhaseDisplay:
         return "Unknown"
 
     def is_protected_left(self, tl_id, phase_index):
+        # Try event log first
         for event in reversed(self.event_log):
             if event.get("tls_id") == tl_id and event.get("phase_idx") == phase_index:
-                return event.get("protected_left", False) or event.get("action", "").startswith("add_true_protected_left")
+                # If log says it's protected left, trust it
+                if event.get("protected_left", False):
+                    return True
+                # If action seems to be protected left, trust it
+                if str(event.get("action", "")).lower().startswith("add_true_protected_left"):
+                    return True
+        # Fallback: infer from phase state (only one green, and that lane is a left turn)
+        try:
+            logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(tl_id)[0]
+            phases = logic.getPhases()
+            if phase_index < len(phases):
+                phase_state = phases[phase_index].state
+                controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
+                green_indices = [i for i, c in enumerate(phase_state) if c.upper() == 'G']
+                if len(green_indices) == 1:
+                    lane_id = controlled_lanes[green_indices[0]]
+                    links = traci.lane.getLinks(lane_id)
+                    is_left = any(len(link) > 6 and link[6] == 'l' for link in links)
+                    return is_left
+        except Exception:
+            pass
         return False
 
     def is_blocked(self, tl_id, phase_index):
+        # Try event log first
         for event in reversed(self.event_log):
             if event.get("tls_id") == tl_id and event.get("phase_idx") == phase_index:
-                return event.get("blocked", False)
+                if event.get("blocked", False):
+                    return True
+        # Fallback: check if any green lane has a stopped vehicle for >5s
+        try:
+            logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(tl_id)[0]
+            phases = logic.getPhases()
+            if phase_index < len(phases):
+                phase_state = phases[phase_index].state
+                controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
+                for idx, lane_id in enumerate(controlled_lanes):
+                    if phase_state[idx].upper() == 'G':
+                        vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
+                        if vehicles:
+                            front_vehicle = vehicles[0]
+                            speed = traci.vehicle.getSpeed(front_vehicle)
+                            stopped_time = traci.vehicle.getAccumulatedWaitingTime(front_vehicle)
+                            if speed < 0.2 and stopped_time > 5:
+                                return True
+        except Exception:
+            pass
         return False
-
     def start(self):
         self.running = True
         self.update_table()
