@@ -418,7 +418,6 @@ class AdaptivePhaseController:
         print(f"[ADAPTIVE WEIGHTS] {self.tls_id}: {self.weights}")    
     
     def log_phase_switch(self, new_phase_idx):
-        import traci
         current_time = traci.simulation.getTime()
         elapsed = current_time - self.last_phase_switch_sim_time
 
@@ -443,25 +442,51 @@ class AdaptivePhaseController:
             self.last_phase_idx = new_phase_idx
             self.last_phase_switch_sim_time = current_time
 
-            # PATCH: Always determine protected_left and blocked for this phase
-            phase_state = new_state
-            controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+            # --- PATCH: DYNAMIC event_type/action_taken logic ---
+            event_type = "normal"
+            action_taken = "RL: Switch phase"
+
+            # Priority vehicle detection
+            special_event, _ = self.check_special_events()
+            if special_event == "emergency_vehicle":
+                event_type = "priority vehicle"
+                action_taken = "RL: Serve Emergency"
+            else:
+                # Congestion detection
+                _, lane = self.check_special_events()
+                if lane is not None:
+                    event_type = "heavy congestion"
+                    action_taken = "RL: Serve Congestion"
+                else:
+                    # Heuristic: congestion/no congestion
+                    q_sum = sum(traci.lane.getLastStepHaltingNumber(lane_id)
+                                for lane_id in traci.trafficlight.getControlledLanes(self.tls_id))
+                    if q_sum > 10:
+                        event_type = "congestion"
+                        action_taken = "RL: Serve Congestion"
+                    else:
+                        event_type = "no congestion"
+                        action_taken = "RL: No Action"
+
+            # Protected left detection
             protected_left = False
-            blocked = False
-            # Heuristic: protected left if only one lane is green and it's a left-turn lane
-            green_lanes = [idx for idx, ch in enumerate(phase_state) if ch.upper() == 'G']
+            controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+            green_lanes = [idx for idx, ch in enumerate(new_state) if ch.upper() == 'G']
             if len(green_lanes) == 1:
                 lane_id = controlled_lanes[green_lanes[0]]
                 links = traci.lane.getLinks(lane_id)
                 is_left = any(len(link) > 6 and link[6] == 'l' for link in links)
                 protected_left = is_left
-            # Blocked: use your detection function if desired
-            if hasattr(self, "detect_blocked_left_turn") and self.detect_blocked_left_turn():
-                blocked = True
+                if protected_left:
+                    action_taken = "RL: Protected Left"
+
+            # Blocked detection
+            blocked = self.detect_blocked_left_turn() is not None
 
             event = {
                 "action": "phase_switch",
-                "action_taken": "General",
+                "event_type": event_type,
+                "action_taken": action_taken,
                 "protected_left": protected_left,
                 "blocked": blocked,
                 "old_phase": self.last_phase_idx,
@@ -477,6 +502,7 @@ class AdaptivePhaseController:
             }
             self._log_apc_event(event)
             print(f"\n[PHASE SWITCH] {self.tls_id}: {self.last_phase_idx}→{new_phase}")
+            print(f"  event_type: {event_type}, action_taken: {action_taken}, protected_left: {protected_left}, blocked: {blocked}")
             print(f"  New state: {new_state}")
             print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
             return True
@@ -1794,6 +1820,7 @@ class UniversalSmartTrafficController:
                 min_green=10,
                 max_green=60
             )
+        # Preload phases for all controllers!
         for apc in self.adaptive_phase_controllers.values():
             apc.preload_phases_from_sumo()
         self.lane_id_to_idx = {lid: i for i, lid in enumerate(self.lane_id_list)}
@@ -1803,6 +1830,12 @@ class UniversalSmartTrafficController:
         self.left_turn_lanes, self.right_turn_lanes = self.detect_turning_lanes()
         self.lane_lengths = {lid: traci.lane.getLength(lid) for lid in self.lane_id_list}
         self.lane_edge_ids = {lid: traci.lane.getEdgeID(lid) for lid in self.lane_id_list}
+
+        # -------- PATCH: Aggregate all APC events into self.phase_events --------
+        self.phase_events.clear()
+        for apc in self.adaptive_phase_controllers.values():
+            self.phase_events.extend(apc.apc_state["events"])
+        # -----------------------------------------------------------------------
     def _init_left_turn_lanes(self):
         try:
             self.left_turn_lanes.clear()

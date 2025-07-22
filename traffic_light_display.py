@@ -82,32 +82,29 @@ class TrafficLightPhaseDisplay:
                         if p.get("tls_id") == tl_id and p.get("phase_idx") == current_phase:
                             curr_phase_record = p
                             break
-                    event_type = (curr_phase_record.get("action") if curr_phase_record and "action" in curr_phase_record
-                                  else self.get_event_type_for(tl_id, current_phase))
-                    action_taken = (curr_phase_record.get("action_taken", event_type) if curr_phase_record
-                                    else self.get_action_taken_for(tl_id, current_phase))
+                    # PATCH: Prefer event_type and action_taken fields
+                    event_type = (curr_phase_record.get("event_type") if curr_phase_record and "event_type" in curr_phase_record
+                                else curr_phase_record.get("action") if curr_phase_record and "action" in curr_phase_record
+                                else self.get_event_type_for(tl_id, current_phase))
+                    action_taken = (curr_phase_record.get("action_taken") if curr_phase_record and "action_taken" in curr_phase_record
+                                    else event_type)
                     phase_state = (curr_phase_record.get("state") if curr_phase_record and "state" in curr_phase_record
-                                   else (phases[current_phase].state if current_phase < len(phases) else "-"))
+                                else (phases[current_phase].state if current_phase < len(phases) else "-"))
                     protected_left = (curr_phase_record.get("protected_left", False) if curr_phase_record
-                                      else self.is_protected_left(tl_id, current_phase))
+                                    else self.is_protected_left(tl_id, current_phase))
                     blocked = (curr_phase_record.get("blocked", False) if curr_phase_record
-                               else self.is_blocked(tl_id, current_phase))
+                            else self.is_blocked(tl_id, current_phase))
                     extended_time = curr_phase_record.get("extended_time", 0) if curr_phase_record else 0
 
                     # For each lane, show its own row
                     controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
-                    # Deduplicate and sort for consistent display
                     unique_lanes = sorted(set(controlled_lanes), key=controlled_lanes.index)
                     for lane in unique_lanes:
                         orig_idx = controlled_lanes.index(lane)
                         color = phase_state[orig_idx] if orig_idx < len(phase_state) else "-"
-                        # Smoother time left logic:
-                        # If lane is green now, show countdown (time left in phase, smooth)
-                        # If not green, show time until next green (may jump)
                         if color.upper() == 'G':
                             lane_time_left = max(0, round(next_switch - now, 2))
                         else:
-                            # Find when this lane will next get green
                             t = next_switch
                             found = False
                             for offset in range(1, len(phases) + 1):
@@ -148,7 +145,6 @@ class TrafficLightPhaseDisplay:
             print("[TrafficLightPhaseDisplay ERROR]:", e)
         if self.running:
             self.root.after(self.poll_interval, self.update_table)
-
     def update_phase_duration(self, phase_idx, duration, current_time, next_switch_time, extended_time=0):
         self.phase_idx = phase_idx
         self.duration = duration
