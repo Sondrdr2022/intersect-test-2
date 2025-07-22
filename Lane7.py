@@ -912,6 +912,7 @@ class AdaptivePhaseController:
     def preload_phases_from_sumo(self):
         """
         Ensure all SUMO phases are loaded into PKL with correct indices at startup.
+        Also log an event for each phase for GUI lookup.
         """
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         phases = logic.getPhases()
@@ -925,8 +926,38 @@ class AdaptivePhaseController:
                     raw_delta_t=0,
                     penalty=0
                 )
+        self.log_phase_preload_events()  # <-- Add this line!
         print(f"[PRELOAD] Preloaded {len(phases)} SUMO phases into PKL.")
 
+    def log_phase_preload_events(self):
+        """
+        Log an event for each preloaded phase so the GUI can display proper info.
+        """
+        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+        phases = logic.getPhases()
+        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
+        for idx, phase in enumerate(phases):
+            green_lanes = [i for i, c in enumerate(phase.state) if c.upper() == 'G']
+            protected_left = False
+            action_taken = "General"
+            event_type = "phase_preload"
+            blocked = False
+            if len(green_lanes) == 1:
+                lane_id = controlled_lanes[green_lanes[0]]
+                links = traci.lane.getLinks(lane_id)
+                if any(len(link) > 6 and link[6] == 'l' for link in links):
+                    protected_left = True
+                    action_taken = "Protected Left"
+            self._log_apc_event({
+                "action": event_type,
+                "action_taken": action_taken,
+                "protected_left": protected_left,
+                "blocked": blocked,
+                "phase_idx": idx,
+                "tls_id": self.tls_id,
+                "state": phase.state,
+                "duration": phase.duration
+            })
     def update_phase_duration_record(self, phase_idx, new_duration, extended_time=0):
         updated = False
         for p in self.apc_state.get("phases", []):
@@ -1763,7 +1794,8 @@ class UniversalSmartTrafficController:
                 min_green=10,
                 max_green=60
             )
-        
+        for apc in self.adaptive_phase_controllers.values():
+            apc.preload_phases_from_sumo()
         self.lane_id_to_idx = {lid: i for i, lid in enumerate(self.lane_id_list)}
         self.idx_to_lane_id = dict(enumerate(self.lane_id_list))
         self.last_green_time = np.zeros(len(self.lane_id_list))
