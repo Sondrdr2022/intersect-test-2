@@ -184,6 +184,25 @@ class AdaptivePhaseController:
     def _save_apc_state_firestore(self):
         self._pending_db_ops.append(self.apc_state.copy())
 
+    
+    def _load_apc_state_firestore(self):
+        """
+        Loads the APC state (phases/events) for this TLS from Firestore.
+        """
+        doc_id = f"{self.tls_id}_full"
+        doc_ref = db.collection("apc_states").document(doc_id)
+        doc = doc_ref.get()
+        if doc.exists:
+            data = doc.to_dict().get("data", "{}")
+            try:
+                self.apc_state = json.loads(data)
+            except Exception as e:
+                print(f"[Firestore] Failed to parse apc_state JSON for {self.tls_id}: {e}")
+                self.apc_state = {"events": [], "phases": []}
+        else:
+            self.apc_state = {"events": [], "phases": []}
+
+
     def save_phase_to_firestore(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty,
                                reward=None, bonus=None, weights=None, event_type=None, lanes=None):
         entry = {
