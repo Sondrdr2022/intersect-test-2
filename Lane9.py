@@ -113,6 +113,7 @@ class AdaptivePhaseController:
         if 0 <= phase_idx < len(phases):
             phase = phases[phase_idx]
             traci.trafficlight.setPhase(self.tls_id, phase_idx)
+            
             traci.trafficlight.setPhaseDuration(self.tls_id, phase['duration'])
 
     def control_step(self):
@@ -376,10 +377,26 @@ class UniversalSmartTrafficController:
         ])
         # (5) RL agent picks phase index
         phase_idx = self.rl_agent.get_action(state, tl_id=self.tls_id, action_size=len(phases))
-        # (6) Set phase in SUMO
+
+        # (6) Validate and Set phase in SUMO
         phase = phases[phase_idx]
-        traci.trafficlight.setPhase(self.tls_id, phase_idx)
-        traci.trafficlight.setPhaseDuration(self.tls_id, phase['duration'])
+        expected_state_length = len(traci.trafficlight.getControlledLinks(self.tls_id))
+        actual_state_length = len(phase.get('state', ""))
+
+        print(f"[DEBUG] About to set phase: idx={phase_idx}, duration={phase['duration']}, state={phase['state']}")
+        print(f"[DEBUG] Expected state length: {expected_state_length}, Actual state length: {actual_state_length}")
+
+        try:
+            if actual_state_length != expected_state_length:
+                print(f"[ERROR] Phase state string length ({actual_state_length}) does not match expected ({expected_state_length}). Skipping phase set to avoid crash.")
+                return
+            traci.trafficlight.setPhase(self.tls_id, phase_idx)
+            traci.trafficlight.setPhaseDuration(self.tls_id, phase['duration'])
+        except Exception as e:
+            print(f"[ERROR] Exception while setting phase: {e}")
+            print(f"[ERROR] Phase data: {phase}")
+            # Optionally: raise to crash, or return to skip
+
         self.last_phase_change[self.tls_id] = traci.simulation.getTime()
         self.log_phase_event({
             "action": "phase_set",
@@ -387,7 +404,6 @@ class UniversalSmartTrafficController:
             "duration": phase['duration'],
             "timestamp": datetime.datetime.now().isoformat()
         })
-
 def main():
     parser = argparse.ArgumentParser(description="Run universal SUMO RL traffic simulation (API phases)")
     parser.add_argument('--sumo', required=True, help='Path to SUMO config file')
@@ -403,8 +419,18 @@ def main():
             sumo_cmd = [os.path.join(os.environ['SUMO_HOME'], 'bin', sumo_binary), '-c', args.sumo, '--start', '--quit-on-end']
             traci.start(sumo_cmd)
             controller = UniversalSmartTrafficController(args.sumo, mode="train")
-            # RL agent assignment here (must be done before .run_step)
-            # controller.rl_agent = EnhancedQLearningAgent(...)
+
+            # RL agent assignment (use correct state_size, action_size, and pass controller if needed)
+            # You may need to adjust these arguments:
+            state_size = 6  # or whatever your state shape is
+            action_size = len(get_phases_from_api(controller.tls_id)) or 1  # fetch actual action count
+            controller.rl_agent = EnhancedQLearningAgent(
+                state_size=state_size,
+                action_size=action_size,
+                adaptive_controller=controller,  # or pass None if not needed
+                mode="train"
+            )
+
             controller.initialize()
             step = 0
             while traci.simulation.getMinExpectedNumber() > 0:
