@@ -89,7 +89,6 @@ class AdaptivePhaseController:
         self.severe_congestion_threshold = severe_congestion_threshold
         self.large_delta_t = large_delta_t
 
-        # Caching topology
         self._links_map = {lid: traci.lane.getLinks(lid) for lid in lane_ids}
         self._controlled_lanes = traci.trafficlight.getControlledLanes(tls_id)
         self._phase_defs = [phase for phase in traci.trafficlight.getCompleteRedYellowGreenDefinition(tls_id)[0].getPhases()]
@@ -136,7 +135,7 @@ class AdaptivePhaseController:
     def log_phase_adjustment(self, action_type, phase, old_duration, new_duration):
         print(f"[LOG] {action_type} phase {phase}: {old_duration} -> {new_duration}")    
     def subscribe_lanes(self):
-        for lid in self.lane_ids:
+        for lid in self.lane_id_list:
             traci.lane.subscribe(lid, [
                 traci.constants.LAST_STEP_VEHICLE_NUMBER,
                 traci.constants.LAST_STEP_MEAN_SPEED,
@@ -149,6 +148,7 @@ class AdaptivePhaseController:
                 traci.vehicle.subscribe(vid, [traci.constants.VAR_VEHICLECLASS])
             except traci.TraCIException:
                 pass
+
     def get_vehicle_classes(self, vehicle_ids):
         classes = {}
         for vid in vehicle_ids:
@@ -160,10 +160,10 @@ class AdaptivePhaseController:
                     classes[vid] = traci.vehicle.getVehicleClass(vid)
                 except traci.TraCIException:
                     classes[vid] = None
-        return classes    
+        return classes   
     def detect_turning_lanes(self):
         left, right = set(), set()
-        for lid in self.lane_ids:
+        for lid in self.lane_id_list:
             for c in traci.lane.getLinks(lid):
                 idx = 6 if len(c) > 6 else 3 if len(c) > 3 else None
                 if idx and c[idx] == 'l':
@@ -173,7 +173,6 @@ class AdaptivePhaseController:
         return left, right    
     def _save_apc_state_supabase(self):
         self._pending_db_ops.append(self.apc_state.copy())
-
     def _load_apc_state_supabase(self):
         response = supabase.table("apc_states").select("data").eq("tls_id", self.tls_id).eq("state_type", "full").execute()
         if response.data and len(response.data) > 0:
@@ -498,7 +497,6 @@ class AdaptivePhaseController:
             if not lanes:
                 return
             for lane in lanes:
-                # Defensive: check if lane controlled
                 if lane in controlled_lanes:
                     idx = controlled_lanes.index(lane)
                     state[idx] = state_char
@@ -1702,7 +1700,7 @@ class UniversalSmartTrafficController:
 
     def detect_turning_lanes(self):
         left, right = set(), set()
-        for lid in traci.lane.getIDList():
+        for lid in self.lane_id_list:
             for c in traci.lane.getLinks(lid):
                 idx = 6 if len(c) > 6 else 3 if len(c) > 3 else None
                 if idx and c[idx] == 'l':
