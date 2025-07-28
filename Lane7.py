@@ -7,10 +7,12 @@ from traci._trafficlight import Logic, Phase
 from supabase import create_client
 import os, json, datetime
 import threading
+from collections import deque
 
 
 
 SUPABASE_URL = "https://zckiwulodojgcfwyjrcx.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -2818,11 +2820,7 @@ def main():
                         help='Controller mode: train (explore+learn), eval (exploit only), adaptive (exploit+learn)')
     parser.add_argument('--api', action='store_true', help='Start API server instead of simulation')
     args = parser.parse_args()
-    if args.api:
-        print("Starting API server...")
-        controller = None
-        app.run(port=5000, debug=True)
-        return
+
     start_universal_simulation(args.sumo, args.gui, args.max_steps, args.episodes, args.num_retries, args.retry_delay, mode=args.mode)
 
 def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episodes=1, num_retries=1, retry_delay=1, mode="train"):
