@@ -92,7 +92,6 @@ class AdaptivePhaseController:
         self.last_served_time = defaultdict(lambda: 0)
         self.severe_congestion_global_cooldown_time = 10  # Patch: shorter cooldown
 
-
         self._links_map = {lid: traci.lane.getLinks(lid) for lid in lane_ids}
         self._controlled_lanes = traci.trafficlight.getControlledLanes(tls_id)
         self._phase_defs = [phase for phase in traci.trafficlight.getCompleteRedYellowGreenDefinition(tls_id)[0].getPhases()]
@@ -112,7 +111,6 @@ class AdaptivePhaseController:
         self.protected_left_cooldown = defaultdict(float)
         self.severe_congestion_cooldown = {}
         self.severe_congestion_global_cooldown = 0
-        self.severe_congestion_global_cooldown_time = 30
         self.last_phase_idx = None
 
         self.apc_state = {"events": [], "phases": []}
@@ -563,7 +561,7 @@ class AdaptivePhaseController:
     def check_special_events(self):
         """Detect special conditions with improved prioritization"""
         now = traci.simulation.getTime()
-        if hasattr(self, "_last_special_check") and now - self._last_special_check < 5:
+        if hasattr(self, "_last_special_check") and now - self._last_special_check < 2:
             return None, None
         self._last_special_check = now
         next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
@@ -576,7 +574,6 @@ class AdaptivePhaseController:
                     if 'emergency' in v_type or 'priority' in v_type:
                         if now - self.emergency_cooldown.get(lane_id, 0) < self.min_green:
                             continue
-                            
                         print(f"\n[EMERGENCY] {v_type} on {lane_id}")
                         self._log_apc_event({
                             "action": "emergency_vehicle",
@@ -605,7 +602,9 @@ class AdaptivePhaseController:
 
         if congested_lanes:
             lane_id, queue = max(congested_lanes, key=lambda x: x[1])
-            # ... [existing congestion handling] ...
+            # PATCH: Set cooldowns to prevent immediate re-trigger
+            self.severe_congestion_cooldown[lane_id] = now
+            self.severe_congestion_global_cooldown = now
             return 'severe_congestion', lane_id
 
         return None, None
@@ -1303,6 +1302,7 @@ class AdaptivePhaseController:
         next_duration = np.clip(base + delta_t, self.min_green, self.max_green)
         self.set_phase_from_pkl(next_phase, requested_duration=next_duration)
         self.last_served_time[next_phase] = now
+
 class EnhancedQLearningAgent:
     def __init__(self, state_size, action_size, adaptive_controller, learning_rate=0.1, discount_factor=0.95, 
                  epsilon=0.1, epsilon_decay=0.995, min_epsilon=0.01, 
