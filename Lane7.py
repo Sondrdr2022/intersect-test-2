@@ -88,6 +88,10 @@ class AdaptivePhaseController:
         self.r_adjust = r_adjust
         self.severe_congestion_threshold = severe_congestion_threshold
         self.large_delta_t = large_delta_t
+        self.phase_repeat_counter = defaultdict(int)
+        self.last_served_time = defaultdict(lambda: 0)
+        self.severe_congestion_global_cooldown_time = 10  # Patch: shorter cooldown
+
 
         self._links_map = {lid: traci.lane.getLinks(lid) for lid in lane_ids}
         self._controlled_lanes = traci.trafficlight.getControlledLanes(tls_id)
@@ -1226,7 +1230,32 @@ class AdaptivePhaseController:
             return traci.trafficlight.getPhaseDuration(self.tls_id)
     def control_step(self):
         self.phase_count += 1
-        current_time = traci.simulation.getTime()
+        now = traci.simulation.getTime()
+
+        # --- PATCH: Handle severe congestion as top priority ---
+        event_type, congested_lane = self.check_special_events()
+        if event_type == 'severe_congestion':
+            # Serve the congested lane immediately
+            self.reorganize_or_create_phase(congested_lane, event_type)
+            # Mark that we just served it
+            current_phase = traci.trafficlight.getPhase(self.tls_id)
+            self.last_served_time[current_phase] = now
+            return
+        # --------------------------------------------------------
+
+        # (Optional) Starvation protection for low-queue phases
+        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+        num_phases = len(logic.getPhases())
+        for idx in range(num_phases):
+            # Only consider phases with almost no queue
+            q, _, _, _ = self.get_lane_stats(self.lane_ids[idx])
+            if q < 1 and now - self.last_served_time[idx] > 60:
+                self.set_phase_from_pkl(idx, requested_duration=self.min_green)
+                self.last_served_time[idx] = now
+                return
+
+        # --- Existing starvation protection, RL selection, etc ---
+        current_time = now
         elapsed = current_time - self.last_phase_switch_sim_time
         min_green_elapsed = elapsed >= self.min_green
 
@@ -1238,7 +1267,6 @@ class AdaptivePhaseController:
                 self.reorganize_or_create_phase(event_lane, event_type)
                 return
 
-        now = traci.simulation.getTime()
         next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
         time_left = max(0, next_switch - now)
         if time_left > 0.1:
@@ -1269,12 +1297,12 @@ class AdaptivePhaseController:
         # PATCH: Always use base_duration + delta_t!
         phase_record = self.load_phase_from_supabase(next_phase)
         if phase_record:
-            # Prefer truly immutable base_duration if present, else fallback to duration, else min_green
             base = phase_record.get("base_duration", phase_record.get("duration", self.min_green))
         else:
             base = self.min_green
         next_duration = np.clip(base + delta_t, self.min_green, self.max_green)
         self.set_phase_from_pkl(next_phase, requested_duration=next_duration)
+        self.last_served_time[next_phase] = now
 class EnhancedQLearningAgent:
     def __init__(self, state_size, action_size, adaptive_controller, learning_rate=0.1, discount_factor=0.95, 
                  epsilon=0.1, epsilon_decay=0.995, min_epsilon=0.01, 
