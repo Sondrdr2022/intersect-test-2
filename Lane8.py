@@ -1,24 +1,17 @@
-from collections import defaultdict
+from collections import defaultdict, deque
 import os, sys, traci, threading, warnings, time, argparse, traceback, pickle, datetime, logging
 import numpy as np
 warnings.filterwarnings('ignore')
 from traffic_light_display import TrafficLightPhaseDisplay
 from traci._trafficlight import Logic, Phase
+import json
+
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-import os, json, datetime
-import threading
-from collections import deque
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("controller")
-
-# Initialize Firebase Admin SDK
-if not firebase_admin._apps:
-    cred = credentials.Certificate('firebase-key.json')  # update path if needed
-    firebase_admin.initialize_app(cred)
+# Path to your service account key file
+cred = credentials.Certificate('tl-controller-firebase-adminsdk-fbsvc-9d1c41a9ff.json')
+firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 os.environ.setdefault('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
@@ -26,8 +19,12 @@ tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
 if tools not in sys.path:
     sys.path.append(tools)
 
+# Logger setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("controller")
+
 def override_sumo_program_from_firestore(apc, current_phase_idx=None):
-    phase_seq = apc.get_full_phase_sequence()  # If this now reads from Firestore, good
+    phase_seq = apc.get_full_phase_sequence()
     if not phase_seq:
         logger.warning(f"No Firestore phase sequence for {apc.tls_id}, skipping override.")
         return
@@ -43,11 +40,10 @@ def override_sumo_program_from_firestore(apc, current_phase_idx=None):
     traci.trafficlight.setCompleteRedYellowGreenDefinition(apc.tls_id, new_logic)
     logger.info(f"Overrode SUMO program for {apc.tls_id} with {len(phases)} Firestore phases.")
 
-
 def override_all_tls_with_firestore(controller, current_phase_idx=None):
     logger.info("Overriding all TLS logic from Firestore records...")
     for tl_id, apc in getattr(controller, 'adaptive_phase_controllers', {}).items():
-        phase_seq = apc.get_full_phase_sequence()  # Should now read from Firestore
+        phase_seq = apc.get_full_phase_sequence()
         if not phase_seq:
             logger.warning(f"No Firestore phase sequence for {tl_id}, skipping override.")
             continue
@@ -63,7 +59,6 @@ def override_all_tls_with_firestore(controller, current_phase_idx=None):
         traci.trafficlight.setCompleteRedYellowGreenDefinition(tl_id, logic)
         logger.info(f"Set Firestore logic for {tl_id} ({len(traci_phases)} phases)")
 
-
 class AsyncFirestoreWriter(threading.Thread):
     def __init__(self, apc, interval=2):
         super().__init__(daemon=True)
@@ -78,7 +73,6 @@ class AsyncFirestoreWriter(threading.Thread):
 
     def stop(self):
         self.running = False
-        
 class AdaptivePhaseController:
     def __init__(self, lane_ids, tls_id, alpha=1.0, min_green=30, max_green=80,
                  r_base=0.5, r_adjust=0.1, severe_congestion_threshold=0.8,
@@ -94,7 +88,7 @@ class AdaptivePhaseController:
         self.large_delta_t = large_delta_t
         self.phase_repeat_counter = defaultdict(int)
         self.last_served_time = defaultdict(lambda: 0)
-        self.severe_congestion_global_cooldown_time = 10  # Patch: shorter cooldown
+        self.severe_congestion_global_cooldown_time = 10
 
         self._links_map = {lid: traci.lane.getLinks(lid) for lid in lane_ids}
         self._controlled_lanes = traci.trafficlight.getControlledLanes(tls_id)
@@ -124,21 +118,21 @@ class AdaptivePhaseController:
         self._load_apc_state_firestore()
         self.preload_phases_from_sumo()
 
-
     def flush_pending_firestore_writes(self):
         if self._pending_db_ops:
             state_json = json.dumps(self._pending_db_ops[-1])
             try:
-                doc_ref = db.collection("apc_states").document(self.tls_id)
-                doc_ref.set({
+                doc_id = f"{self.tls_id}_full"
+                db.collection("apc_states").document(doc_id).set({
                     "tls_id": self.tls_id,
                     "state_type": "full",
                     "data": state_json,
                     "updated_at": datetime.datetime.now().isoformat()
-                })
+                }, merge=True)
                 self._pending_db_ops.clear()
             except Exception as e:
                 print(f"[Firestore] Write failed: {e}")
+
     def log_phase_adjustment(self, action_type, phase, old_duration, new_duration):
         print(f"[LOG] {action_type} phase {phase}: {old_duration} -> {new_duration}")    
     def subscribe_lanes(self):
@@ -183,20 +177,16 @@ class AdaptivePhaseController:
         self._pending_db_ops.append(self.apc_state.copy())
 
     def _load_apc_state_firestore(self):
-        try:
-            doc_ref = db.collection("apc_states").document(self.tls_id)
-            doc = doc_ref.get()
-            if doc.exists:
-                data = doc.to_dict()
-                self.apc_state = json.loads(data.get("data", "{}"))
-            else:
-                self.apc_state = {"events": [], "phases": []}
-        except Exception as e:
-            print(f"[Firestore] Load failed: {e}")
+        doc_id = f"{self.tls_id}_full"
+        doc = db.collection("apc_states").document(doc_id).get()
+        if doc.exists:
+            data = doc.to_dict()
+            self.apc_state = json.loads(data["data"])
+        else:
             self.apc_state = {"events": [], "phases": []}
 
     def save_phase_to_firestore(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty,
-                               reward=None, bonus=None, weights=None, event_type=None, lanes=None):
+                            reward=None, bonus=None, weights=None, event_type=None, lanes=None):
         entry = {
             "phase_idx": phase_idx,
             "duration": duration,
@@ -251,13 +241,13 @@ class AdaptivePhaseController:
                 base_duration = self.min_green
                 for idx, phase in enumerate(logic.getPhases()):
                     if phase.state == protected_state:
-                        phase_record = self.load_phase_from_db(idx) if hasattr(self, "load_phase_from_db") else None
+                        phase_record = self.load_phase_from_supabase(idx) if hasattr(self, "load_phase_from_supabase") else None
                         base_duration = phase_record["duration"] if phase_record and "duration" in phase_record else phase.duration
                         phase_idx = idx
                         break
                 duration = np.clip(base_duration + delta_t, self.min_green, self.max_green)
                 if phase_idx is not None:
-                    self.save_phase_to_db(phase_idx, duration, protected_state, delta_t, delta_t, penalty=0)
+                    self.save_phase_to_supabase(phase_idx, duration, protected_state, delta_t, delta_t, penalty=0)
                     if hasattr(self, "update_display"):
                         self.update_display(phase_idx, duration)
                     return phase_idx
@@ -271,7 +261,7 @@ class AdaptivePhaseController:
                 )
                 traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
                 traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
-                self.save_phase_to_db(len(phases) - 1, duration, protected_state, delta_t, delta_t, penalty=0)
+                self.save_phase_to_supabase(len(phases) - 1, duration, protected_state, delta_t, delta_t, penalty=0)
                 if hasattr(self, "update_display"):
                     self.update_display(len(phases) - 1, duration)
                 print(f"[PATCH][PROT LEFT] Created protected left phase for {lane} (idx {len(phases) - 1})")
@@ -282,13 +272,13 @@ class AdaptivePhaseController:
         base_duration = self.min_green
         for idx, phase in enumerate(logic.getPhases()):
             if phase.state == new_state:
-                phase_record = self.load_phase_from_db(idx) if hasattr(self, "load_phase_from_db") else None
+                phase_record = self.load_phase_from_supabase(idx) if hasattr(self, "load_phase_from_supabase") else None
                 base_duration = phase_record["duration"] if phase_record and "duration" in phase_record else phase.duration
                 phase_idx = idx
                 break
         duration = np.clip(base_duration + delta_t, self.min_green, self.max_green)
         if phase_idx is not None:
-            self.save_phase_to_db(phase_idx, duration, new_state, delta_t, delta_t, penalty=0)
+            self.save_phase_to_supabase(phase_idx, duration, new_state, delta_t, delta_t, penalty=0)
             if hasattr(self, "update_display"):
                 self.update_display(phase_idx, duration)
             return phase_idx
@@ -304,7 +294,7 @@ class AdaptivePhaseController:
         print(f"[DEBUG] setCompleteRedYellowGreenDefinition called for {self.tls_id} with {len(phases)} phases")
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
         print(f"[DEBUG] setPhase called for {self.tls_id} to phase {len(phases) - 1}")
-        self.save_phase_to_db(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
+        self.save_phase_to_supabase(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
         if hasattr(self, "update_display"):
             self.update_display(len(phases) - 1, duration)
         try:
@@ -470,7 +460,7 @@ class AdaptivePhaseController:
 
             # PATCH: Check if this phase was RL-created
             phase_was_rl_created = False
-            phase_pkl = self.load_phase_from_db(new_phase_idx)
+            phase_pkl = self.load_phase_from_supabase(new_phase_idx)
             if phase_pkl and phase_pkl.get("rl_created"):
                 phase_was_rl_created = True
 
@@ -936,9 +926,9 @@ class AdaptivePhaseController:
             "tls_id": self.tls_id
         })
 
-    def set_phase_from_db(self, phase_idx, requested_duration=None):
-        print(f"[DB]/[Supabase][SET] set_phase_from_db({phase_idx}, requested_duration={requested_duration}) called")
-        phase_record = self.load_phase_from_db(phase_idx)
+    def set_phase_from_pkl(self, phase_idx, requested_duration=None):
+        print(f"[DB]/[Supabase][SET] set_phase_from_pkl({phase_idx}, requested_duration={requested_duration}) called")
+        phase_record = self.load_phase_from_supabase(phase_idx)
         if phase_record:
             duration = requested_duration if requested_duration is not None else phase_record["duration"]
             extended_time = duration - phase_record.get("duration", duration) if requested_duration is not None else 0
@@ -955,7 +945,7 @@ class AdaptivePhaseController:
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
             phases = logic.getPhases()
             if 0 <= phase_idx < len(phases):
-                self.save_phase_to_db(
+                self.save_phase_to_supabase(
                     phase_idx=phase_idx,
                     duration=phases[phase_idx].duration,
                     state_str=phases[phase_idx].state,
@@ -964,7 +954,7 @@ class AdaptivePhaseController:
                     penalty=0
                 )
                 print(f"[DB]/[Supabase][AUTO-SAVE] Saved missing SUMO phase {phase_idx} to Supabase.")
-                return self.set_phase_from_db(phase_idx, requested_duration=phases[phase_idx].duration)
+                return self.set_phase_from_pkl(phase_idx, requested_duration=phases[phase_idx].duration)
             if 0 <= phase_idx < len(phases):
                 target_state = phases[phase_idx].state
                 for p in self.apc_state.get("phases", []):
@@ -980,7 +970,7 @@ class AdaptivePhaseController:
                 fallback_idx = phase_idx if 0 <= phase_idx < len(phases) else 0
                 fallback_state = phases[fallback_idx].state
                 fallback_duration = self.max_green
-                self.save_phase_to_db(
+                self.save_phase_to_supabase(
                     phase_idx=phase_idx,
                     duration=fallback_duration,
                     state_str=fallback_state,
@@ -1202,7 +1192,7 @@ class AdaptivePhaseController:
                 return traci.trafficlight.getPhaseDuration(self.tls_id)
             current_phase = traci.trafficlight.getPhase(self.tls_id)
             # PATCH: Use base duration from DB if available, not just current duration
-            phase_record = self.load_phase_from_db(current_phase) if hasattr(self, "load_phase_from_db") else None
+            phase_record = self.load_phase_from_supabase(current_phase) if hasattr(self, "load_phase_from_supabase") else None
             if phase_record and "duration" in phase_record:
                 base_duration = phase_record["duration"]
             else:
@@ -1261,7 +1251,7 @@ class AdaptivePhaseController:
             # Only consider phases with almost no queue
             q, _, _, _ = self.get_lane_stats(self.lane_ids[idx])
             if q < 1 and now - self.last_served_time[idx] > 60:
-                self.set_phase_from_db(idx, requested_duration=self.min_green)
+                self.set_phase_from_pkl(idx, requested_duration=self.min_green)
                 self.last_served_time[idx] = now
                 return
 
@@ -1306,19 +1296,20 @@ class AdaptivePhaseController:
         delta_t = self.calculate_delta_t(R)
 
         # PATCH: Always use base_duration + delta_t!
-        phase_record = self.load_phase_from_db(next_phase)
+        phase_record = self.load_phase_from_supabase(next_phase)
         if phase_record:
             base = phase_record.get("base_duration", phase_record.get("duration", self.min_green))
         else:
             base = self.min_green
         next_duration = np.clip(base + delta_t, self.min_green, self.max_green)
-        self.set_phase_from_db(next_phase, requested_duration=next_duration)
+        self.set_phase_from_pkl(next_phase, requested_duration=next_duration)
         self.last_served_time[next_phase] = now
 
 class EnhancedQLearningAgent:
     def __init__(self, state_size, action_size, adaptive_controller, learning_rate=0.1, discount_factor=0.95, 
                  epsilon=0.1, epsilon_decay=0.995, min_epsilon=0.01, 
-                 q_table_file="enhanced_q_table.pkl", mode="train", adaptive_params=None):
+                 q_table_file="enhanced_q_table.pkl", mode="train", adaptive_params=None,
+                 firebase_collection="qlearning_agents", firebase_doc_id="agent1"):
         self.state_size, self.action_size = state_size, action_size
         self.learning_rate, self.discount_factor = learning_rate, discount_factor
         self.epsilon, self.epsilon_decay, self.min_epsilon = epsilon, epsilon_decay, min_epsilon
@@ -1326,6 +1317,8 @@ class EnhancedQLearningAgent:
         self.q_table_file, self._loaded_training_count = q_table_file, 0
         self.reward_history = []
         self.mode = mode
+        self.firebase_collection = firebase_collection
+        self.firebase_doc_id = firebase_doc_id
         
         self.adaptive_params = adaptive_params or {
             'min_green': 30, 'max_green': 80, 'starvation_threshold': 40, 'reward_scale': 40,
@@ -1336,6 +1329,7 @@ class EnhancedQLearningAgent:
         if mode == "eval": self.epsilon = 0.0
         elif mode == "adaptive": self.epsilon = 0.01
         print(f"AGENT INIT: mode={self.mode}, epsilon={self.epsilon}")
+
     def is_valid_state(self, state):
         arr = np.array(state)
         return (
@@ -1354,7 +1348,6 @@ class EnhancedQLearningAgent:
         qs = self.q_table[key][:action_size]
         
         if self.mode == "train" and np.random.rand() < self.epsilon:
-            # Congestion-biased exploration
             if hasattr(state, 'queues'):
                 congestion_scores = np.array([q + w*0.5 for q, w in zip(state.queues, state.waits)])
                 if congestion_scores.sum() > 0:
@@ -1362,7 +1355,7 @@ class EnhancedQLearningAgent:
                     return np.random.choice(range(action_size), p=congestion_scores)
             return np.random.randint(action_size)
         return np.argmax(qs)
-        pass
+
 
     def switch_or_extend_phase(self, state, green_lanes, force_protected_left=False):
         print(f"[DEBUG][RL Agent] switch_or_extend_phase called with state={state}, green_lanes={green_lanes}, force_protected_left={force_protected_left}")
@@ -1384,55 +1377,43 @@ class EnhancedQLearningAgent:
             "penalty": penalty,
             "state": str(state),
         })
-        print(f"[DEBUG][RL Agent] Will now set phase from DB: phase_idx={phase_idx}")
-        self.adaptive_controller.set_phase_from_db(phase_idx)
-        phase_record = self.adaptive_controller.load_phase_from_db(phase_idx)
+        print(f"[DEBUG][RL Agent] Will now set phase from PKL: phase_idx={phase_idx}")
+        self.adaptive_controller.set_phase_from_pkl(phase_idx)
+        phase_record = self.adaptive_controller.load_phase_from_supabase(phase_idx)
         if phase_record:
             traci.trafficlight.setPhase(self.adaptive_controller.tls_id, phase_record["phase_idx"])
             traci.trafficlight.setPhaseDuration(self.adaptive_controller.tls_id, phase_record["duration"])
             self.adaptive_controller.update_display(phase_record["phase_idx"], phase_record["duration"])
-            print(f"[APC-RL] RL agent set phase {phase_record['phase_idx']} duration={phase_record['duration']} (from DB)")
+            print(f"[APC-RL] RL agent set phase {phase_record['phase_idx']} duration={phase_record['duration']} (from PKL)")
         else:
-            print(f"[APC-RL] No DB record for RL agent phase {phase_idx}, fallback to default.")
+            print(f"[APC-RL] No PKL record for RL agent phase {phase_idx}, fallback to default.")
             traci.trafficlight.setPhase(self.adaptive_controller.tls_id, phase_idx)
             traci.trafficlight.setPhaseDuration(self.adaptive_controller.tls_id, self.adaptive_controller.max_green)
             self.adaptive_controller.update_display(phase_idx, self.adaptive_controller.max_green)
         return phase_idx
-    
+
     def switch_to_best_phase(self, state, lane_data, left_turn_lanes=None):
-        """
-        New method: RL agent picks best phase (possibly protected left) based on state and lane_data.
-        Prioritizes blocked/queued left-turns (as protected left), else chooses the lane with largest queue.
-        """
-        # 1. Prioritize protected left turn if severely blocked
         if left_turn_lanes:
             for left_lane in left_turn_lanes:
-                # Consider "blocked" if queue is high and (optionally) all vehicles stopped
                 queue = lane_data[left_lane]['queue_length']
                 vehicles = lane_data[left_lane]['vehicle_ids']
                 speeds = [traci.vehicle.getSpeed(vid) for vid in vehicles] if vehicles else []
-                # Threshold: queue >= 2 and all speeds low
                 if queue >= 2 and (not speeds or max(speeds) < 0.2):
                     print(f"[RL] Detected blocked left {left_lane}, requesting protected left phase.")
                     return self.switch_or_extend_phase(state, [left_lane], force_protected_left=True)
-
-        # 2. Otherwise: select the lane with highest queue for green
         max_q = -1
         best_lane = None
         for lane, data in lane_data.items():
             if data.get('queue_length', 0) > max_q:
                 max_q = data['queue_length']
                 best_lane = lane
-
         if best_lane is not None:
             print(f"[RL] Selecting lane {best_lane} with queue {max_q} for green phase.")
             return self.switch_or_extend_phase(state, [best_lane])
-
-        # 3. Fallback: use all lanes (should not usually happen)
         print("[RL] No valid lane found, defaulting to all green.")
         all_lanes = list(lane_data.keys())
         return self.switch_or_extend_phase(state, all_lanes)
-    
+
     def update_display(self, phase_idx, new_duration):
         now = traci.simulation.getTime()
         next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
@@ -1468,7 +1449,7 @@ class EnhancedQLearningAgent:
                 )
                 traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
                 traci.trafficlight.setPhase(self.tls_id, idx)
-                self.save_phase_to_db(idx, new_duration, protected_state, delta_t, delta_t, penalty=0)
+                self.save_phase_to_supabase(idx, new_duration, protected_state, delta_t, delta_t, penalty=0)
                 self._log_apc_event({
                     "action": "extend_protected_left_phase",
                     "tls_id": self.tls_id,
@@ -1490,7 +1471,7 @@ class EnhancedQLearningAgent:
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 2)
-        self.save_phase_to_db(len(phases) - 2, self.max_green, protected_state, delta_t, delta_t, penalty=0)
+        self.save_phase_to_supabase(len(phases) - 2, self.max_green, protected_state, delta_t, delta_t, penalty=0)
         self._log_apc_event({
             "action": "create_protected_left_phase",
             "tls_id": self.tls_id,
@@ -1551,51 +1532,21 @@ class EnhancedQLearningAgent:
             3: "Shorten Phase", 4: "Balanced Phase"
         }.get(action, f"Unknown Action {action}")
 
-    def load_model(self, filepath=None):
-        filepath = filepath or self.q_table_file
-        print(f"Attempting to load Q-table from: {filepath}\nAbsolute path: {os.path.abspath(filepath)}\nFile exists? {os.path.exists(filepath)}")
+    def save_model_to_firebase(self, adaptive_params=None):
+        """
+        Save the Q-table and metadata to Firestore.
+        """
         try:
-            if os.path.exists(filepath):
-                with open(filepath, 'rb') as f:
-                    data = pickle.load(f)
-                self.q_table = {k: np.array(v) for k, v in data.get('q_table', {}).items()}
-                self._loaded_training_count = len(data.get('training_data', []))
-                params = data.get('params', {})
-                self.learning_rate = params.get('learning_rate', self.learning_rate)
-                self.discount_factor = params.get('discount_factor', self.discount_factor)
-                adaptive_params = data.get('adaptive_params', {})
-                print(f"After model load, epsilon={self.epsilon}")
-                print(f"Loaded Q-table with {len(self.q_table)} states from {filepath}")
-                if adaptive_params: print("📋 Loaded adaptive parameters from previous run")
-                return True, adaptive_params
-            print("No existing Q-table, starting fresh")
-            return False, {}
-        except Exception as e:
-            print(f"Error loading model: {e}\nNo existing Q-table, starting fresh")
-            return False, {}
-
-
-    def save_model(self, filepath=None, adaptive_params=None):
-        filepath = filepath or self.q_table_file
-        try:
-            if os.path.exists(filepath):
-                backup = f"{filepath}.bak_{datetime.datetime.now():%Y%m%d_%H%M%S}"
-                for _ in range(3):
-                    try:
-                        os.rename(filepath, backup)
-                        break
-                    except Exception as e:
-                        print(f"Retrying backup: {e}")
-                        time.sleep(0.5)
             meta = {
                 'last_updated': datetime.datetime.now().isoformat(),
                 'training_count': len(self.training_data),
-                'average_reward': np.mean([x.get('reward', 0) for x in self.training_data[-100:]]) if self.training_data else 0,
+                'average_reward': float(np.mean([x.get('reward', 0) for x in self.training_data[-100:]])) if self.training_data else 0,
                 'reward_components': [x.get('reward_components', {}) for x in self.training_data[-100:]]
             }
-            params = {k: getattr(self, k) for k in ['state_size','action_size','learning_rate','discount_factor','epsilon','epsilon_decay','min_epsilon']}
+            params = {k: getattr(self, k) for k in ['state_size', 'action_size', 'learning_rate', 'discount_factor', 'epsilon', 'epsilon_decay', 'min_epsilon']}
+            # Firestore does not like numpy arrays, so convert to lists
             model_data = {
-                'q_table': {k: v.tolist() for k, v in self.q_table.items()},
+                'q_table': {str(k): v.tolist() for k, v in self.q_table.items()},
                 'training_data': self.training_data,
                 'params': params,
                 'metadata': meta
@@ -1603,12 +1554,41 @@ class EnhancedQLearningAgent:
             if adaptive_params:
                 model_data['adaptive_params'] = adaptive_params.copy()
                 print(f"Saving adaptive parameters: {adaptive_params}")
-            with open(filepath, 'wb') as f:
-                pickle.dump(model_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"✅ Model saved with {len(self.training_data)} training entries")
+            db.collection(self.firebase_collection).document(self.firebase_doc_id).set(model_data, merge=True)
+            print(f"✅ Model saved to Firebase with {len(self.training_data)} training entries")
             self.training_data = []
         except Exception as e:
-            print(f"Error saving model: {e}")
+            print(f"[Firebase] Error saving model: {e}")
+
+    def load_model_from_firebase(self):
+        """
+        Load the Q-table and metadata from Firestore.
+        """
+        try:
+            doc = db.collection(self.firebase_collection).document(self.firebase_doc_id).get()
+            if doc.exists:
+                data = doc.to_dict()
+                self.q_table = {eval(k): np.array(v) for k, v in data.get('q_table', {}).items()}
+                self._loaded_training_count = len(data.get('training_data', []))
+                params = data.get('params', {})
+                self.learning_rate = params.get('learning_rate', self.learning_rate)
+                self.discount_factor = params.get('discount_factor', self.discount_factor)
+                adaptive_params = data.get('adaptive_params', {})
+                print(f"[Firebase] Loaded Q-table from Firestore: {self.firebase_doc_id}, states: {len(self.q_table)}")
+                if adaptive_params: print("📋 Loaded adaptive parameters from previous run")
+                return True, adaptive_params
+            print("[Firebase] No existing Q-table in Firestore, starting fresh")
+            return False, {}
+        except Exception as e:
+            print(f"[Firebase] Error loading model: {e}")
+            return False, {}
+
+    # Alias for compatibility
+    def save_model(self, filepath=None, adaptive_params=None):
+        self.save_model_to_firebase(adaptive_params=adaptive_params)
+
+    def load_model(self, filepath=None):
+        return self.load_model_from_firebase()
 
 class UniversalSmartTrafficController:
     DILEMMA_ZONE_THRESHOLD = 12.0  # meters
@@ -1885,7 +1865,7 @@ class UniversalSmartTrafficController:
                 return False
 
             # PATCH: Use phase record from APC PKL to set SUMO phase/duration
-            phase_record = apc.load_phase_from_db(phase_idx)
+            phase_record = apc.load_phase_from_supabase(phase_idx)
             if phase_record:
                 traci.trafficlight.setPhase(apc.tls_id, phase_record["phase_idx"])
                 traci.trafficlight.setPhaseDuration(apc.tls_id, phase_record["duration"])
@@ -2087,14 +2067,14 @@ class UniversalSmartTrafficController:
                         pending_phase = 0
                     if current_time - set_time >= phase_duration - 0.1:
                         # PATCH: Use APC PKL for all phase switches
-                        apc.set_phase_from_db(pending_phase)
+                        apc.set_phase_from_pkl(pending_phase)
                         self.last_phase_change[tl_id] = current_time
                         del self.pending_next_phase[tl_id]
                         logic = self._get_traffic_light_logic(tl_id)
                         n_phases = len(logic.phases) if logic else 0
                         current_phase = traci.trafficlight.getPhase(tl_id)
                         if n_phases == 0 or current_phase >= n_phases or current_phase < 0:
-                            apc.set_phase_from_db(max(0, n_phases - 1))
+                            apc.set_phase_from_pkl(max(0, n_phases - 1))
                     continue
 
                 # Priority handling
@@ -2125,10 +2105,10 @@ class UniversalSmartTrafficController:
                         n_phases = len(logic.phases) if logic else 1
                         current_phase = traci.trafficlight.getPhase(tl_id)
                         if current_phase >= n_phases:
-                            apc.set_phase_from_db(n_phases - 1)
+                            apc.set_phase_from_pkl(n_phases - 1)
                         # PATCH: Always set via APC PKL, not direct setPhase/setPhaseDuration
                         if not switched:
-                            apc.set_phase_from_db(starved_phase)
+                            apc.set_phase_from_pkl(starved_phase)
                             self.last_phase_change[tl_id] = current_time
                     self.last_green_time[self.lane_id_to_idx[most_starved_lane]] = current_time
                     self.debug_green_lanes(tl_id, lane_data)
@@ -2162,7 +2142,7 @@ class UniversalSmartTrafficController:
                         tl_id, current_phase, action, logic, controlled_lanes, lane_data, current_time)
                     # PATCH: Always use APC PKL for all RL phase changes!
                     if not switched:
-                        apc.set_phase_from_db(action)
+                        apc.set_phase_from_pkl(action)
                         self.last_phase_change[tl_id] = current_time
                         self._process_rl_learning(self.intersection_data, lane_data, current_time)
                 self.debug_green_lanes(tl_id, lane_data)
@@ -2489,7 +2469,7 @@ class UniversalSmartTrafficController:
             apc = self.adaptive_phase_controllers[tl_id]
             if current_phase != target_phase:
                 # Apply adaptive phase controller's PKL-driven phase record
-                phase_record = apc.load_phase_from_db(target_phase)
+                phase_record = apc.load_phase_from_supabase(target_phase)
                 if phase_record:
                     traci.trafficlight.setPhase(tl_id, phase_record["phase_idx"])
                     traci.trafficlight.setPhaseDuration(tl_id, phase_record["duration"])
