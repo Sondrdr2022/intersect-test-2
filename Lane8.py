@@ -1,10 +1,9 @@
-from collections import defaultdict, deque
-import os, sys, traci, threading, warnings, time, argparse, traceback, pickle, datetime, logging
+from collections import defaultdict,deque
+import os, sys, json, traci, threading, warnings, time, argparse, traceback, pickle, datetime, logging
 import numpy as np
 warnings.filterwarnings('ignore')
 from traffic_light_display import TrafficLightPhaseDisplay
 from traci._trafficlight import Logic, Phase
-import json
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -22,6 +21,13 @@ if tools not in sys.path:
 # Logger setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("controller")
+
+os.environ.setdefault('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
+tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
+if tools not in sys.path:
+    sys.path.append(tools)
+
+# --- PATCH: Replace Supabase DB calls with Firestore ----
 
 def override_sumo_program_from_firestore(apc, current_phase_idx=None):
     phase_seq = apc.get_full_phase_sequence()
@@ -122,8 +128,10 @@ class AdaptivePhaseController:
         if self._pending_db_ops:
             state_json = json.dumps(self._pending_db_ops[-1])
             try:
+                # PATCH: Firestore upsert (set with merge)
                 doc_id = f"{self.tls_id}_full"
-                db.collection("apc_states").document(doc_id).set({
+                doc_ref = db.collection("apc_states").document(doc_id)
+                doc_ref.set({
                     "tls_id": self.tls_id,
                     "state_type": "full",
                     "data": state_json,
@@ -177,14 +185,15 @@ class AdaptivePhaseController:
         self._pending_db_ops.append(self.apc_state.copy())
 
     def _load_apc_state_firestore(self):
+        # PATCH: Load from Firestore
         doc_id = f"{self.tls_id}_full"
-        doc = db.collection("apc_states").document(doc_id).get()
+        doc_ref = db.collection("apc_states").document(doc_id)
+        doc = doc_ref.get()
         if doc.exists:
-            data = doc.to_dict()
-            self.apc_state = json.loads(data["data"])
+            doc_data = doc.to_dict()
+            self.apc_state = json.loads(doc_data.get("data", "{}"))
         else:
             self.apc_state = {"events": [], "phases": []}
-
     def save_phase_to_firestore(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty,
                             reward=None, bonus=None, weights=None, event_type=None, lanes=None):
         entry = {
@@ -214,7 +223,6 @@ class AdaptivePhaseController:
         if not found:
             self.apc_state["phases"].append(entry)
         self._save_apc_state_firestore()
-
 
     def create_or_extend_phase(self, green_lanes, delta_t):
         print(f"[DEBUG] create_or_extend_phase called with green_lanes={green_lanes}, delta_t={delta_t}")
