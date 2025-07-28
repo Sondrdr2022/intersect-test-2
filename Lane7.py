@@ -743,7 +743,7 @@ class AdaptivePhaseController:
         if len(self.reward_history) < window:
             return
 
-        avg_R = np.mean(self.reward_history[-window:])
+        avg_R = np.mean(list(self.reward_history)[-window:])
         self.R_target = self.r_base + self.r_adjust * (avg_R - self.r_base)
         print(f"\n[TARGET UPDATE] R_target={self.R_target:.2f} (avg={avg_R:.2f})")
 
