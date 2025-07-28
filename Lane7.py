@@ -426,8 +426,7 @@ class AdaptivePhaseController:
             self.weights = values / total
 
         self.weight_history.append(self.weights.copy())
-        print(f"[ADAPTIVE WEIGHTS] {self.tls_id}: {self.weights}")    
-    
+        print(f"[ADAPTIVE WEIGHTS] {self.tls_id}: {self.weights}")        
     def log_phase_switch(self, new_phase_idx):
         current_time = traci.simulation.getTime()
         elapsed = current_time - self.last_phase_switch_sim_time
@@ -739,10 +738,8 @@ class AdaptivePhaseController:
         return np.clip(delta_t, -10, 10)
 
     def update_R_target(self, window=10):
-        """Update target reward based on historical performance"""
-        if len(self.reward_history) < window:
+        if len(self.reward_history) < window or self.phase_count % 10 != 0:
             return
-
         avg_R = np.mean(list(self.reward_history)[-window:])
         self.R_target = self.r_base + self.r_adjust * (avg_R - self.r_base)
         print(f"\n[TARGET UPDATE] R_target={self.R_target:.2f} (avg={avg_R:.2f})")
@@ -1715,25 +1712,51 @@ class UniversalSmartTrafficController:
         return left, right
 
     def initialize(self):
+        # Print phase info for each traffic light
         for tl_id in traci.trafficlight.getIDList():
             phases = traci.trafficlight.getAllProgramLogics(tl_id)[0].phases
             for i, phase in enumerate(phases):
                 print(f"  Phase {i}: {phase.state} (duration {getattr(phase, 'duration', '?')})")
 
+        # Main lane and traffic light setup
         self.lane_id_list = [lid for lid in traci.lane.getIDList() if not lid.startswith(":")]
         self.tl_action_sizes = {tl_id: len(traci.trafficlight.getAllProgramLogics(tl_id)[0].phases)
                                 for tl_id in traci.trafficlight.getIDList()}
-        for tls_id in traci.trafficlight.getIDList():
+        # Setup RL agent and AdaptivePhaseControllers
+        tls_list = traci.trafficlight.getIDList()
+        if tls_list:
+            # Create RL agent using the first intersection
+            tls_id = tls_list[0]
             lane_ids = traci.trafficlight.getControlledLanes(tls_id)
-            self.adaptive_phase_controllers[tls_id] = AdaptivePhaseController(
+            self.adaptive_phase_controller = AdaptivePhaseController(
                 lane_ids=lane_ids,
                 tls_id=tls_id,
                 alpha=1.0,
                 min_green=10,
                 max_green=60
             )
-            self.adaptive_phase_controllers[tls_id].rl_agent = self.rl_agent
+            self.rl_agent = EnhancedQLearningAgent(
+                state_size=12,
+                action_size=self.tl_action_sizes[tls_id],
+                adaptive_controller=self.adaptive_phase_controller,
+                mode=self.mode
+            )
+            self.adaptive_phase_controller.rl_agent = self.rl_agent
+        # Setup AdaptivePhaseController for each intersection
+        self.adaptive_phase_controllers = {}
+        for tls_id in tls_list:
+            lane_ids = traci.trafficlight.getControlledLanes(tls_id)
+            apc = AdaptivePhaseController(
+                lane_ids=lane_ids,
+                tls_id=tls_id,
+                alpha=1.0,
+                min_green=10,
+                max_green=60
+            )
+            apc.rl_agent = self.rl_agent
+            self.adaptive_phase_controllers[tls_id] = apc
 
+        # Lanes and topology setup
         self.lane_id_to_idx = {lid: i for i, lid in enumerate(self.lane_id_list)}
         self.idx_to_lane_id = dict(enumerate(self.lane_id_list))
         for lid in self.lane_id_list:
@@ -1741,52 +1764,7 @@ class UniversalSmartTrafficController:
         self.subscribe_lanes(self.lane_id_list)
         self.left_turn_lanes, self.right_turn_lanes = self.detect_turning_lanes()
         self.lane_lengths = {lid: traci.lane.getLength(lid) for lid in self.lane_id_list}
-        self.lane_edge_ids = {lid: traci.lane.getEdgeID(lid) for lid in self.lane_id_list}
-
-    # ... rest of methods unchanged from user code ...
-    def initialize(self):
-        for tl_id in traci.trafficlight.getIDList():
-            phases = traci.trafficlight.getAllProgramLogics(tl_id)[0].phases
-            for i, phase in enumerate(phases):
-                print(f"  Phase {i}: {phase.state} (duration {getattr(phase, 'duration', '?')})")
-
-        lane_ids = [lid for lid in traci.lane.getIDList() if not lid.startswith(":")]
-        tls_id = traci.trafficlight.getIDList()[0]
-
-        self.adaptive_phase_controller = AdaptivePhaseController(
-            lane_ids=lane_ids,
-            tls_id=tls_id,
-            alpha=1.0,
-            min_green=10,
-            max_green=60
-        )
-        self.rl_agent = EnhancedQLearningAgent(
-            state_size=12,
-            action_size=8,
-            adaptive_controller=self.adaptive_phase_controller,
-            mode=self.mode
-        )
-        self.lane_id_list = [lid for lid in traci.lane.getIDList() if not lid.startswith(":")]
-        self.tl_action_sizes = {tl_id: len(traci.trafficlight.getAllProgramLogics(tl_id)[0].phases)
-                                for tl_id in traci.trafficlight.getIDList()}
-        for tls_id in traci.trafficlight.getIDList():
-            lane_ids = traci.trafficlight.getControlledLanes(tls_id)
-            self.adaptive_phase_controllers[tls_id] = AdaptivePhaseController(
-                lane_ids=lane_ids,
-                tls_id=tls_id,
-                alpha=1.0,
-                min_green=10,
-                max_green=60
-            )
-        
-        self.lane_id_to_idx = {lid: i for i, lid in enumerate(self.lane_id_list)}
-        self.idx_to_lane_id = dict(enumerate(self.lane_id_list))
-        self.last_green_time = np.zeros(len(self.lane_id_list))
-        self.subscribe_lanes(self.lane_id_list)
-        self.left_turn_lanes, self.right_turn_lanes = self.detect_turning_lanes()
-        self.lane_lengths = {lid: traci.lane.getLength(lid) for lid in self.lane_id_list}
-        self.lane_edge_ids = {lid: traci.lane.getEdgeID(lid) for lid in self.lane_id_list}
-    
+        self.lane_edge_ids = {lid: traci.lane.getEdgeID(lid) for lid in self.lane_id_list}    
     def _init_left_turn_lanes(self):
         try:
             self.left_turn_lanes.clear()
@@ -2826,8 +2804,7 @@ def main():
 
 def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episodes=1, num_retries=1, retry_delay=1, mode="train"):
     global controller
-    controller = None  # <-- Add this line
-
+    controller = None  # PATCH: ensure controller is defined before thread
 
     # 1. Start the simulation in a background thread and initialize controller
     def simulation_loop():
@@ -2881,7 +2858,6 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
         time.sleep(0.1)
 
     # 3. Start the display window (only ONCE, with valid tls_id)
-# In your display launcher:
     display = TrafficLightPhaseDisplay(controller.phase_events, poll_interval=500)
     display.start()
 
