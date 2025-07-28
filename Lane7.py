@@ -243,7 +243,7 @@ class AdaptivePhaseController:
                         break
                 duration = np.clip(base_duration + delta_t, self.min_green, self.max_green)
                 if phase_idx is not None:
-                    self.save_phase_to_pkl(phase_idx, duration, protected_state, delta_t, delta_t, penalty=0)
+                    self.save_phase_to_supabase(phase_idx, duration, protected_state, delta_t, delta_t, penalty=0)
                     if hasattr(self, "update_display"):
                         self.update_display(phase_idx, duration)
                     return phase_idx
@@ -257,7 +257,7 @@ class AdaptivePhaseController:
                 )
                 traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
                 traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
-                self.save_phase_to_pkl(len(phases) - 1, duration, protected_state, delta_t, delta_t, penalty=0)
+                self.save_phase_to_supabase(len(phases) - 1, duration, protected_state, delta_t, delta_t, penalty=0)
                 if hasattr(self, "update_display"):
                     self.update_display(len(phases) - 1, duration)
                 print(f"[PATCH][PROT LEFT] Created protected left phase for {lane} (idx {len(phases) - 1})")
@@ -274,7 +274,7 @@ class AdaptivePhaseController:
                 break
         duration = np.clip(base_duration + delta_t, self.min_green, self.max_green)
         if phase_idx is not None:
-            self.save_phase_to_pkl(phase_idx, duration, new_state, delta_t, delta_t, penalty=0)
+            self.save_phase_to_supabase(phase_idx, duration, new_state, delta_t, delta_t, penalty=0)
             if hasattr(self, "update_display"):
                 self.update_display(phase_idx, duration)
             return phase_idx
@@ -290,7 +290,7 @@ class AdaptivePhaseController:
         print(f"[DEBUG] setCompleteRedYellowGreenDefinition called for {self.tls_id} with {len(phases)} phases")
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
         print(f"[DEBUG] setPhase called for {self.tls_id} to phase {len(phases) - 1}")
-        self.save_phase_to_pkl(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
+        self.save_phase_to_supabase(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
         if hasattr(self, "update_display"):
             self.update_display(len(phases) - 1, duration)
         try:
@@ -940,7 +940,7 @@ class AdaptivePhaseController:
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
             phases = logic.getPhases()
             if 0 <= phase_idx < len(phases):
-                self.save_phase_to_pkl(
+                self.save_phase_to_supabase(
                     phase_idx=phase_idx,
                     duration=phases[phase_idx].duration,
                     state_str=phases[phase_idx].state,
@@ -948,16 +948,13 @@ class AdaptivePhaseController:
                     raw_delta_t=0,
                     penalty=0
                 )
-                print(f"[DB]/[Supabase][AUTO-SAVE] Saved missing SUMO phase {phase_idx} to PKL.")
-                self.set_phase_from_pkl(phase_idx, requested_duration=phases[phase_idx].duration)
-                if hasattr(self, "update_display"):
-                    self.update_display(phase_idx, phases[phase_idx].duration)
-                return True
+                print(f"[DB]/[Supabase][AUTO-SAVE] Saved missing SUMO phase {phase_idx} to Supabase.")
+                return self.set_phase_from_pkl(phase_idx, requested_duration=phases[phase_idx].duration)
             if 0 <= phase_idx < len(phases):
                 target_state = phases[phase_idx].state
                 for p in self.apc_state.get("phases", []):
                     if p["state"] == target_state:
-                        print(f"[DB]/[Supabase][SUBSTITUTE] Found PKL phase with matching state. Using phase_idx={p['phase_idx']}.")
+                        print(f"[DB]/[Supabase][SUBSTITUTE] Found Supabase phase with matching state. Using phase_idx={p['phase_idx']}.")
                         traci.trafficlight.setPhase(self.tls_id, p["phase_idx"])
                         traci.trafficlight.setPhaseDuration(self.tls_id, p["duration"])
                         self.update_phase_duration_record(p["phase_idx"], p["duration"])
@@ -968,7 +965,7 @@ class AdaptivePhaseController:
                 fallback_idx = phase_idx if 0 <= phase_idx < len(phases) else 0
                 fallback_state = phases[fallback_idx].state
                 fallback_duration = self.max_green
-                self.save_phase_to_pkl(
+                self.save_phase_to_supabase(
                     phase_idx=phase_idx,
                     duration=fallback_duration,
                     state_str=fallback_state,
@@ -976,7 +973,7 @@ class AdaptivePhaseController:
                     raw_delta_t=0,
                     penalty=0
                 )
-                print(f"[DB]/[Supabase][FALLBACK] Created and saved fallback phase {phase_idx} with max_green to PKL.")
+                print(f"[DB]/[Supabase][FALLBACK] Created and saved fallback phase {phase_idx} with max_green to Supabase.")
                 traci.trafficlight.setPhase(self.tls_id, phase_idx)
                 traci.trafficlight.setPhaseDuration(self.tls_id, fallback_duration)
                 self.update_phase_duration_record(phase_idx, fallback_duration)
@@ -985,7 +982,6 @@ class AdaptivePhaseController:
                 return True
             print(f"[ERROR] Could not find or create a suitable phase for index {phase_idx}.")
             return False
-
     def ensure_true_protected_left_phase(self, left_lane):
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -1433,7 +1429,7 @@ class EnhancedQLearningAgent:
                 )
                 traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
                 traci.trafficlight.setPhase(self.tls_id, idx)
-                self.save_phase_to_pkl(idx, new_duration, protected_state, delta_t, delta_t, penalty=0)
+                self.save_phase_to_supabase(idx, new_duration, protected_state, delta_t, delta_t, penalty=0)
                 self._log_apc_event({
                     "action": "extend_protected_left_phase",
                     "tls_id": self.tls_id,
@@ -1455,7 +1451,7 @@ class EnhancedQLearningAgent:
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 2)
-        self.save_phase_to_pkl(len(phases) - 2, self.max_green, protected_state, delta_t, delta_t, penalty=0)
+        self.save_phase_to_supabase(len(phases) - 2, self.max_green, protected_state, delta_t, delta_t, penalty=0)
         self._log_apc_event({
             "action": "create_protected_left_phase",
             "tls_id": self.tls_id,
