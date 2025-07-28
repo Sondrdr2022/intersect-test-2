@@ -184,16 +184,42 @@ class AdaptivePhaseController:
     def _save_apc_state_firestore(self):
         self._pending_db_ops.append(self.apc_state.copy())
 
-    def _load_apc_state_firestore(self):
-        # PATCH: Load from Firestore
-        doc_id = f"{self.tls_id}_full"
-        doc_ref = db.collection("apc_states").document(doc_id)
-        doc = doc_ref.get()
-        if doc.exists:
-            doc_data = doc.to_dict()
-            self.apc_state = json.loads(doc_data.get("data", "{}"))
-        else:
-            self.apc_state = {"events": [], "phases": []}
+    def save_phase_to_firestore(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty,
+                               reward=None, bonus=None, weights=None, event_type=None, lanes=None):
+        entry = {
+            "phase_idx": phase_idx,
+            "duration": duration,
+            "base_duration": duration if not self.load_phase_from_firestore(phase_idx) else
+                self.load_phase_from_firestore(phase_idx).get("base_duration", duration),
+            "state": state_str,
+            "delta_t": delta_t,
+            "raw_delta_t": raw_delta_t,
+            "penalty": penalty,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "sim_time": traci.simulation.getTime(),
+            "reward": reward if reward is not None else getattr(self, "last_R", None),
+            "bonus": bonus if bonus is not None else getattr(self, "last_bonus", 0),
+            "weights": weights if weights is not None else self.weights.tolist(),
+            "event_type": event_type,
+            "lanes": lanes if lanes is not None else self.lane_ids[:],
+        }
+        found = False
+        for i, p in enumerate(self.apc_state.setdefault("phases", [])):
+            if p["phase_idx"] == phase_idx:
+                entry["base_duration"] = p.get("base_duration", entry["base_duration"])
+                self.apc_state["phases"][i] = entry
+                found = True
+                break
+        if not found:
+            self.apc_state["phases"].append(entry)
+        self._save_apc_state_firestore()
+
+    def load_phase_from_firestore(self, phase_idx=None):
+        for p in self.apc_state.get("phases", []):
+            if p["phase_idx"] == phase_idx:
+                return p
+        return None
+  
     def save_phase_to_firestore(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty,
                             reward=None, bonus=None, weights=None, event_type=None, lanes=None):
         entry = {
@@ -244,18 +270,18 @@ class AdaptivePhaseController:
             if is_left:
                 left_idx = controlled_lanes.index(lane)
                 protected_state = ''.join(['G' if i == left_idx else 'r' for i in range(len(controlled_lanes))])
-                # PATCH: Use base duration from DB if available
+                # PATCH: Use base duration from Firestore if available
                 phase_idx = None
                 base_duration = self.min_green
                 for idx, phase in enumerate(logic.getPhases()):
                     if phase.state == protected_state:
-                        phase_record = self.load_phase_from_supabase(idx) if hasattr(self, "load_phase_from_supabase") else None
+                        phase_record = self.load_phase_from_firestore(idx)
                         base_duration = phase_record["duration"] if phase_record and "duration" in phase_record else phase.duration
                         phase_idx = idx
                         break
                 duration = np.clip(base_duration + delta_t, self.min_green, self.max_green)
                 if phase_idx is not None:
-                    self.save_phase_to_supabase(phase_idx, duration, protected_state, delta_t, delta_t, penalty=0)
+                    self.save_phase_to_firestore(phase_idx, duration, protected_state, delta_t, delta_t, penalty=0)
                     if hasattr(self, "update_display"):
                         self.update_display(phase_idx, duration)
                     return phase_idx
@@ -269,7 +295,7 @@ class AdaptivePhaseController:
                 )
                 traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
                 traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
-                self.save_phase_to_supabase(len(phases) - 1, duration, protected_state, delta_t, delta_t, penalty=0)
+                self.save_phase_to_firestore(len(phases) - 1, duration, protected_state, delta_t, delta_t, penalty=0)
                 if hasattr(self, "update_display"):
                     self.update_display(len(phases) - 1, duration)
                 print(f"[PATCH][PROT LEFT] Created protected left phase for {lane} (idx {len(phases) - 1})")
@@ -280,13 +306,13 @@ class AdaptivePhaseController:
         base_duration = self.min_green
         for idx, phase in enumerate(logic.getPhases()):
             if phase.state == new_state:
-                phase_record = self.load_phase_from_supabase(idx) if hasattr(self, "load_phase_from_supabase") else None
+                phase_record = self.load_phase_from_firestore(idx)
                 base_duration = phase_record["duration"] if phase_record and "duration" in phase_record else phase.duration
                 phase_idx = idx
                 break
         duration = np.clip(base_duration + delta_t, self.min_green, self.max_green)
         if phase_idx is not None:
-            self.save_phase_to_supabase(phase_idx, duration, new_state, delta_t, delta_t, penalty=0)
+            self.save_phase_to_firestore(phase_idx, duration, new_state, delta_t, delta_t, penalty=0)
             if hasattr(self, "update_display"):
                 self.update_display(phase_idx, duration)
             return phase_idx
@@ -302,7 +328,7 @@ class AdaptivePhaseController:
         print(f"[DEBUG] setCompleteRedYellowGreenDefinition called for {self.tls_id} with {len(phases)} phases")
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
         print(f"[DEBUG] setPhase called for {self.tls_id} to phase {len(phases) - 1}")
-        self.save_phase_to_supabase(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
+        self.save_phase_to_firestore(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
         if hasattr(self, "update_display"):
             self.update_display(len(phases) - 1, duration)
         try:
@@ -327,11 +353,6 @@ class AdaptivePhaseController:
             return [(p.state, p.duration) for p in self._phase_defs]
         return [(rec["state"], rec["duration"]) for rec in phase_records]
 
-    def load_phase_from_firestore(self, phase_idx=None):
-        for p in self.apc_state.get("phases", []):
-            if p["phase_idx"] == phase_idx:
-                return p
-        return None
 
     def _log_apc_event(self, event):
         event["timestamp"] = datetime.datetime.now().isoformat()
@@ -922,21 +943,20 @@ class AdaptivePhaseController:
         for p in self.apc_state.get("phases", []):
             if p["phase_idx"] == phase_idx:
                 p["duration"] = new_duration
-                p["extended_time"] = extended_time  # <-- NEW
+                p["extended_time"] = extended_time
                 updated = True
         if updated:
-            self._save_apc_state_supabase()
+            self._save_apc_state_firestore()
         self._log_apc_event({
             "action": "phase_duration_update",
             "phase_idx": phase_idx,
             "duration": new_duration,
-            "extended_time": extended_time,  # <-- NEW
+            "extended_time": extended_time,
             "tls_id": self.tls_id
         })
-
     def set_phase_from_pkl(self, phase_idx, requested_duration=None):
-        print(f"[DB]/[Supabase][SET] set_phase_from_pkl({phase_idx}, requested_duration={requested_duration}) called")
-        phase_record = self.load_phase_from_supabase(phase_idx)
+        print(f"[DB]/[Firestore][SET] set_phase_from_pkl({phase_idx}, requested_duration={requested_duration}) called")
+        phase_record = self.load_phase_from_firestore(phase_idx)
         if phase_record:
             duration = requested_duration if requested_duration is not None else phase_record["duration"]
             extended_time = duration - phase_record.get("duration", duration) if requested_duration is not None else 0
@@ -949,11 +969,11 @@ class AdaptivePhaseController:
                 self.update_display(phase_idx, duration, current_time, next_switch, extended_time)
             return True
         else:
-            print(f"[APC-RL] Phase {phase_idx} not found in PKL, attempting to create or substitute.")
+            print(f"[APC-RL] Phase {phase_idx} not found in Firestore, attempting to create or substitute.")
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
             phases = logic.getPhases()
             if 0 <= phase_idx < len(phases):
-                self.save_phase_to_supabase(
+                self.save_phase_to_firestore(
                     phase_idx=phase_idx,
                     duration=phases[phase_idx].duration,
                     state_str=phases[phase_idx].state,
@@ -961,13 +981,13 @@ class AdaptivePhaseController:
                     raw_delta_t=0,
                     penalty=0
                 )
-                print(f"[DB]/[Supabase][AUTO-SAVE] Saved missing SUMO phase {phase_idx} to Supabase.")
+                print(f"[DB]/[Firestore][AUTO-SAVE] Saved missing SUMO phase {phase_idx} to Firestore.")
                 return self.set_phase_from_pkl(phase_idx, requested_duration=phases[phase_idx].duration)
             if 0 <= phase_idx < len(phases):
                 target_state = phases[phase_idx].state
                 for p in self.apc_state.get("phases", []):
                     if p["state"] == target_state:
-                        print(f"[DB]/[Supabase][SUBSTITUTE] Found Supabase phase with matching state. Using phase_idx={p['phase_idx']}.")
+                        print(f"[DB]/[Firestore][SUBSTITUTE] Found Firestore phase with matching state. Using phase_idx={p['phase_idx']}.")
                         traci.trafficlight.setPhase(self.tls_id, p["phase_idx"])
                         traci.trafficlight.setPhaseDuration(self.tls_id, p["duration"])
                         self.update_phase_duration_record(p["phase_idx"], p["duration"])
@@ -978,7 +998,7 @@ class AdaptivePhaseController:
                 fallback_idx = phase_idx if 0 <= phase_idx < len(phases) else 0
                 fallback_state = phases[fallback_idx].state
                 fallback_duration = self.max_green
-                self.save_phase_to_supabase(
+                self.save_phase_to_firestore(
                     phase_idx=phase_idx,
                     duration=fallback_duration,
                     state_str=fallback_state,
@@ -986,7 +1006,7 @@ class AdaptivePhaseController:
                     raw_delta_t=0,
                     penalty=0
                 )
-                print(f"[DB]/[Supabase][FALLBACK] Created and saved fallback phase {phase_idx} with max_green to Supabase.")
+                print(f"[DB]/[Firestore][FALLBACK] Created and saved fallback phase {phase_idx} with max_green to Firestore.")
                 traci.trafficlight.setPhase(self.tls_id, phase_idx)
                 traci.trafficlight.setPhaseDuration(self.tls_id, fallback_duration)
                 self.update_phase_duration_record(phase_idx, fallback_duration)
@@ -995,6 +1015,7 @@ class AdaptivePhaseController:
                 return True
             print(f"[ERROR] Could not find or create a suitable phase for index {phase_idx}.")
             return False
+    
     def ensure_true_protected_left_phase(self, left_lane):
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
