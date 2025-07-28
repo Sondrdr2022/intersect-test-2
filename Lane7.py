@@ -164,6 +164,7 @@ class AdaptivePhaseController:
     def detect_turning_lanes(self):
         left, right = set(), set()
         for lid in self.lane_id_list:
+
             for c in traci.lane.getLinks(lid):
                 idx = 6 if len(c) > 6 else 3 if len(c) > 3 else None
                 if idx and c[idx] == 'l':
@@ -181,10 +182,12 @@ class AdaptivePhaseController:
             self.apc_state = {"events": [], "phases": []}
 
     def save_phase_to_supabase(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty,
-                              reward=None, bonus=None, weights=None, event_type=None, lanes=None):
+                            reward=None, bonus=None, weights=None, event_type=None, lanes=None):
         entry = {
             "phase_idx": phase_idx,
             "duration": duration,
+            "base_duration": duration if not self.load_phase_from_supabase(phase_idx) else
+                self.load_phase_from_supabase(phase_idx).get("base_duration", duration),
             "state": state_str,
             "delta_t": delta_t,
             "raw_delta_t": raw_delta_t,
@@ -200,6 +203,8 @@ class AdaptivePhaseController:
         found = False
         for i, p in enumerate(self.apc_state.setdefault("phases", [])):
             if p["phase_idx"] == phase_idx:
+                # Always keep the initial base_duration
+                entry["base_duration"] = p.get("base_duration", entry["base_duration"])
                 self.apc_state["phases"][i] = entry
                 found = True
                 break
@@ -212,20 +217,11 @@ class AdaptivePhaseController:
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
 
-        # PATCH #1: Defensive: Only process lanes that actually exist in controlled_lanes
         valid_green_lanes = [lane for lane in green_lanes if lane in controlled_lanes]
         if not valid_green_lanes:
             print(f"[BUG] No valid green lanes found in {green_lanes}. controlled_lanes={controlled_lanes}")
             return None
 
-        # PATCH #2: Defensive: traci.trafficlight.getPhaseDuration may fail if phase index is out of range
-        try:
-            current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
-        except Exception as e:
-            print(f"[BUG] getPhaseDuration failed, using min_green. Error: {e}")
-            current_duration = self.min_green
-
-        # --- PATCH: If any green_lane is a protected left, create a protected left phase! ---
         for lane in valid_green_lanes:
             try:
                 links = traci.lane.getLinks(lane)
@@ -236,16 +232,21 @@ class AdaptivePhaseController:
             if is_left:
                 left_idx = controlled_lanes.index(lane)
                 protected_state = ''.join(['G' if i == left_idx else 'r' for i in range(len(controlled_lanes))])
-                duration = np.clip(current_duration + delta_t, self.min_green, self.max_green)
-                # Check if phase already exists
+                # PATCH: Use base duration from DB if available
+                phase_idx = None
+                base_duration = self.min_green
                 for idx, phase in enumerate(logic.getPhases()):
                     if phase.state == protected_state:
-                        print(f"[DEBUG] Protected left requested phase already exists: {idx}")
-                        self.save_phase_to_pkl(idx, duration, protected_state, delta_t, delta_t, penalty=0)
-                        if hasattr(self, "update_display"):
-                            self.update_display(idx, duration)
-                        return idx
-                # Otherwise, create it
+                        phase_record = self.load_phase_from_supabase(idx) if hasattr(self, "load_phase_from_supabase") else None
+                        base_duration = phase_record["duration"] if phase_record and "duration" in phase_record else phase.duration
+                        phase_idx = idx
+                        break
+                duration = np.clip(base_duration + delta_t, self.min_green, self.max_green)
+                if phase_idx is not None:
+                    self.save_phase_to_pkl(phase_idx, duration, protected_state, delta_t, delta_t, penalty=0)
+                    if hasattr(self, "update_display"):
+                        self.update_display(phase_idx, duration)
+                    return phase_idx
                 new_phase = traci.trafficlight.Phase(duration, protected_state)
                 phases = list(logic.getPhases()) + [new_phase]
                 new_logic = traci.trafficlight.Logic(
@@ -262,20 +263,21 @@ class AdaptivePhaseController:
                 print(f"[PATCH][PROT LEFT] Created protected left phase for {lane} (idx {len(phases) - 1})")
                 return len(phases) - 1
 
-        # --- Otherwise, original logic (not a protected left turn) ---
         new_state = self.create_phase_state(green_lanes=valid_green_lanes)
-        duration = np.clip(current_duration + delta_t, self.min_green, self.max_green)
-        print(f"[DEBUG] About to check for existing phase: state={new_state}, duration={duration}")
+        phase_idx = None
+        base_duration = self.min_green
         for idx, phase in enumerate(logic.getPhases()):
-            print(f"[DEBUG]   Checking phase {idx}: state={phase.state}, duration={phase.duration}")
             if phase.state == new_state:
-                print(f"[DEBUG] RL/Controller requested phase already exists: {idx}")
-                # PATCH #3: Overwrite, not append, to PKL for this phase_idx
-                self.save_phase_to_pkl(idx, duration, new_state, delta_t, delta_t, penalty=0)
-                if hasattr(self, "update_display"):
-                    self.update_display(idx, duration)
-                return idx
-        print(f"[DEBUG] No existing phase matched. Creating new phase.")
+                phase_record = self.load_phase_from_supabase(idx) if hasattr(self, "load_phase_from_supabase") else None
+                base_duration = phase_record["duration"] if phase_record and "duration" in phase_record else phase.duration
+                phase_idx = idx
+                break
+        duration = np.clip(base_duration + delta_t, self.min_green, self.max_green)
+        if phase_idx is not None:
+            self.save_phase_to_pkl(phase_idx, duration, new_state, delta_t, delta_t, penalty=0)
+            if hasattr(self, "update_display"):
+                self.update_display(phase_idx, duration)
+            return phase_idx
         new_phase = traci.trafficlight.Phase(duration, new_state)
         phases = list(logic.getPhases()) + [new_phase]
         new_logic = traci.trafficlight.Logic(
@@ -288,7 +290,6 @@ class AdaptivePhaseController:
         print(f"[DEBUG] setCompleteRedYellowGreenDefinition called for {self.tls_id} with {len(phases)} phases")
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 1)
         print(f"[DEBUG] setPhase called for {self.tls_id} to phase {len(phases) - 1}")
-        # PATCH #3: Overwrite, not append, to PKL for this phase_idx
         self.save_phase_to_pkl(len(phases) - 1, duration, new_state, delta_t, delta_t, penalty=0)
         if hasattr(self, "update_display"):
             self.update_display(len(phases) - 1, duration)
@@ -299,13 +300,13 @@ class AdaptivePhaseController:
             actual = duration
         print(f"[SANITY] SUMO reported duration = {actual}, expected = {duration}")
         return len(phases) - 1
-
     def calculate_delta_t_and_penalty(self, R):
+        # Δt is an *addition* to base duration, not a replacement
         raw_delta_t = self.alpha * (R - self.R_target)
-        penalty = max(0, abs(raw_delta_t) - 10)
-        delta_t = 10 * np.tanh(raw_delta_t / 20)
-        delta_t = np.clip(delta_t, -10, 10)
-        print(f"[DEBUG] [DELTA_T_PENALTY] R={R:.2f}, R_target={self.R_target:.2f}, raw_delta_t={raw_delta_t:.2f}, delta_t={delta_t:.2f}, penalty={penalty:.2f}")
+        penalty     = max(0, abs(raw_delta_t) - 10)
+        ext_t       = 10 * np.tanh(raw_delta_t / 20)
+        delta_t     = np.clip(ext_t, -10, 10)
+        print(f"[DEBUG] [DELTA_T_PENALTY] R={R:.2f}, R_target={self.R_target:.2f}, raw={raw_delta_t:.2f}, Δt={delta_t:.2f}, penalty={penalty:.2f}")
         return raw_delta_t, delta_t, penalty
  
     def get_full_phase_sequence(self):
@@ -331,10 +332,13 @@ class AdaptivePhaseController:
         self._save_apc_state_supabase()
 
     def compute_reward_and_bonus(self):
+        """Calculate reward considering all lanes"""
         status_score = 0
         valid_lanes = 0
         metrics = np.zeros(4)
         MAX_VALUES = [0.2, 13.89, 300, 50]
+
+        # Get current max values across all lanes
         current_max = [
             max(0.1, max(traci.lane.getLastStepVehicleNumber(lid)/max(1, traci.lane.getLength(lid)) for lid in self.lane_ids)),
             max(5.0, max(traci.lane.getLastStepMeanSpeed(lid) for lid in self.lane_ids)),
@@ -342,12 +346,14 @@ class AdaptivePhaseController:
             max(5.0, max(traci.lane.getLastStepHaltingNumber(lid) for lid in self.lane_ids))
         ]
         max_vals = [min(MAX_VALUES[i], current_max[i]) for i in range(4)]
+
         bonus, penalty = 0, 0
         for lane_id in self.lane_ids:
             queue, wtime, v, dens = self.get_lane_stats(lane_id)
             if queue < 0 or wtime < 0:
                 continue
-            status_score += min(queue, 50)/10 + min(wtime, 300)/60
+
+            # Normalize metrics using current max values
             metrics += [
                 min(dens, max_vals[0]) / max_vals[0],
                 min(v, max_vals[1]) / max_vals[1],
@@ -355,21 +361,27 @@ class AdaptivePhaseController:
                 min(queue, max_vals[3]) / max_vals[3]
             ]
             valid_lanes += 1
+
+            # Calculate status score for bonus/penalty
+            status_score += min(queue, 50)/10 + min(wtime, 300)/60
+
         if valid_lanes == 0:
             avg_metrics = np.zeros(4)
             avg_status = 0
         else:
             avg_metrics = metrics / valid_lanes
             avg_status = status_score / valid_lanes
+
+        # Determine bonus/penalty based on overall status
         if avg_status >= 5 * 1.25:
             penalty = 2
         elif avg_status <= 2.5:
             bonus = 1
+
         self.last_bonus = bonus
         self.last_penalty = penalty
-        self.metric_history.append(avg_metrics)
-        if self.phase_count % 5 == 0:
-            self.adjust_weights()
+
+        # Calculate final reward considering all metrics
         R = 100 * (
             -self.weights[0] * avg_metrics[0] +
             self.weights[1] * avg_metrics[1] -
@@ -377,18 +389,9 @@ class AdaptivePhaseController:
             self.weights[3] * avg_metrics[3] +
             bonus - penalty
         )
+
         self.last_R = np.clip(R, -100, 100)
-        self.reward_history.append(self.last_R)
         return self.last_R, bonus, penalty
-    # Throttle congestion/emergency checks
-
-    # Only update R_target every 10 switches
-    def update_R_target(self, window=10):
-        if len(self.reward_history) < window or self.phase_count % 10 != 0:
-            return
-        avg_R = np.mean(list(self.reward_history)[-window:])
-        self.R_target = self.r_base + self.r_adjust * (avg_R - self.r_base)
-
     def shutdown(self):
         self._db_writer.stop()
     def get_lane_stats(self, lane_id):
@@ -1185,67 +1188,53 @@ class AdaptivePhaseController:
         try:
             if not self.enforce_min_green() and not self.check_priority_conditions():
                 print("[ADJUST BLOCKED] Min green active")
-                return current_duration
-            old_phase = traci.trafficlight.getPhase(self.tls_id)
-            current_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
-            new_duration = np.clip(current_duration + delta_t, self.min_green, self.max_green)
-            extended_time = new_duration - current_duration  # <-- NEW
-            self.last_extended_time = extended_time          # <-- NEW
+                return traci.trafficlight.getPhaseDuration(self.tls_id)
+            current_phase = traci.trafficlight.getPhase(self.tls_id)
+            # PATCH: Use base duration from DB if available, not just current duration
+            phase_record = self.load_phase_from_supabase(current_phase) if hasattr(self, "load_phase_from_supabase") else None
+            if phase_record and "duration" in phase_record:
+                base_duration = phase_record["duration"]
+            else:
+                base_duration = traci.trafficlight.getPhaseDuration(self.tls_id)
+            new_duration = np.clip(base_duration + delta_t, self.min_green, self.max_green)
+            extended_time = new_duration - base_duration
+            self.last_extended_time = extended_time
             if new_duration < self.min_green:
                 print(f"[WARNING] Tried to set duration {new_duration}s < min_green {self.min_green}s! Forcing min_green.")
                 new_duration = self.min_green
             traci.trafficlight.setPhaseDuration(self.tls_id, new_duration)
-            self.update_phase_duration_record(old_phase, new_duration, extended_time)
+            self.update_phase_duration_record(current_phase, new_duration, extended_time)
             event = {
                 "action": "adjust_phase_duration",
-                "phase": old_phase,
+                "phase": current_phase,
                 "delta_t": delta_t,
-                "old_duration": current_duration,
+                "old_duration": base_duration,
                 "new_duration": new_duration,
                 "duration": new_duration,
-                "extended_time": extended_time,  # <-- NEW FIELD
+                "extended_time": extended_time,
                 "reward": self.last_R,
                 "weights": self.weights.tolist(),
                 "bonus": getattr(self, "last_bonus", 0),
                 "penalty": getattr(self, "last_penalty", 0)
             }
             self._log_apc_event(event)
-            print(f"\n[PHASE ADJUST] Phase {old_phase}: {current_duration:.1f}s → {new_duration:.1f}s (extended by {extended_time:.1f}s)")
+            print(f"\n[PHASE ADJUST] Phase {current_phase}: {base_duration:.1f}s → {new_duration:.1f}s (extended by {extended_time:.1f}s)")
             print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
             if hasattr(self, "update_display"):
                 current_time = traci.simulation.getTime()
                 next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
-                self.update_display(old_phase, new_duration, current_time, next_switch, extended_time)
+                self.update_display(current_phase, new_duration, current_time, next_switch, extended_time)
             return new_duration
         except traci.TraCIException as e:
             print(f"[ERROR] Duration adjustment failed: {e}")
             return traci.trafficlight.getPhaseDuration(self.tls_id)
-        
-
-        # Blocked left turn detection
-        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
-        for lane_id in controlled_lanes:
-            links = traci.lane.getLinks(lane_id)
-            is_left = any(len(link) > 6 and link[6] == 'l' for link in links)
-            if is_left:
-                vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
-                speeds = [traci.vehicle.getSpeed(vid) for vid in vehicles]
-                if speeds and max(speeds) < 0.2:
-                    return True
-        return False
-# Do NOT call log_phase_switch or adjust_phase_duration here!        # Do NOT update last_phase_switch_sim_time here!
     def control_step(self):
-
         self.phase_count += 1
         current_time = traci.simulation.getTime()
-        
-        # Check if min green time has elapsed since last switch
         elapsed = current_time - self.last_phase_switch_sim_time
         min_green_elapsed = elapsed >= self.min_green
-        
-        # Allow interruption only for priority conditions
+
         if min_green_elapsed or self.check_priority_conditions():
-            # Existing priority handling and phase switching logic
             if self.serve_true_protected_left_if_needed():
                 return
             event_type, event_lane = self.check_special_events()
@@ -1253,24 +1242,19 @@ class AdaptivePhaseController:
                 self.reorganize_or_create_phase(event_lane, event_type)
                 return
 
-        # Wait for the current phase to run out
         now = traci.simulation.getTime()
         next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
         time_left = max(0, next_switch - now)
         if time_left > 0.1:
             return
 
-        # --- At this point, phase is expiring, time to pick the next phase ---
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         num_phases = len(logic.getPhases())
         current_phase = traci.trafficlight.getPhase(self.tls_id)
 
-        # RL/Adaptive state vector creation (you may need to adapt this to your actual state interface)
-        # Here we use a simple state: current phase, phase count, etc. You can improve this.
+        # RL/Adaptive state vector creation...
         rl_state = np.array([current_phase, num_phases, self.phase_count])
         try:
-            # Use RL agent to select next phase
-            # If you have a richer state, use a richer state here.
             next_phase = self.rl_agent.get_action(rl_state, tl_id=self.tls_id, action_size=num_phases)
             if isinstance(next_phase, np.ndarray) or isinstance(next_phase, list):
                 next_phase = int(next_phase[0])
@@ -1285,17 +1269,16 @@ class AdaptivePhaseController:
         if self.phase_count % 10 == 0:
             self.update_R_target()
         delta_t = self.calculate_delta_t(R)
-        # Use PKL or default duration for next phase:
+
+        # PATCH: Always use base_duration + delta_t!
         phase_record = self.load_phase_from_supabase(next_phase)
         if phase_record:
-            base_next_duration = phase_record["duration"]
+            # Prefer truly immutable base_duration if present, else fallback to duration, else min_green
+            base = phase_record.get("base_duration", phase_record.get("duration", self.min_green))
         else:
-            base_next_duration = self.min_green
-        next_duration = np.clip(base_next_duration + delta_t, self.min_green, self.max_green)
-
-        # Switch to next phase with computed duration
+            base = self.min_green
+        next_duration = np.clip(base + delta_t, self.min_green, self.max_green)
         self.set_phase_from_pkl(next_phase, requested_duration=next_duration)
-
 class EnhancedQLearningAgent:
     def __init__(self, state_size, action_size, adaptive_controller, learning_rate=0.1, discount_factor=0.95, 
                  epsilon=0.1, epsilon_decay=0.995, min_epsilon=0.01, 
@@ -1701,6 +1684,7 @@ class UniversalSmartTrafficController:
     def detect_turning_lanes(self):
         left, right = set(), set()
         for lid in self.lane_id_list:
+
             for c in traci.lane.getLinks(lid):
                 idx = 6 if len(c) > 6 else 3 if len(c) > 3 else None
                 if idx and c[idx] == 'l':
