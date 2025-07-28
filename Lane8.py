@@ -462,17 +462,32 @@ class AdaptivePhaseController:
 
         self.weight_history.append(self.weights.copy())
         print(f"[ADAPTIVE WEIGHTS] {self.tls_id}: {self.weights}")        
+    def log_green_time_per_lane(self):
+        now = traci.simulation.getTime()
+        results = []
+        for idx, lane_id in enumerate(self.lane_id_list):
+            t_since_green = now - self.last_green_time[idx]
+            results.append((lane_id, t_since_green))
+        print(f"[DIAG] Time since last green per lane: {results}")
     def log_phase_switch(self, new_phase_idx):
         current_time = traci.simulation.getTime()
         elapsed = current_time - self.last_phase_switch_sim_time
 
-        # Block switch if min green not met and no priority
-        if elapsed < self.min_green and not self.check_priority_conditions():
+        # --- PATCH: Starvation override for flicker prevention ---
+        # If any lane has been waiting much longer than starvation threshold, allow switch even if same as last phase
+        STARVATION_OVERRIDE = False
+        for idx in range(len(self.lane_id_list)):
+            if current_time - self.last_green_time[idx] > self.adaptive_params['starvation_threshold'] * 2:
+                STARVATION_OVERRIDE = True
+                break
+
+        # Block switch if min green not met and no priority (unless starvation override)
+        if elapsed < self.min_green and not self.check_priority_conditions() and not STARVATION_OVERRIDE:
             print(f"[MIN_GREEN BLOCK] Phase switch blocked (elapsed: {elapsed:.1f}s < {self.min_green}s)")
             return False
 
-        # Flicker prevention: block if same as last phase
-        if self.last_phase_idx == new_phase_idx:
+        # Flicker prevention: block if same as last phase, unless starvation override
+        if self.last_phase_idx == new_phase_idx and not STARVATION_OVERRIDE:
             print(f"[PHASE SWITCH BLOCKED] Flicker prevention triggered for {self.tls_id}")
             return False
 
@@ -489,7 +504,7 @@ class AdaptivePhaseController:
 
             # PATCH: Check if this phase was RL-created
             phase_was_rl_created = False
-            phase_pkl = self.load_phase_from_supabase(new_phase_idx)
+            phase_pkl = self.load_phase_from_firestore(new_phase_idx)
             if phase_pkl and phase_pkl.get("rl_created"):
                 phase_was_rl_created = True
 
@@ -504,7 +519,8 @@ class AdaptivePhaseController:
                 "bonus": getattr(self, "last_bonus", 0),
                 "penalty": getattr(self, "last_penalty", 0),
                 "rl_created": phase_was_rl_created,
-                "phase_idx": new_phase_idx
+                "phase_idx": new_phase_idx,
+                "starvation_override": STARVATION_OVERRIDE
             }
             self._log_apc_event(event)
             print(f"\n[PHASE SWITCH] {self.tls_id}: {self.last_phase_idx}→{new_phase}")
@@ -512,11 +528,12 @@ class AdaptivePhaseController:
             print(f"  Weights: {self.weights}, Bonus: {getattr(self, 'last_bonus', 0)}, Penalty: {getattr(self, 'last_penalty', 0)}")
             if phase_was_rl_created:
                 print(f"  [INFO] RL agent's phase is now in use (phase {new_phase_idx})")
+            if STARVATION_OVERRIDE:
+                print(f"  [FAIRNESS] Flicker prevention bypassed due to lane starvation.")
             return True
         except Exception as e:
             print(f"[ERROR] Phase switch failed: {e}")
             return False
-
     def check_priority_conditions(self):
         # Returns True if there is a priority event that allows preemption of min green
         # You may want to expand this as needed (emergency, protected left, etc)
@@ -711,12 +728,9 @@ class AdaptivePhaseController:
         return bonus, penalty
     
     def calculate_reward(self, bonus=0, penalty=0):
-        """Improved reward calculation with dynamic normalization"""
-        metrics = np.zeros(4)  # density, speed, wait, queue
+        metrics = np.zeros(4)
         valid_lanes = 0
         MAX_VALUES = [0.2, 13.89, 300, 50]
-
-        # Calculate dynamic max values based on current traffic
         current_max = [
             max(0.1, max(traci.lane.getLastStepVehicleNumber(lid)/max(1, traci.lane.getLength(lid)) 
                 for lid in self.lane_ids)),
@@ -724,16 +738,11 @@ class AdaptivePhaseController:
             max(30.0, max(traci.lane.getWaitingTime(lid) for lid in self.lane_ids)),
             max(5.0, max(traci.lane.getLastStepHaltingNumber(lid) for lid in self.lane_ids))
         ]
-
-        # Use the smaller of static and dynamic max values
         max_vals = [min(MAX_VALUES[i], current_max[i]) for i in range(4)]
-
         for lane_id in self.lane_ids:
             q, w, v, dens = self.get_lane_stats(lane_id)
-
             if any(val < 0 for val in (q, w, v, dens)):
                 continue
-
             metrics += [
                 min(dens, max_vals[0]) / max_vals[0],
                 min(v, max_vals[1]) / max_vals[1],
@@ -741,15 +750,17 @@ class AdaptivePhaseController:
                 min(q, max_vals[3]) / max_vals[3]
             ]
             valid_lanes += 1
-
         if valid_lanes == 0:
             self.last_R = 0
             return 0
-
         avg_metrics = metrics / valid_lanes
         self.metric_history.append(avg_metrics)
-        # PATCH: Always adjust weights before calculating reward for true adaptivity
         self.adjust_weights()
+
+        # PATCH: Add starvation penalty
+        now = traci.simulation.getTime()
+        max_time_since_green = max(now - self.last_green_time[idx] for idx in range(len(self.lane_id_list)))
+        starvation_penalty = min(30, max_time_since_green / 10.0)  # scale as needed, cap at 30
 
         R = 100 * (
             -self.weights[0] * avg_metrics[0] +
@@ -757,12 +768,8 @@ class AdaptivePhaseController:
             self.weights[2] * avg_metrics[2] -
             self.weights[3] * avg_metrics[3] +
             bonus - penalty
-        )
-
+        ) - starvation_penalty
         self.last_R = np.clip(R, -100, 100)
-
-        print(f"[REWARD] {self.tls_id}: R={self.last_R:.2f} (dens={avg_metrics[0]:.2f}, spd={avg_metrics[1]:.2f}, wait={avg_metrics[2]:.2f}, queue={avg_metrics[3]:.2f})")
-        print(f"  Weights: {self.weights}, Bonus: {bonus}, Penalty: {penalty}")
         return self.last_R
 
     def calculate_delta_t(self, R):
@@ -1221,7 +1228,7 @@ class AdaptivePhaseController:
                 return traci.trafficlight.getPhaseDuration(self.tls_id)
             current_phase = traci.trafficlight.getPhase(self.tls_id)
             # PATCH: Use base duration from DB if available, not just current duration
-            phase_record = self.load_phase_from_supabase(current_phase) if hasattr(self, "load_phase_from_supabase") else None
+            phase_record = self.load_phase_from_firestore(current_phase) if hasattr(self, "load_phase_from_firestore") else None
             if phase_record and "duration" in phase_record:
                 base_duration = phase_record["duration"]
             else:
@@ -1325,7 +1332,7 @@ class AdaptivePhaseController:
         delta_t = self.calculate_delta_t(R)
 
         # PATCH: Always use base_duration + delta_t!
-        phase_record = self.load_phase_from_supabase(next_phase)
+        phase_record = self.load_phase_from_firestore(next_phase)
         if phase_record:
             base = phase_record.get("base_duration", phase_record.get("duration", self.min_green))
         else:
@@ -1408,7 +1415,7 @@ class EnhancedQLearningAgent:
         })
         print(f"[DEBUG][RL Agent] Will now set phase from PKL: phase_idx={phase_idx}")
         self.adaptive_controller.set_phase_from_pkl(phase_idx)
-        phase_record = self.adaptive_controller.load_phase_from_supabase(phase_idx)
+        phase_record = self.adaptive_controller.load_phase_from_firestore(phase_idx)
         if phase_record:
             traci.trafficlight.setPhase(self.adaptive_controller.tls_id, phase_record["phase_idx"])
             traci.trafficlight.setPhaseDuration(self.adaptive_controller.tls_id, phase_record["duration"])
@@ -1478,7 +1485,7 @@ class EnhancedQLearningAgent:
                 )
                 traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
                 traci.trafficlight.setPhase(self.tls_id, idx)
-                self.save_phase_to_supabase(idx, new_duration, protected_state, delta_t, delta_t, penalty=0)
+                self.save_phase_to_firestore(idx, new_duration, protected_state, delta_t, delta_t, penalty=0)
                 self._log_apc_event({
                     "action": "extend_protected_left_phase",
                     "tls_id": self.tls_id,
@@ -1500,7 +1507,7 @@ class EnhancedQLearningAgent:
         )
         traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
         traci.trafficlight.setPhase(self.tls_id, len(phases) - 2)
-        self.save_phase_to_supabase(len(phases) - 2, self.max_green, protected_state, delta_t, delta_t, penalty=0)
+        self.save_phase_to_firestore(len(phases) - 2, self.max_green, protected_state, delta_t, delta_t, penalty=0)
         self._log_apc_event({
             "action": "create_protected_left_phase",
             "tls_id": self.tls_id,
@@ -1894,7 +1901,7 @@ class UniversalSmartTrafficController:
                 return False
 
             # PATCH: Use phase record from APC PKL to set SUMO phase/duration
-            phase_record = apc.load_phase_from_supabase(phase_idx)
+            phase_record = apc.load_phase_from_firestore(phase_idx)
             if phase_record:
                 traci.trafficlight.setPhase(apc.tls_id, phase_record["phase_idx"])
                 traci.trafficlight.setPhaseDuration(apc.tls_id, phase_record["duration"])
@@ -2378,9 +2385,21 @@ class UniversalSmartTrafficController:
             return 0.0
         
         
+
     def _select_target_lane(self, tl_id, controlled_lanes, lane_data, current_time):
         """Prefer lanes with vehicles; ignore empty unless all are empty.
-        Score: queue*0.5 + wait*0.3 + arrival*0.2 + starvation*0.3 + emergency."""
+        Score: queue*0.5 + wait*0.3 + arrival*0.2 + starvation*0.3 + emergency.
+        PATCH: Anti-bias: If any lane is starved, force it. Otherwise, use softmax sampling to diversify selection."""
+        STARVATION_THRESHOLD = self.adaptive_params.get('starvation_threshold', 40)
+        STARVATION_FORCE = STARVATION_THRESHOLD * 2  # Time to force-serve a lane
+
+        # First, check for starved lanes and force them
+        for lane in controlled_lanes:
+            idx = self.lane_id_to_idx.get(lane)
+            if idx is not None and current_time - self.last_green_time[idx] > STARVATION_FORCE:
+                print(f"[FAIRNESS] Forcing starved lane {lane}")
+                return lane
+
         # Only consider lanes with vehicles, unless all are empty
         nonempty_lanes = [l for l in controlled_lanes if l in lane_data and lane_data[l]['queue_length'] > 0]
         lanes_to_consider = nonempty_lanes if nonempty_lanes else [l for l in controlled_lanes if l in lane_data]
@@ -2399,13 +2418,20 @@ class UniversalSmartTrafficController:
             w_score = d['waiting_time'] / max_wait if max_wait > 0 else 0
             a_score = d.get('arrival_rate', 0) / max_arr if max_arr > 0 else 0
             last_green = self.last_green_time[idx]
-            starve = max(0, (current_time - last_green - self.adaptive_params['starvation_threshold']) / 10)
+            starve = max(0, (current_time - last_green - STARVATION_THRESHOLD) / 10)
             emerg = 2 if d.get('ambulance') else 0
             total = (0.5 * q_score + 0.3 * w_score + 0.2 * a_score + 0.3 * starve + emerg)
             candidates.append((lane, total))
-        # Pick the lane with the highest score
-        return max(candidates, key=lambda x: x[1])[0]
 
+        # PATCH: Use softmax sampling to reduce bias toward always-max lanes
+        scores = np.array([score for _, score in candidates])
+        temperature = 2.0  # Higher = more random, lower = greedier
+        exp_scores = np.exp(scores / temperature)
+        probs = exp_scores / exp_scores.sum() if exp_scores.sum() > 0 else np.ones_like(scores) / len(scores)
+        chosen_idx = np.random.choice(len(candidates), p=probs)
+        chosen_lane = candidates[chosen_idx][0]
+        print(f"[FAIRNESS] Candidates: {[(l, round(s,2)) for l,s in candidates]}, Chosen: {chosen_lane}")
+        return chosen_lane
     def _get_phase_efficiency(self, tl_id, phase_index):
         """Phase efficiency based on utilization"""
         try:
@@ -2498,7 +2524,7 @@ class UniversalSmartTrafficController:
             apc = self.adaptive_phase_controllers[tl_id]
             if current_phase != target_phase:
                 # Apply adaptive phase controller's PKL-driven phase record
-                phase_record = apc.load_phase_from_supabase(target_phase)
+                phase_record = apc.load_phase_from_firestore(target_phase)
                 if phase_record:
                     traci.trafficlight.setPhase(tl_id, phase_record["phase_idx"])
                     traci.trafficlight.setPhaseDuration(tl_id, phase_record["duration"])
