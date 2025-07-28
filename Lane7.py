@@ -100,6 +100,7 @@ class AdaptivePhaseController:
         self.reward_history = deque(maxlen=50)
         self.R_target = r_base
         self.phase_count = 0
+        self.rl_agent = None
 
         self.emergency_cooldown = {}
         self.emergency_global_cooldown = 0
@@ -407,7 +408,7 @@ class AdaptivePhaseController:
             self.weights = np.array([0.25] * 4)
             return
         use_win = min(window, available)
-        recent = np.mean(self.metric_history[-use_win:], axis=0)
+        recent = np.mean(list(self.metric_history)[-use_win:], axis=0)
         density, speed, wait, queue = recent
 
         speed_importance = 1 - min(speed, 1.0)
@@ -2825,6 +2826,8 @@ def main():
 
 def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episodes=1, num_retries=1, retry_delay=1, mode="train"):
     global controller
+    controller = None  # <-- Add this line
+
 
     # 1. Start the simulation in a background thread and initialize controller
     def simulation_loop():
