@@ -4,7 +4,7 @@ import logging
 from supabase import create_client
 
 SUPABASE_URL = "https://zckiwulodojgcfwyjrcx.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTMxNDQ3NDQsImV4cCI6MjA2ODcyMDc0NH0.glM0KT1bfV_5BgQbOLS5JxhjTjJR5sLNn7nuoNpBtBc"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 logger = logging.getLogger("api_phase_client")
 
@@ -51,7 +51,10 @@ class APIPhaseClient:
                 .eq("tls_id", self.tls_id)\
                 .order("created_at", desc=True).limit(1).execute()
             if response.data:
-                return response.data[0]
+                rec = response.data[0]
+                # Only allow valid phase indices (e.g., phase_idx >= 0)
+                if rec.get("phase_idx") is not None and rec["phase_idx"] >= 0:
+                    return rec
         except Exception as e:
             print(f"[ERROR] API fetch failed: {e}")
         return None

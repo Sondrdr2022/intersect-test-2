@@ -7,7 +7,7 @@ import logging
 
 app = Flask(__name__)
 SUPABASE_URL = "https://zckiwulodojgcfwyjrcx.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTMxNDQ3NDQsImV4cCI6MjA2ODcyMDc0NH0.glM0KT1bfV_5BgQbOLS5JxhjTjJR5sLNn7nuoNpBtBc"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 logger = logging.getLogger("api")
 logging.basicConfig(level=logging.INFO)
@@ -43,33 +43,48 @@ def process_traffic_data():
             _, delta_t, _ = calculate_delta_t(reward)
 
             # Load existing phases
-            phases = supabase.table("phases")\
+            phases_resp = supabase.table("phases")\
                 .select("phase_idx, state, duration")\
                 .eq("tls_id", tls_id)\
                 .execute()
-            if not phases.data:
+            if not phases_resp.data:
                 phases = [{'phase_idx': 0, 'duration': MIN_GREEN, 'state': 'Grrr'}]
             else:
-                phases = phases.data
+                phases = phases_resp.data
 
-            # Update phases (skip any with None as phase_idx)
+            # Only update phases within valid SUMO phase index
+            try:
+                import traci
+                num_phases = len(traci.trafficlight.getCompleteRedYellowGreenDefinition(tls_id)[0].phases)
+            except Exception:
+                num_phases = None  # If not available, skip phase index validation
+
             for phase in phases:
                 if phase.get('phase_idx') is None:
                     print(f"[WARNING] Skipping phase with None phase_idx for tls_id={tls_id}")
                     continue
+                if num_phases is not None and (phase['phase_idx'] < 0 or phase['phase_idx'] >= num_phases):
+                    print(f"[WARNING] Skipping phase_idx={phase['phase_idx']} outside SUMO range")
+                    continue
                 new_duration = int(np.clip(phase['duration'] + delta_t, MIN_GREEN, MAX_GREEN))
-                supabase.table("phases").update({"duration": new_duration, "updated_at": datetime.datetime.now().isoformat()})\
-                    .eq("tls_id", tls_id).eq("phase_idx", phase['phase_idx']).execute()
+                try:
+                    supabase.table("phases").update({"duration": new_duration, "updated_at": datetime.datetime.now().isoformat()})\
+                        .eq("tls_id", tls_id).eq("phase_idx", phase['phase_idx']).execute()
+                except Exception as e:
+                    print(f"[ERROR] Failed to update phase: {e}")
 
-            # Store phase recommendation (only if phase_idx is not None)
-            valid_phases = [p for p in phases if p.get('phase_idx') is not None]
+            # Store phase recommendation (only if phase_idx is not None and valid)
+            valid_phases = [p for p in phases if p.get('phase_idx') is not None and (num_phases is None or (0 <= p['phase_idx'] < num_phases))]
             if valid_phases:
                 latest_phase = max(valid_phases, key=lambda x: x['phase_idx'])
-                supabase.table("phase_recommendations").insert({
-                    "tls_id": tls_id,
-                    "phase_idx": latest_phase['phase_idx'],
-                    "duration": latest_phase['duration']
-                }).execute()
+                try:
+                    supabase.table("phase_recommendations").insert({
+                        "tls_id": tls_id,
+                        "phase_idx": latest_phase['phase_idx'],
+                        "duration": latest_phase['duration']
+                    }).execute()
+                except Exception as e:
+                    print(f"[ERROR] Failed to insert phase recommendation: {e}")
 
             print(f"[INFO] Processed traffic data for tls_id: {tls_id}, record_id: {record_id}")
         except Exception as e:
