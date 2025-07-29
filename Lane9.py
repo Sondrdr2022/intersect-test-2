@@ -9,7 +9,7 @@ from api_phase_client import post_traffic_to_api, get_phases_from_api
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("controller")
 
-os.environ.setdefault('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
+os.environ.setdefault('SUMO_HOME', r'C:\\Program Files (x86)\\Eclipse\\Sumo')
 tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
 if tools not in sys.path:
     sys.path.append(tools)
@@ -41,8 +41,13 @@ class EnhancedQLearningAgent:
         if key not in self.q_table or len(self.q_table[key]) < action_size:
             self.q_table[key] = np.zeros(action_size)
         qs = self.q_table[key][:action_size]
-
+        # Congestion-biased exploration
         if self.mode == "train" and np.random.rand() < self.epsilon:
+            if hasattr(state, 'queues') and hasattr(state, 'waits'):
+                congestion_scores = np.array([q + w * 0.5 for q, w in zip(state.queues, state.waits)])
+                if congestion_scores.sum() > 0:
+                    congestion_scores = congestion_scores / congestion_scores.sum()
+                    return np.random.choice(range(action_size), p=congestion_scores)
             return np.random.randint(action_size)
         return np.argmax(qs)
 
@@ -132,6 +137,7 @@ class UniversalSmartTrafficController:
         # 5. RL agent picks phase
         phase_idx = self.rl_agent.get_action(state, tl_id=self.tls_id, action_size=len(phases))
         phase = phases[phase_idx]
+        # PATCH: Use correct tls_id in getRedYellowGreenState
         expected_state_length = len(traci.trafficlight.getRedYellowGreenState(self.tls_id))
         actual_state_length = len(phase.get('state', ""))
 

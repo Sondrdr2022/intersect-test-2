@@ -15,18 +15,6 @@ SUPABASE_KEY = os.getenv(
 )
 
 def post_traffic_to_api(tls_id, traffic_data):
-    """
-    Send current traffic state to the Supabase Edge Function.
-    The Edge Function will perform all adaptive phase logic (reward, delta_t, phase creation, duration extension, etc),
-    update the phases in Supabase, and return the current list of phases for this intersection.
-
-    Args:
-        tls_id (str): Intersection id.
-        traffic_data (list of dict): List of lane traffic dicts (queue, wait, speed, etc).
-
-    Returns:
-        List of phase objects, each with at least keys: phase_idx, state, duration.
-    """
     payload = {
         "tls_id": tls_id,
         "traffic": traffic_data
@@ -37,19 +25,12 @@ def post_traffic_to_api(tls_id, traffic_data):
     }
     resp = requests.post(SUPABASE_EDGE_URL, json=payload, headers=headers)
     resp.raise_for_status()
-    # The Edge Function should return: {"phases": [...]}
-    return resp.json().get("phases", [])
+    data = resp.json()
+    if "phases" in data:
+        return data["phases"]
+    return []
 
 def get_phases_from_api(tls_id):
-    """
-    Fetch all phases for the given intersection from Supabase.
-
-    Args:
-        tls_id (str): Intersection id.
-
-    Returns:
-        List of phase objects, each with at least keys: phase_idx, state, duration.
-    """
     params = {"tls_id": f"eq.{tls_id}"}
     headers = {
         "apikey": SUPABASE_KEY,

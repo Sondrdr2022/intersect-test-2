@@ -9,7 +9,7 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 function calcReward(traffic) {
-  // Example reward: penalize queue and wait, reward higher speed
+  // Lane 7-style reward: penalize queue and wait, reward higher speed
   let queueSum = 0, waitSum = 0, speedSum = 0;
   for (const lane of traffic){
     queueSum += lane.queue || 0;
@@ -17,13 +17,11 @@ function calcReward(traffic) {
     speedSum += lane.speed || 0;
   }
   const avgSpeed = traffic.length ? speedSum / traffic.length : 0;
-  // Negative reward if queues/waits are high, bonus if average speed is high
   return -queueSum * 1.0 - waitSum * 0.5 + avgSpeed * 2.0;
 }
 function calcDeltaT(reward, lastReward, alpha = 1.0) {
-  // Example logic: extend/shorten phase based on reward improvement
+  // Extend/shorten phase based on reward improvement
   const rawDelta = alpha * (reward - lastReward);
-  // Clip delta_t to [-10, 10] seconds
   return Math.max(-10, Math.min(10, rawDelta));
 }
 serve(async (req)=>{
@@ -46,7 +44,7 @@ serve(async (req)=>{
         }
       });
     }
-    // Get state: queue, wait, speed per lane
+    // Use full expected lane count for phase state
     const expectedStateLength = EXPECTED_LANE_COUNTS[tls_id] || traffic.length;
     const all_lane_ids = traffic.map((lane)=>lane.lane_id);
     // 1. Fetch previous reward for this intersection (simple version: store in a 'phase_meta' table)
@@ -57,20 +55,20 @@ serve(async (req)=>{
     const reward = calcReward(traffic);
     // 3. Compute delta_t (phase duration adjustment)
     const delta_t = calcDeltaT(reward, lastReward);
-    // 4. Generate phases (example: for each lane, green for that lane, red for others, apply delta_t)
-    const baseDuration = 30; // baseline phase duration
+    // 4. Generate phases (per-lane green, protected lefts, all red)
+    const baseDuration = 30;
     const phases = [];
+    // Per-lane phases (one green per lane)
     for(let i = 0; i < all_lane_ids.length; i++){
       let stateArr = [];
       for(let j = 0; j < all_lane_ids.length; j++){
         stateArr.push(i === j ? "G" : "r");
       }
-      // Pad/truncate to expectedStateLength
       while(stateArr.length < expectedStateLength)stateArr.push("r");
       if (stateArr.length > expectedStateLength) stateArr = stateArr.slice(0, expectedStateLength);
       const stateStr = stateArr.join("");
-      // Example: if queue is high on this lane, extend green, else keep base
       const laneQueue = traffic[i]?.queue ?? 0;
+      // Smart phase time: longer for congested lanes
       const duration = Math.max(10, Math.min(80, baseDuration + delta_t + laneQueue));
       phases.push({
         tls_id,
