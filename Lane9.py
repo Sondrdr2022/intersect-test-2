@@ -5,7 +5,7 @@ from traffic_light_display import TrafficLightPhaseDisplay
 from collections import defaultdict
 from api_phase_client import post_traffic_to_api, get_phases_from_api, create_new_phase_in_api
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)  # Use DEBUG for more verbose output
 logger = logging.getLogger("controller")
 
 os.environ.setdefault('SUMO_HOME', r'C:\\Program Files (x86)\\Eclipse\\Sumo')
@@ -14,7 +14,7 @@ if tools not in sys.path:
     sys.path.append(tools)
 
 class APIBasedAdaptiveController:
-    def __init__(self, tls_id, lane_ids):
+    def __init__(self, tls_id, lane_ids, display=None):
         self.tls_id = tls_id
         self.lane_ids = lane_ids
         self.phases = []
@@ -22,6 +22,7 @@ class APIBasedAdaptiveController:
         self.current_phase_idx = 0
         self.min_green = 10
         self.max_green = 60
+        self.display = display
 
     def initialize(self):
         self.update_phases()
@@ -33,13 +34,15 @@ class APIBasedAdaptiveController:
                 queue = traci.lane.getLastStepHaltingNumber(lane_id)
                 wait = traci.lane.getWaitingTime(lane_id)
                 speed = traci.lane.getLastStepMeanSpeed(lane_id)
+                logger.debug(f"[COLLECT] {lane_id}: queue={queue}, wait={wait}, speed={speed}")
                 traffic_data.append({
                     "lane_id": lane_id,
                     "queue": queue,
                     "wait": wait,
                     "speed": speed
                 })
-            except traci.TraCIException:
+            except traci.TraCIException as e:
+                logger.warning(f"[COLLECT] TraCIException for {lane_id}: {e}")
                 traffic_data.append({
                     "lane_id": lane_id,
                     "queue": 0,
@@ -51,11 +54,14 @@ class APIBasedAdaptiveController:
     def update_phases(self):
         expected_state_length = len(traci.trafficlight.getRedYellowGreenState(self.tls_id))
         traffic_data = self.collect_traffic_data()
+        logger.debug(f"[API] Posting traffic data to API for {self.tls_id}, expected_state_length={expected_state_length}")
         self.phases = post_traffic_to_api(
-            self.tls_id, 
-            traffic_data, 
+            self.tls_id,
+            traffic_data,
             expected_state_length=expected_state_length
         )
+        logger.debug(f"[API] Received {len(self.phases)} phases from API: "
+                     f"{[p['state'] for p in self.phases]}")
         self._build_phase_map()
 
     def _build_phase_map(self):
@@ -73,19 +79,33 @@ class APIBasedAdaptiveController:
         if new_phase:
             self.phases.append(new_phase)
             self.phase_map[state_str] = len(self.phases) - 1
+            logger.info(f"[API] Created new phase: idx={len(self.phases)-1}, state={state_str}, duration={duration}")
             return len(self.phases) - 1
         return None
 
     def set_phase(self, phase_idx):
+        logger.debug(f"[SET_PHASE] Trying to set phase_idx={phase_idx}, total phases={len(self.phases)}")
         if 0 <= phase_idx < len(self.phases):
             phase = self.phases[phase_idx]
             try:
                 traci.trafficlight.setPhase(self.tls_id, phase_idx)
                 traci.trafficlight.setPhaseDuration(self.tls_id, phase['duration'])
                 self.current_phase_idx = phase_idx
+                logger.info(f"[SET_PHASE] Set phase {phase_idx} ({phase['state']}) duration={phase['duration']}")
+                if self.display:
+                    now = traci.simulation.getTime()
+                    next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
+                    self.display.update_phase_duration(
+                        phase_idx,
+                        duration=phase['duration'],
+                        current_time=now,
+                        next_switch_time=next_switch
+                    )
                 return True
             except traci.TraCIException as e:
                 logger.error(f"Error setting phase: {e}")
+        else:
+            logger.error(f"[SET_PHASE] Phase index {phase_idx} out of range [0,{len(self.phases)-1}]")
         return False
 
     def create_phase_state(self, green_lanes=None, yellow_lanes=None, red_lanes=None):
@@ -100,7 +120,9 @@ class APIBasedAdaptiveController:
         set_lanes(green_lanes, 'G')
         set_lanes(yellow_lanes, 'y')
         set_lanes(red_lanes, 'r')
-        return "".join(state)
+        s = "".join(state)
+        logger.debug(f"[PHASE_STATE] green={green_lanes} yellow={yellow_lanes} red={red_lanes} -> {s}")
+        return s
 
 class EnhancedQLearningAgent:
     def __init__(self, state_size, action_size, adaptive_controller, learning_rate=0.1, discount_factor=0.95, 
@@ -407,7 +429,11 @@ class UniversalSmartTrafficController:
         self.phase_event_log_file = f"phase_event_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
         self.phase_events = []
         self.rl_agent = None
-        self.apc = APIBasedAdaptiveController(self.tls_id, self.lane_id_list)
+
+        # --- TrafficLightPhaseDisplay integration ---
+        self.display = TrafficLightPhaseDisplay(self.phase_events, poll_interval=500)
+        self.display.start()
+        self.apc = APIBasedAdaptiveController(self.tls_id, self.lane_id_list, display=self.display)
 
     def log_phase_event(self, event: dict):
         event["timestamp"] = datetime.datetime.now().isoformat()
@@ -416,7 +442,7 @@ class UniversalSmartTrafficController:
             with open(self.phase_event_log_file, "wb") as f:
                 pickle.dump(self.phase_events, f, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception as e:
-            print(f"[WARN] Could not write phase_events to file: {e}")
+            logger.warning(f"[WARN] Could not write phase_events to file: {e}")
 
     def initialize(self):
         self.apc.initialize()
@@ -425,18 +451,21 @@ class UniversalSmartTrafficController:
         self.rl_agent = EnhancedQLearningAgent(
             state_size=state_size,
             action_size=action_size,
-            adaptive_controller=self.apc,  
+            adaptive_controller=self.apc,
             mode=self.mode
         )
 
     def run_step(self):
+        logger.debug("[RUN_STEP] Updating phases")
         self.apc.update_phases()
         state = self._create_state_vector()
+        logger.debug(f"[RUN_STEP] RL state: {state}")
         phase_idx = self.rl_agent.get_action(
-            state, 
-            tl_id=self.tls_id, 
+            state,
+            tl_id=self.tls_id,
             action_size=len(self.apc.phases)
         )
+        logger.debug(f"[RUN_STEP] RL agent chose phase_idx={phase_idx}")
         if self.apc.set_phase(phase_idx):
             self.log_phase_event({
                 "action": "phase_set",
@@ -493,7 +522,10 @@ class UniversalSmartTrafficController:
         state_str = self.apc.create_phase_state(green_lanes=[lane_id])
         phase_idx = self.apc.get_phase_by_state(state_str)
         if phase_idx is None:
+            logger.info(f"[EMERGENCY] Creating new phase for emergency lane {lane_id}")
             phase_idx = self.apc.create_new_phase(state_str, self.apc.max_green)
+        else:
+            logger.info(f"[EMERGENCY] Found existing phase for emergency lane {lane_id}: idx={phase_idx}")
         if phase_idx is not None:
             self.apc.set_phase(phase_idx)
             logger.info(f"Emergency priority phase set for {lane_id}")
@@ -502,10 +534,14 @@ class UniversalSmartTrafficController:
         state_str = self.apc.create_phase_state(green_lanes=[lane_id])
         phase_idx = self.apc.get_phase_by_state(state_str)
         if phase_idx is None:
+            logger.info(f"[PROTECTED_LEFT] Creating new protected left phase for lane {lane_id}")
             phase_idx = self.apc.create_new_phase(state_str, self.apc.min_green)
+        else:
+            logger.info(f"[PROTECTED_LEFT] Found existing protected left phase for lane {lane_id}: idx={phase_idx}")
         if phase_idx is not None:
             self.apc.set_phase(phase_idx)
             logger.info(f"Protected left turn phase set for {lane_id}")
+
 def main():
     parser = argparse.ArgumentParser(description="Run universal SUMO RL traffic simulation (API phases)")
     parser.add_argument('--sumo', required=True, help='Path to SUMO config file')
@@ -521,7 +557,7 @@ def main():
             sumo_cmd = [os.path.join(os.environ['SUMO_HOME'], 'bin', sumo_binary), '-c', args.sumo, '--start', '--quit-on-end']
             traci.start(sumo_cmd)
             controller = UniversalSmartTrafficController(args.sumo, mode="train")
-            controller.initialize()  # Only here!
+            controller.initialize()
             step = 0
             while traci.simulation.getMinExpectedNumber() > 0:
                 if args.max_steps and step >= args.max_steps:
