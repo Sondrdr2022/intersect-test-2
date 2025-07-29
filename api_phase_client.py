@@ -4,7 +4,7 @@ import logging
 from supabase import create_client
 
 SUPABASE_URL = "https://zckiwulodojgcfwyjrcx.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTMxNDQ3NDQsImV4cCI6MjA2ODcyMDc0NH0.glM0KT1bfV_5BgQbOLS5JxhjTjJR5sLNn7nuoNpBtBc"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 logger = logging.getLogger("api_phase_client")
 
@@ -23,7 +23,7 @@ class APIPhaseClient:
         required_keys = ['vehicle_count', 'mean_speed', 'queue_length', 'waiting_time', 'density', 'vehicle_ids']
         for lane_id, data in lane_data.items():
             if not all(key in data for key in required_keys):
-                logger.error(f"Invalid lane_data for {lane_id}: missing keys")
+                print(f"[ERROR] Invalid lane_data for {lane_id}: missing keys")
                 return None
 
         payload = {
@@ -38,10 +38,10 @@ class APIPhaseClient:
                 self.last_submission = now
                 return True
             except Exception as e:
-                logger.error(f"API submission failed (attempt {attempt + 1}/{self.max_retries}): {e}")
+                print(f"[ERROR] API submission failed (attempt {attempt + 1}/{self.max_retries}): {e}")
                 if attempt < self.max_retries - 1:
                     time.sleep(self.retry_delay)
-        logger.error("All retry attempts failed")
+        print("[ERROR] All retry attempts failed")
         return False
 
     def get_phase_recommendation(self):
@@ -53,5 +53,5 @@ class APIPhaseClient:
             if response.data:
                 return response.data[0]
         except Exception as e:
-            logger.error(f"API fetch failed: {e}")
+            print(f"[ERROR] API fetch failed: {e}")
         return None

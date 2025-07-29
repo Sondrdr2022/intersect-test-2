@@ -7,7 +7,7 @@ import logging
 
 app = Flask(__name__)
 SUPABASE_URL = "https://zckiwulodojgcfwyjrcx.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTMxNDQ3NDQsImV4cCI6MjA2ODcyMDc0NH0.glM0KT1bfV_5BgQbOLS5JxhjTjJR5sLNn7nuoNpBtBc"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 logger = logging.getLogger("api")
 logging.basicConfig(level=logging.INFO)
@@ -52,23 +52,28 @@ def process_traffic_data():
             else:
                 phases = phases.data
 
-            # Update phases
+            # Update phases (skip any with None as phase_idx)
             for phase in phases:
-                new_duration = np.clip(phase['duration'] + delta_t, MIN_GREEN, MAX_GREEN)
+                if phase.get('phase_idx') is None:
+                    print(f"[WARNING] Skipping phase with None phase_idx for tls_id={tls_id}")
+                    continue
+                new_duration = int(np.clip(phase['duration'] + delta_t, MIN_GREEN, MAX_GREEN))
                 supabase.table("phases").update({"duration": new_duration, "updated_at": datetime.datetime.now().isoformat()})\
                     .eq("tls_id", tls_id).eq("phase_idx", phase['phase_idx']).execute()
 
-            # Store phase recommendation
-            latest_phase = max(phases, key=lambda x: x['phase_idx'])
-            supabase.table("phase_recommendations").insert({
-                "tls_id": tls_id,
-                "phase_idx": latest_phase['phase_idx'],
-                "duration": latest_phase['duration']
-            }).execute()
+            # Store phase recommendation (only if phase_idx is not None)
+            valid_phases = [p for p in phases if p.get('phase_idx') is not None]
+            if valid_phases:
+                latest_phase = max(valid_phases, key=lambda x: x['phase_idx'])
+                supabase.table("phase_recommendations").insert({
+                    "tls_id": tls_id,
+                    "phase_idx": latest_phase['phase_idx'],
+                    "duration": latest_phase['duration']
+                }).execute()
 
-            logger.info(f"Processed traffic data for tls_id: {tls_id}, record_id: {record_id}")
+            print(f"[INFO] Processed traffic data for tls_id: {tls_id}, record_id: {record_id}")
         except Exception as e:
-            logger.error(f"Error processing record {record_id}: {e}")
+            print(f"[ERROR] Error processing record {record_id}: {e}")
 
 def compute_reward(lane_data):
     metrics = np.zeros(4)  # [density, speed, wait, queue]
@@ -106,7 +111,7 @@ def run_polling():
         try:
             process_traffic_data()
         except Exception as e:
-            logger.error(f"Polling error: {e}")
+            print(f"[ERROR] Polling error: {e}")
         time.sleep(1)
 
 if __name__ == "__main__":
