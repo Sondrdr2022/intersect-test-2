@@ -225,7 +225,6 @@ class Lane9Controller:
             self.handle_protected_left(blocked_lane, lane_idx)
             return True
         return False
-
     def apply_phase_recommendation(self, recommendation):
         if recommendation is None:
             print("[WARNING] No phase recommendation available, using default phase")
@@ -236,18 +235,22 @@ class Lane9Controller:
             return
         phase_idx = recommendation.get('phase_idx')
         duration = recommendation.get('duration', self.min_green)
-        if phase_idx is not None:
+        
+        # Validate phase index with SUMO
+        num_phases = len(traci.trafficlight.getProgramLogic(self.tls_id)[0].phases)
+        if phase_idx is not None and 0 <= phase_idx < num_phases:
             try:
                 traci.trafficlight.setPhase(self.tls_id, phase_idx)
                 traci.trafficlight.setPhaseDuration(self.tls_id, duration)
                 print(f"[INFO] API recommended phase: {phase_idx}, duration: {duration}s")
             except traci.TraCIException as e:
                 print(f"[ERROR] Failed to apply phase {phase_idx}: {e}")
-                phases = self.get_all_phases()
-                if phases:
-                    traci.trafficlight.setPhase(self.tls_id, 0)
-                    traci.trafficlight.setPhaseDuration(self.tls_id, self.min_green)
-
+                traci.trafficlight.setPhase(self.tls_id, 0)
+                traci.trafficlight.setPhaseDuration(self.tls_id, self.min_green)
+        else:
+            print(f"[ERROR] Phase index {phase_idx} out of range for tls_id {self.tls_id}. Allowed: 0-{num_phases-1}")
+            traci.trafficlight.setPhase(self.tls_id, 0)
+            traci.trafficlight.setPhaseDuration(self.tls_id, self.min_green)
     def control_step(self):
         try:
             lane_data = self.collect_lane_data()
