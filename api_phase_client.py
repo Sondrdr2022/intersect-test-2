@@ -28,7 +28,9 @@ def post_traffic_to_api(tls_id, traffic_data, expected_state_length=None):
     try:
         resp = requests.post(SUPABASE_EDGE_URL, json=payload, headers=headers)
         resp.raise_for_status()
-        return resp.json().get("phases", [])
+        # Return both phases and reward if present (hybrid mode compatibility)
+        out = resp.json()
+        return out.get("phases", [])
     except Exception as e:
         print(f"API POST error: {e}")
         return get_phases_from_api(tls_id)

@@ -1,4 +1,4 @@
-import os, sys, traci, pickle, threading, warnings, time, argparse, logging
+import os, sys, traci, time, threading, warnings, argparse, logging
 import numpy as np
 
 from api_phase_client import (
@@ -11,16 +11,16 @@ from api_phase_client import (
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("Lane9Controller")
+logger = logging.getLogger("Lane7Middleware")
 
 os.environ.setdefault('SUMO_HOME', r'C:\\Program Files (x86)\\Eclipse\\Sumo')
 tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
 if tools not in sys.path:
     sys.path.append(tools)
 
-class APIBasedPhaseController:
+class MiddlewarePhaseController:
     """
-    Handles all phase/logic via remote API. No local APC logic.
+    Handles all phase/logic via remote API (Edge Function or Middleware). Only detection remains local.
     """
     def __init__(self, tls_id, lane_ids):
         self.tls_id = tls_id
@@ -85,9 +85,9 @@ class APIBasedPhaseController:
 
 class RLAgent:
     """
-    RL agent as in Lane7, but all APC logic is remote (API).
+    RL agent as before, but all APC logic is remote. Q-table is still local.
     """
-    def __init__(self, state_size, action_size, controller, q_table_file="lane9_qtable.pkl"):
+    def __init__(self, state_size, action_size, controller, q_table_file="lane7_qtable.pkl"):
         self.state_size = state_size
         self.action_size = action_size
         self.controller = controller
@@ -119,20 +119,22 @@ class RLAgent:
 
     def save_q_table(self):
         with open(self.q_table_file, "wb") as f:
+            import pickle
             pickle.dump(self.q_table, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     def load_q_table(self):
         try:
             with open(self.q_table_file, "rb") as f:
+                import pickle
                 self.q_table = pickle.load(f)
         except Exception:
             self.q_table = {}
 
-class Lane9Controller:
+class Lane7Controller:
     def __init__(self, tls_id, lane_ids):
         self.tls_id = tls_id
         self.lane_ids = lane_ids
-        self.apc = APIBasedPhaseController(tls_id, lane_ids)
+        self.apc = MiddlewarePhaseController(tls_id, lane_ids)
         self.episode_reward = 0
 
         self.state_size = 6
@@ -167,7 +169,7 @@ class Lane9Controller:
         action = self.agent.get_action(state)
         # 4. Set phase via API
         self.apc.set_phase(action)
-        # 5. Reward: fetch from API (should be available in API or meta endpoint)
+        # 5. Reward: fetch from API (implement if your API returns it; else use 0 or local calc)
         reward = self.get_api_reward()
         # 6. Next state for RL
         next_state = self.get_state_vector()
@@ -181,6 +183,7 @@ class Lane9Controller:
         return 0
 
     def handle_special_cases(self):
+        # Real-time detection stays here!
         for lane_id in self.lane_ids:
             for vid in traci.lane.getLastStepVehicleIDs(lane_id):
                 try:
@@ -229,7 +232,7 @@ class Lane9Controller:
         self.episode_reward = 0
 
 def main():
-    parser = argparse.ArgumentParser(description="Lane9 API-Based RL Controller")
+    parser = argparse.ArgumentParser(description="Lane7 Middleware/Edge Function RL Controller")
     parser.add_argument('--sumo', required=True, help='Path to SUMO config file')
     parser.add_argument('--gui', action='store_true', help='Use SUMO GUI')
     parser.add_argument('--max-steps', type=int, help='Max simulation steps')
@@ -242,7 +245,7 @@ def main():
         traci.start(sumo_cmd)
         tls_id = traci.trafficlight.getIDList()[0]
         lane_ids = [lid for lid in traci.lane.getIDList() if not lid.startswith(":")]
-        controller = Lane9Controller(tls_id, lane_ids)
+        controller = Lane7Controller(tls_id, lane_ids)
         step = 0
         while traci.simulation.getMinExpectedNumber() > 0:
             if args.max_steps and step >= args.max_steps:
