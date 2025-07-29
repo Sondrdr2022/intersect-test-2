@@ -1,103 +1,57 @@
-import os
-import requests
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Optional
+import time
+import datetime
+import logging
+from supabase import create_client
 
-SUPABASE_EDGE_URL = os.getenv(
-    "SUPABASE_EDGE_URL",
-    "https://zckiwulodojgcfwyjrcx.supabase.co/functions/v1/clever-worker"
-)
-SUPABASE_REST_URL = os.getenv(
-    "SUPABASE_REST_URL",
-    "https://zckiwulodojgcfwyjrcx.supabase.co/rest/v1/phases"
-)
-SUPABASE_KEY = os.getenv(
-    "SUPABASE_KEY",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc"
-)
+SUPABASE_URL = "https://zckiwulodojgcfwyjrcx.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc"
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+logger = logging.getLogger("api_phase_client")
 
-app = FastAPI()
+class APIPhaseClient:
+    def __init__(self, tls_id, max_retries=3, retry_delay=1):
+        self.tls_id = tls_id
+        self.last_submission = 0
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
 
-class LaneData(BaseModel):
-    lane_id: str
-    queue: float
-    wait: float
-    speed: float
+    def submit_traffic_data(self, lane_data, sim_time=None):
+        now = time.time()
+        if now - self.last_submission < 2.0:
+            return None
 
-class APCRequest(BaseModel):
-    tls_id: str
-    traffic: List[LaneData]
-    expected_state_length: Optional[int] = None
+        required_keys = ['vehicle_count', 'mean_speed', 'queue_length', 'waiting_time', 'density', 'vehicle_ids']
+        for lane_id, data in lane_data.items():
+            if not all(key in data for key in required_keys):
+                logger.error(f"Invalid lane_data for {lane_id}: missing keys")
+                return None
 
-def calc_reward(traffic):
-    queue_sum = sum(l.queue for l in traffic)
-    wait_sum = sum(l.wait for l in traffic)
-    speed_sum = sum(l.speed for l in traffic)
-    avg_speed = speed_sum / len(traffic) if traffic else 0
-    return -queue_sum * 1.0 - wait_sum * 0.5 + avg_speed * 2.0
+        payload = {
+            "tls_id": self.tls_id,
+            "obs": {"lanes": [{k: v for k, v in data.items()} for k, data in lane_data.items()],
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "sim_time": sim_time}
+        }
+        for attempt in range(self.max_retries):
+            try:
+                supabase.table("traffic_observations").insert(payload).execute()
+                self.last_submission = now
+                return True
+            except Exception as e:
+                logger.error(f"API submission failed (attempt {attempt + 1}/{self.max_retries}): {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+        logger.error("All retry attempts failed")
+        return False
 
-def calc_delta_t(reward, last_reward, alpha=1.0):
-    raw_delta = alpha * (reward - last_reward)
-    return max(-10, min(10, raw_delta))
-
-def get_last_reward_from_supabase(tls_id):
-    url = "https://zckiwulodojgcfwyjrcx.supabase.co/rest/v1/phase_meta"
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    params = {"tls_id": f"eq.{tls_id}"}
-    resp = requests.get(url, headers=headers, params=params)
-    if resp.ok and resp.json():
-        return resp.json()[0].get("last_reward", 0)
-    return 0
-
-@app.post("/apc")
-async def apc_endpoint(req: APCRequest):
-    tls_id = req.tls_id
-    traffic = req.traffic
-    expected_state_length = req.expected_state_length or len(traffic)
-    last_reward = get_last_reward_from_supabase(tls_id)
-    reward = calc_reward(traffic)
-    delta_t = calc_delta_t(reward, last_reward)
-    base_duration = 30
-
-    all_lane_ids = [l.lane_id for l in traffic]
-    phases = []
-    for i, lane in enumerate(traffic):
-        state_arr = ["G" if j == i else "r" for j in range(len(all_lane_ids))]
-        while len(state_arr) < expected_state_length:
-            state_arr.append("r")
-        if len(state_arr) > expected_state_length:
-            state_arr = state_arr[:expected_state_length]
-        state_str = "".join(state_arr)
-        lane_queue = lane.queue
-        duration = max(10, min(80, base_duration + delta_t + lane_queue))
-        phases.append({
-            "tls_id": tls_id,
-            "phase_idx": i,
-            "state": state_str,
-            "duration": duration
-        })
-    # Add all-red phase for safety
-    phases.append({
-        "tls_id": tls_id,
-        "phase_idx": len(all_lane_ids),
-        "state": "r" * expected_state_length,
-        "duration": 7
-    })
-
-    # Optionally: sync with Supabase
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json"
-    }
-    try:
-        requests.post(SUPABASE_REST_URL, json=phases, headers=headers)
-        # Optionally: update meta
-        requests.post("https://zckiwulodojgcfwyjrcx.supabase.co/rest/v1/phase_meta",
-                      json={"tls_id": tls_id, "last_reward": reward}, headers=headers)
-    except Exception as e:
-        # Log error; continue to return phases to client
-        print(f"Error syncing with Supabase: {e}")
-
-    return {"phases": phases, "reward": reward}
+    def get_phase_recommendation(self):
+        try:
+            response = supabase.table("phase_recommendations")\
+                .select("tls_id, phase_idx, duration")\
+                .eq("tls_id", self.tls_id)\
+                .order("created_at", desc=True).limit(1).execute()
+            if response.data:
+                return response.data[0]
+        except Exception as e:
+            logger.error(f"API fetch failed: {e}")
+        return None
