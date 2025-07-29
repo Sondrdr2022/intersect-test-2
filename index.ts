@@ -1,6 +1,5 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-// REMOVE hardcoded EXPECTED_LANE_COUNTS
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -28,7 +27,6 @@ serve(async (req)=>{
     const body = await req.json();
     const tls_id = body.tls_id;
     const traffic = body.traffic;
-    // PATCH: Allow dynamic expected state length
     const expectedStateLength = typeof body.expected_state_length === "number" ? body.expected_state_length : traffic.length;
     if (!tls_id || !Array.isArray(traffic) || traffic.length === 0) {
       return new Response(JSON.stringify({

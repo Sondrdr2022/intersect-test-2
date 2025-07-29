@@ -14,14 +14,13 @@ SUPABASE_KEY = os.getenv(
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc"
 )
 
-
 def post_traffic_to_api(tls_id, traffic_data, expected_state_length=None):
     payload = {
         "tls_id": tls_id,
         "traffic": traffic_data
     }
     if expected_state_length is not None:
-        payload["expectedStateLength"] = expected_state_length
+        payload["expected_state_length"] = expected_state_length
     headers = {
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json"
@@ -67,3 +66,31 @@ def create_new_phase_in_api(tls_id, state_str, duration):
     except Exception as e:
         print(f"API phase creation error: {e}")
         return None
+
+def update_phase_duration_in_api(tls_id, phase_idx, new_duration):
+    url = f"{SUPABASE_REST_URL}?tls_id=eq.{tls_id}&phase_idx=eq.{phase_idx}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+    try:
+        resp = requests.patch(url, json={"duration": new_duration}, headers=headers)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"API phase update error: {e}")
+
+def get_phase_by_state_from_api(tls_id, state_str):
+    params = {"tls_id": f"eq.{tls_id}", "state": f"eq.{state_str}"}
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}"
+    }
+    try:
+        resp = requests.get(SUPABASE_REST_URL, params=params, headers=headers)
+        resp.raise_for_status()
+        phases = resp.json()
+        if phases: return phases[0].get("phase_idx")
+    except Exception as e:
+        print(f"API phase-by-state error: {e}")
+    return None
