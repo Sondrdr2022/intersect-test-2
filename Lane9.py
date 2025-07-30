@@ -1,352 +1,115 @@
 import os
-import sys
+os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 import traci
-import time
-import logging
-from collections import defaultdict
-from api_phase_client import APIPhaseClient
 import numpy as np
+import time
+import threading
+import argparse
 import json
-from supabase import create_client
+import asyncio
+import websockets
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger("Lane9Controller")
+WS_URL = "ws://localhost:8000/apc/ws"
 
-Q_TABLE = {}
-LEARNING_RATE = 0.1
-DISCOUNT_FACTOR = 0.9
-EXPLORATION_RATE = 0.1
-STATE_HISTORY = []
+def gather_lane_data(lane_ids):
+    lanes = []
+    for lid in lane_ids:
+        queue = traci.lane.getLastStepHaltingNumber(lid)
+        waiting_time = traci.lane.getWaitingTime(lid)
+        mean_speed = traci.lane.getLastStepMeanSpeed(lid)
+        length = max(1.0, traci.lane.getLength(lid))
+        density = traci.lane.getLastStepVehicleNumber(lid) / length
+        vids = list(traci.lane.getLastStepVehicleIDs(lid))
+        vclasses = [traci.vehicle.getVehicleClass(vid) for vid in vids]
+        links = traci.lane.getLinks(lid)
+        is_left = any((len(link) > 6 and link[6] == 'l') or (len(link) > 3 and link[3] == 'l') for link in links)
+        is_right = any((len(link) > 6 and link[6] == 'r') or (len(link) > 3 and link[3] == 'r') for link in links)
+        lanes.append({
+            "id": lid,
+            "queue": queue,
+            "wait": waiting_time,
+            "speed": mean_speed,
+            "density": density,
+            "vehicle_ids": vids,
+            "vehicle_classes": vclasses,
+            "is_left": is_left,
+            "is_right": is_right
+        })
+    return lanes
 
-os.environ.setdefault('SUMO_HOME', r'C:\Program Files (x86)\Eclipse\Sumo')
-tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
-if tools not in sys.path:
-    sys.path.append(tools)
+def gather_phase_data(tls_id):
+    phases = []
+    logic = traci.trafficlight.getAllProgramLogics(tls_id)[0]
+    for idx, phase in enumerate(logic.phases):
+        phases.append({
+            "index": idx,
+            "state": phase.state,
+            "duration": float(getattr(phase, "duration", 10))
+        })
+    return phases
 
-def tuple_keys_to_str(d):
-    # Handles nested Q-table dicts (state: {action: value, ...})
-    return {str(k): {str(ak): av for ak, av in v.items()} if isinstance(v, dict) else v for k, v in d.items()}
+def apply_commands(tls_id, commands):
+    logic = traci.trafficlight.getAllProgramLogics(tls_id)[0]
+    phases = list(logic.phases)
+    for cmd in commands:
+        if cmd["action"] == "add_phase":
+            state = cmd["state"]
+            if any(phase.state == state for phase in phases): continue
+            from traci._trafficlight import Phase, Logic
+            phases.append(Phase(cmd["duration"], state))
+            traci.trafficlight.setCompleteRedYellowGreenDefinition(
+                tls_id,
+                Logic(logic.programID, logic.type, len(phases) - 1, phases)
+            )
+        elif cmd["action"] == "switch_phase" and cmd["phase_index"] is not None:
+            traci.trafficlight.setPhase(tls_id, cmd["phase_index"])
+        elif cmd["action"] == "set_duration" and cmd["phase_index"] is not None and cmd["duration"] is not None:
+            traci.trafficlight.setPhase(tls_id, cmd["phase_index"])
+            traci.trafficlight.setPhaseDuration(tls_id, cmd["duration"])
 
-def str_keys_to_tuple(d):
-    import ast
-    return {tuple(ast.literal_eval(k)): v for k, v in d.items()}
-
-class Lane9Controller:
-    def __init__(self, tls_id, lane_ids, min_green=30, max_green=80):
-        self.tls_id = tls_id
-        self.lane_ids = lane_ids
-        self.min_green = min_green
-        self.max_green = max_green
-        self.api_client = APIPhaseClient(tls_id)
-        self.emergency_cooldown = {}
-        self.protected_left_cooldown = defaultdict(float)
-        self.last_phase_switch_sim_time = 0
-        self.last_phase_idx = None
-        self.q_table = Q_TABLE
-        self.episode_reward = 0
-        self.load_state()
-
-    def load_state(self):
-        supabase = create_client("https://zckiwulodojgcfwyjrcx.supabase.co", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc")
-        response = supabase.table("apc_states")\
-            .select("data")\
-            .eq("tls_id", self.tls_id)\
-            .eq("state_type", "full")\
-            .order("updated_at", desc=True)\
-            .limit(1)\
-            .execute()
-        if response.data and len(response.data) > 0:
-            state_str = response.data[0]['data']
-            try:
-                state = json.loads(state_str) if isinstance(state_str, str) else state_str
-                # Deserialize q_table
-                loaded_q_table = state.get('q_table', {})
-                self.q_table.update(str_keys_to_tuple(loaded_q_table))
-                STATE_HISTORY.extend(state.get('state_history', []))
-            except json.JSONDecodeError as e:
-                print(f"[ERROR] Failed to parse state data: {e}")
-        else:
-            print(f"[INFO] No state data found for tls_id: {self.tls_id}")
-
-    def save_state(self):
-        supabase = create_client("https://zckiwulodojgcfwyjrcx.supabase.co", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc")
-        payload = {
-            "tls_id": self.tls_id,
-            "state_type": "full",
-            "data": {
-                "q_table": tuple_keys_to_str(self.q_table),
-                "state_history": STATE_HISTORY
-            }
-        }
-        try:
-            supabase.table("apc_states").insert(payload).execute()
-        except Exception as e:
-            print(f"[ERROR] Failed to save state: {e}")
-
-    def get_state(self, lane_data):
-        if not lane_data:
-            return tuple()
-        state = tuple(int(min(data['queue_length'], 50) // 5) for data in lane_data.values())
-        STATE_HISTORY.append(state)
-        return state
-
-    def get_action(self, state):
-        if np.random.random() < EXPLORATION_RATE:
-            all_phases = self.get_all_phases()
-            return np.random.randint(0, len(all_phases)) if all_phases else 0
-        state_dict = self.q_table.get(state, {})
-        if not state_dict:
-            return 0
-        return max(state_dict.items(), key=lambda x: x[1])[0]
-
-    def update_q_table(self, state, action, reward, next_state):
-        current_q = self.q_table.get(state, {}).get(action, 0.0)
-        next_state_dict = self.q_table.get(next_state, {})
-        max_next_q = max(next_state_dict.values(), default=0.0) if next_state_dict else 0.0
-        new_q = current_q + LEARNING_RATE * (reward + DISCOUNT_FACTOR * max_next_q - current_q)
-        self.q_table.setdefault(state, {})[action] = new_q
-
-    def get_all_phases(self):
-        supabase = create_client("https://zckiwulodojgcfwyjrcx.supabase.co", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc")
-        response = supabase.table("phases")\
-            .select("phase_idx, state, duration")\
-            .eq("tls_id", self.tls_id)\
-            .execute()
-        return response.data if response.data else []
-
-    def create_dynamic_phase(self, lane_idx, green=True):
-        # Only allow creation if within SUMO's phase index range!
-        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
-        new_state = ['r'] * len(controlled_lanes)
-        if green and lane_idx < len(new_state):
-            new_state[lane_idx] = 'G'
-        all_phases = self.get_all_phases()
-        # Only create a phase if it does not exceed SUMO's phase count
-        try:
-            num_phases = len(traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0].phases)
-        except Exception as e:
-            print(f"[ERROR] Could not get SUMO phase count: {e}")
-            num_phases = 0
-        if all_phases:
-            max_idx = max([p['phase_idx'] for p in all_phases if p.get('phase_idx') is not None] + [0])
-            next_idx = max_idx + 1
-        else:
-            next_idx = 0
-        if next_idx >= num_phases:
-            print(f"[WARNING] Not creating phase {next_idx}: exceeds SUMO phase count {num_phases}")
-            return 0  # fallback to zero
-        new_phase = {
-            "tls_id": self.tls_id,
-            "phase_idx": next_idx,
-            "state": ''.join(new_state),
-            "duration": self.min_green
-        }
-        supabase = create_client("https://zckiwulodojgcfwyjrcx.supabase.co", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpja2l3dWxvZG9qZ2Nmd3lqcmN4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzE0NDc0NCwiZXhwIjoyMDY4NzIwNzQ0fQ.FLthh_xzdGy3BiuC2PBhRQUcH6QZ1K5mt_dYQtMT2Sc")
-        try:
-            supabase.table("phases").insert(new_phase).execute()
-        except Exception as e:
-            print(f"[ERROR] Failed to insert dynamic phase: {e}")
-        return new_phase['phase_idx']
-
-    def collect_lane_data(self):
-        data = {}
-        for lane_id in self.lane_ids:
-            try:
-                data[lane_id] = {
-                    "id": lane_id,
-                    "vehicle_count": traci.lane.getLastStepVehicleNumber(lane_id),
-                    "mean_speed": traci.lane.getLastStepMeanSpeed(lane_id),
-                    "queue_length": traci.lane.getLastStepHaltingNumber(lane_id),
-                    "waiting_time": traci.lane.getWaitingTime(lane_id),
-                    "density": traci.lane.getLastStepVehicleNumber(lane_id) / max(1, traci.lane.getLength(lane_id)),
-                    "vehicle_ids": traci.lane.getLastStepVehicleIDs(lane_id)
+async def main_loop():
+    lane_ids = [lid for lid in traci.lane.getIDList() if not lid.startswith(":")]
+    tls_id = traci.trafficlight.getIDList()[0]
+    async with websockets.connect(WS_URL, max_queue=None) as websocket:
+        while traci.simulation.getMinExpectedNumber() > 0:
+            lanes = gather_lane_data(lane_ids)
+            phases = gather_phase_data(tls_id)
+            req = {
+                "intersection": {
+                    "tls_id": tls_id,
+                    "current_phase": traci.trafficlight.getPhase(tls_id),
+                    "phases": phases,
+                    "lanes": lanes,
+                    "sim_time": traci.simulation.getTime()
                 }
-            except traci.TraCIException:
-                continue
-        return data
-
-    def detect_emergency_vehicle(self):
-        now = traci.simulation.getTime()
-        for lane_id in self.lane_ids:
-            for vid in traci.lane.getLastStepVehicleIDs(lane_id):
-                try:
-                    v_type = traci.vehicle.getTypeID(vid)
-                    if 'emergency' in v_type or 'priority' in v_type:
-                        if now - self.emergency_cooldown.get(lane_id, 0) < self.min_green:
-                            continue
-                        self.emergency_cooldown[lane_id] = now
-                        return lane_id, vid
-                except traci.TraCIException:
-                    continue
-        return None, None
-
-    def detect_blocked_left_turn(self):
-        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
-        current_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
-        for lane_idx, lane_id in enumerate(controlled_lanes):
-            if lane_idx >= len(current_state) or current_state[lane_idx] not in 'Gg':
-                continue
-            vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
-            if not vehicles:
-                continue
-            front_vehicle = vehicles[0]
-            speed = traci.vehicle.getSpeed(front_vehicle)
-            stopped_time = traci.vehicle.getAccumulatedWaitingTime(front_vehicle)
-            if speed < 0.2 and stopped_time > 5:
-                return lane_id, lane_idx
-        return None, None
-
-    def handle_emergency(self, lane_id, vid):
-        controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
-        lane_idx = controlled_lanes.index(lane_id)
-        phase_idx = self.create_dynamic_phase(lane_idx)
-        green_duration = max(self.min_green, 20)
-        try:
-            traci.trafficlight.setPhase(self.tls_id, phase_idx)
-            traci.trafficlight.setPhaseDuration(self.tls_id, green_duration)
-            print(f"[INFO] Emergency priority: {vid} on {lane_id} (Phase {phase_idx}, green for {green_duration}s)")
-            actual_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
-            print(f"[DEBUG] Verified state: {actual_state}")
-        except traci.TraCIException as e:
-            print(f"[ERROR] TraCI error during emergency: {e}")
-
-    def handle_protected_left(self, lane_id, lane_idx):
-        phase_idx = self.create_dynamic_phase(lane_idx)
-        queue = traci.lane.getLastStepHaltingNumber(lane_id)
-        wait = traci.lane.getWaitingTime(lane_id)
-        green_duration = min(self.max_green, max(self.min_green, queue * 2 + wait * 0.1))
-        try:
-            traci.trafficlight.setPhase(self.tls_id, phase_idx)
-            traci.trafficlight.setPhaseDuration(self.tls_id, green_duration)
-            print(f"[INFO] Protected left: {lane_id} (Phase {phase_idx}, {green_duration}s)")
-            actual_state = traci.trafficlight.getRedYellowGreenState(self.tls_id)
-            print(f"[DEBUG] Verified state: {actual_state}")
-        except traci.TraCIException as e:
-            print(f"[ERROR] TraCI error during protected left: {e}")
-
-    def compute_reward(self, lane_data):
-        metrics = np.array([0.0, 0.0, 0.0, 0.0])  # [density, speed, wait, queue]
-        valid_lanes = 0
-        for data in lane_data.values():
-            metrics += np.array([
-                min(data['density'], 0.2) / 0.2,
-                min(data['mean_speed'], 13.89) / 13.89,
-                min(data['waiting_time'], 300) / 300,
-                min(data['queue_length'], 50) / 50
-            ])
-            valid_lanes += 1
-        avg_metrics = metrics / valid_lanes if valid_lanes > 0 else np.zeros(4)
-        weights = np.array([0.25, 0.25, 0.25, 0.25])
-        reward = 100 * (-weights[0] * avg_metrics[0] + weights[1] * avg_metrics[1] -
-                       weights[2] * avg_metrics[2] - weights[3] * avg_metrics[3])
-        return np.clip(reward, -100, 100)
-
-    def handle_priority_events(self):
-        emergency_lane, vid = self.detect_emergency_vehicle()
-        if emergency_lane:
-            self.handle_emergency(emergency_lane, vid)
-            return True
-        blocked_lane, lane_idx = self.detect_blocked_left_turn()
-        if blocked_lane:
-            self.handle_protected_left(blocked_lane, lane_idx)
-            return True
-        return False
-
-    def apply_phase_recommendation(self, recommendation):
-        if recommendation is None:
-            print("[WARNING] No phase recommendation available, using default phase")
-            phases = self.get_all_phases()
-            if phases:
-                try:
-                    traci.trafficlight.setPhase(self.tls_id, 0)
-                    traci.trafficlight.setPhaseDuration(self.tls_id, self.min_green)
-                except Exception as e:
-                    print(f"[ERROR] Failed to set default phase: {e}")
-            return
-        phase_idx = recommendation.get('phase_idx')
-        duration = recommendation.get('duration', self.min_green)
-        try:
-            num_phases = len(traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0].phases)
-        except Exception as e:
-            print(f"[ERROR] Could not get SUMO phase count: {e}")
-            num_phases = 0
-        if phase_idx is not None and 0 <= phase_idx < num_phases:
-            try:
-                traci.trafficlight.setPhase(self.tls_id, phase_idx)
-                traci.trafficlight.setPhaseDuration(self.tls_id, duration)
-                print(f"[INFO] API recommended phase: {phase_idx}, duration: {duration}s")
-            except traci.TraCIException as e:
-                print(f"[ERROR] Failed to apply phase {phase_idx}: {e}")
-                try:
-                    traci.trafficlight.setPhase(self.tls_id, 0)
-                    traci.trafficlight.setPhaseDuration(self.tls_id, self.min_green)
-                except Exception as ex:
-                    print(f"[ERROR] Failed to set fallback phase: {ex}")
-        else:
-            print(f"[ERROR] Phase index {phase_idx} out of range for tls_id {self.tls_id}. Allowed: 0-{num_phases-1}")
-            try:
-                traci.trafficlight.setPhase(self.tls_id, 0)
-                traci.trafficlight.setPhaseDuration(self.tls_id, self.min_green)
-            except Exception as ex:
-                print(f"[ERROR] Failed to set fallback phase: {ex}")
-
-    def control_step(self):
-        try:
-            lane_data = self.collect_lane_data()
-            sim_time = traci.simulation.getTime()
-            try:
-                self.api_client.submit_traffic_data(lane_data, sim_time=sim_time)
-            except Exception as e:
-                print(f"[ERROR] Failed to submit traffic data: {e}")
-            if self.handle_priority_events():
-                return
-            recommendation = self.api_client.get_phase_recommendation()
-            self.apply_phase_recommendation(recommendation)
-            current_state = self.get_state(lane_data)
-            reward = self.compute_reward(lane_data)
-            next_state = self.get_state(self.collect_lane_data()) if STATE_HISTORY else current_state
-            self.update_q_table(current_state, traci.trafficlight.getPhase(self.tls_id), reward, next_state)
-            self.episode_reward += reward
-            print(f"[DEBUG] Reward: {reward}, Episode Reward: {self.episode_reward}")
-            self.save_state()
-        except traci.TraCIException as e:
-            print(f"[ERROR] TraCI error: {e}")
-            try:
-                traci.close()
-            except Exception as ex:
-                print(f"[ERROR] Error during traci.close(): {ex}")
-            sys.exit(1)
+            }
+            await websocket.send(json.dumps(req))
+            data = await websocket.recv()
+            data = json.loads(data)
+            apply_commands(tls_id, data["commands"])
+            traci.simulationStep()
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Lane9 API-Based Traffic Controller")
+    parser = argparse.ArgumentParser(description="Run SUMO RL simulation via API controller (WebSocket)")
     parser.add_argument('--sumo', required=True, help='Path to SUMO config file')
     parser.add_argument('--gui', action='store_true', help='Use SUMO GUI')
-    parser.add_argument('--max-steps', type=int, help='Max simulation steps')
-    parser.add_argument('--episodes', type=int, default=1, help='Episodes')
+    parser.add_argument('--max-steps', type=int, help='Maximum simulation steps per episode')
+    parser.add_argument('--episodes', type=int, default=1, help='Number of episodes to run')
     args = parser.parse_args()
-    sumo_binary = "sumo-gui" if args.gui else "sumo"
-    sumo_cmd = [os.path.join(os.environ['SUMO_HOME'], 'bin', sumo_binary), '-c', args.sumo, '--start', '--quit-on-end']
+    start_universal_simulation(args.sumo, args.gui, args.max_steps, args.episodes)
 
-    for episode in range(args.episodes):
-        traci.start(sumo_cmd)
-        tls_id = traci.trafficlight.getIDList()[0]
-        lane_ids = traci.trafficlight.getControlledLanes(tls_id)
-        controller = Lane9Controller(tls_id, lane_ids)
-        step = 0
-        while traci.simulation.getMinExpectedNumber() > 0:
-            if args.max_steps and step >= args.max_steps:
-                break
-            controller.control_step()
-            traci.simulationStep()
-            step += 1
-        print(f"[INFO] Episode {episode} completed, Total Reward: {controller.episode_reward}")
-        try:
+def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episodes=1):
+    def simulation_loop():
+        for episode in range(episodes):
+            sumo_binary = "sumo-gui" if use_gui else "sumo"
+            sumo_cmd = [os.path.join(os.environ['SUMO_HOME'], 'bin', sumo_binary), '-c', sumocfg_path, '--start', '--quit-on-end']
+            traci.start(sumo_cmd)
+            asyncio.run(main_loop())
             traci.close()
-        except Exception as e:
-            print(f"[ERROR] Error during traci.close(): {e}")
-        if episode < args.episodes - 1:
-            time.sleep(2)
+            if episode < episodes - 1: time.sleep(2)
+    sim_thread = threading.Thread(target=simulation_loop)
+    sim_thread.start()
+    sim_thread.join()
 
 if __name__ == "__main__":
     main()
