@@ -30,7 +30,6 @@ if tools not in sys.path:
 # ---- Utility Functions ----
 
 def verify_supabase_connection():
-    """Verify Supabase connection and table structure."""
     try:
         supabase.table("apc_states").select("id").limit(1).execute()
         print("✅ Supabase connection successful")
@@ -40,10 +39,6 @@ def verify_supabase_connection():
         return False
 
 def fix_phase_states_and_missing_greens(phases, controlled_lanes, min_green=10):
-    """
-    Ensure phase.state strings match the number of controlled lanes
-    and every lane has at least one green phase.
-    """
     n_lanes = len(controlled_lanes)
     for phase in phases:
         if len(phase.state) > n_lanes:
@@ -58,7 +53,6 @@ def fix_phase_states_and_missing_greens(phases, controlled_lanes, min_green=10):
     return phases
 
 def override_sumo_program_from_supabase(apc, current_phase_idx=None):
-    """Override SUMO traffic light logic with Supabase-stored phase sequence."""
     phase_seq = apc.get_full_phase_sequence()
     if not phase_seq:
         logger.warning(f"No Supabase phase sequence for {apc.tls_id}, skipping override.")
@@ -76,7 +70,6 @@ def override_sumo_program_from_supabase(apc, current_phase_idx=None):
     logger.info(f"Overrode SUMO program for {apc.tls_id} with {len(phases)} Supabase phases.")
 
 def override_all_tls_with_supabase(controller, current_phase_idx=None):
-    """Override all TLS logic from Supabase records."""
     logger.info("Overriding all TLS logic from Supabase records...")
     for tl_id, apc in getattr(controller, 'adaptive_phase_controllers', {}).items():
         phase_seq = apc.get_full_phase_sequence()
@@ -94,7 +87,6 @@ def override_all_tls_with_supabase(controller, current_phase_idx=None):
         logger.info(f"Set Supabase logic for {tl_id} ({len(traci_phases)} phases)")
 
 class AsyncSupabaseWriter(threading.Thread):
-    """Background thread to periodically flush Supabase writes for an APC."""
     def __init__(self, apc, interval=2):
         super().__init__(daemon=True)
         self.apc = apc
@@ -110,7 +102,6 @@ class AsyncSupabaseWriter(threading.Thread):
         self.running = False
 
 def retry_supabase_operation(operation, max_retries=3):
-    """Retry Supabase operations with exponential backoff."""
     for attempt in range(max_retries):
         try:
             return operation()
@@ -123,12 +114,6 @@ def retry_supabase_operation(operation, max_retries=3):
 
 
 class AdaptivePhaseController:
-    """
-    Adaptive controller for a SUMO traffic light with Supabase integration and RL compatibility.
-    Handles dynamic phase requests, starvation prevention, congestion management,
-    protected left-turn logic, and event logging.
-    """
-
     def __init__(self, lane_ids, tls_id, alpha=1.0, min_green=30, max_green=80,
                  r_base=0.5, r_adjust=0.1, severe_congestion_threshold=0.8,
                  large_delta_t=20):
@@ -183,9 +168,6 @@ class AdaptivePhaseController:
     # ----- Phase Request/Transition/Starvation/Preemption -----
 
     def request_phase_change(self, phase_idx, priority_type='normal', extension_duration=None):
-        """
-        Request a phase change, with priority handling to prevent starvation and allow preemption.
-        """
         current_time = traci.simulation.getTime()
         priority_order = {'critical_starvation': 10, 'emergency': 9, 'heavy_congestion': 7, 'starvation': 5, 'normal': 1}
         current_priority = priority_order.get(self.pending_priority_type, 0)
@@ -211,7 +193,6 @@ class AdaptivePhaseController:
             return False
 
     def is_phase_ending(self):
-        """Check if the current phase is about to end (within 2s or 10% of time left)."""
         try:
             current_time = traci.simulation.getTime()
             next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
@@ -222,7 +203,6 @@ class AdaptivePhaseController:
             return False
 
     def clear_pending_requests(self):
-        """Clear any pending phase change requests."""
         if self.pending_phase_request is not None:
             print(f"[PENDING REQUEST CLEARED] {self.tls_id}: Cleared pending phase {self.pending_phase_request}")
         self.pending_phase_request = None
@@ -231,7 +211,6 @@ class AdaptivePhaseController:
         self.pending_request_timestamp = 0
 
     def process_pending_requests_on_phase_end(self):
-        """Process pending phase change requests when phase ends."""
         if self.pending_phase_request is None:
             return False
         current_time = traci.simulation.getTime()
@@ -263,7 +242,6 @@ class AdaptivePhaseController:
     # ----- Supabase State Management -----
 
     def flush_pending_supabase_writes(self):
-        """Write any pending state to Supabase with retries and fixed constraint handling."""
         with self._db_lock:
             if not self._pending_db_ops:
                 return
@@ -290,7 +268,6 @@ class AdaptivePhaseController:
                     else:
                         time.sleep(0.5 * (attempt + 1))
     def _load_apc_state_supabase(self):
-        """Load APC state from Supabase or initialize if missing."""
         try:
             response = supabase.table("apc_states").select("data, updated_at").eq("tls_id", self.tls_id).eq("state_type", "full").order("updated_at", desc=True).limit(1).execute()
             if response.data and len(response.data) > 0:
@@ -304,7 +281,6 @@ class AdaptivePhaseController:
             self.apc_state = {"events": [], "phases": []}
 
     def _save_apc_state_supabase(self):
-        """Save a copy of current APC state to Supabase if available."""
         if self.supabase_available:
             self._pending_db_ops.append(self.apc_state.copy())
         else:
@@ -313,21 +289,18 @@ class AdaptivePhaseController:
     # ----- Phase/Reward/Traffic Logic -----
 
     def get_full_phase_sequence(self):
-        """Get the full phase sequence from PKL or current Sumo logic."""
         phase_records = sorted(self.apc_state.get("phases", []), key=lambda x: x["phase_idx"])
         if not phase_records:
             return [(p.state, p.duration) for p in self._phase_defs]
         return [(rec["state"], rec["duration"]) for rec in phase_records]
 
     def load_phase_from_supabase(self, phase_idx=None):
-        """Load a phase record from Supabase state."""
         for p in self.apc_state.get("phases", []):
             if p["phase_idx"] == phase_idx:
                 return p
         return None
 
     def update_lane_serving_status(self):
-        """Update which lanes are currently being served (green)."""
         current_phase_idx = traci.trafficlight.getPhase(self.tls_id)
         current_time = traci.simulation.getTime()
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -340,7 +313,6 @@ class AdaptivePhaseController:
                 self.last_served_time[lane_id] = current_time
 
     def get_lane_stats(self, lane_id):
-        """Return (queue, waiting_time, mean_speed, density) for the lane."""
         try:
             queue = traci.lane.getLastStepHaltingNumber(lane_id)
             waiting_time = traci.lane.getWaitingTime(lane_id)
@@ -352,7 +324,6 @@ class AdaptivePhaseController:
             return 0, 0, 0, 0
 
     def adjust_weights(self, window=10):
-        """Dynamically adjust reward weights based on recent metrics."""
         available = len(self.metric_history)
         if available == 0:
             self.weights = np.array([0.25] * 4)
@@ -373,7 +344,6 @@ class AdaptivePhaseController:
         print(f"[ADAPTIVE WEIGHTS] {self.tls_id}: {self.weights}")
 
     def calculate_reward(self, bonus=0, penalty=0):
-        """Calculate the reward signal (R) for RL/phase adjustment."""
         metrics = np.zeros(4)
         valid_lanes = 0
         MAX_VALUES = [0.2, 13.89, 300, 50]
@@ -413,16 +383,12 @@ class AdaptivePhaseController:
         return self.last_R
 
     def update_R_target(self, window=10):
-        """Periodically update target reward for delta_t calculation."""
         if len(self.reward_history) < window or self.phase_count % 10 != 0:
             return
         avg_R = np.mean(list(self.reward_history)[-window:])
         self.R_target = self.r_base + self.r_adjust * (avg_R - self.r_base)
         print(f"\n[TARGET UPDATE] R_target={self.R_target:.2f} (avg={avg_R:.2f})")
     def is_phase_ending(self):
-        """
-        Check if current phase is about to end (within 2 seconds or 10% of remaining time)
-        """
         try:
             current_time = traci.simulation.getTime()
             next_switch = traci.trafficlight.getNextSwitch(self.tls_id)
@@ -439,7 +405,6 @@ class AdaptivePhaseController:
     # PATCH 5: Add phase record storage to separate table (optional)
     def save_phase_record_to_supabase(self, phase_idx, duration, state_str, delta_t, raw_delta_t, penalty,
                                     reward=None, bonus=None, weights=None, event_type=None, lanes=None):
-        """Save individual phase record to dedicated table"""
         try:
             phase_record = {
                 "tls_id": self.tls_id,
@@ -468,7 +433,6 @@ class AdaptivePhaseController:
 
     # PATCH 6: Add event logging to separate table
     def log_event_to_supabase(self, event):
-        """Log events to dedicated simulation_events table"""
         try:
             event_record = {
                 "tls_id": self.tls_id,
@@ -487,7 +451,6 @@ class AdaptivePhaseController:
 
     # PATCH: Add method to process pending requests when phase ends
     def _initialize_base_durations(self):
-        """Patch: Ensure every phase in SUMO has an initial base_duration logged."""
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         for idx, phase in enumerate(logic.getPhases()):
             found = False
@@ -508,16 +471,6 @@ class AdaptivePhaseController:
         print(f"[LOG] {action_type} phase {phase}: {old_duration} -> {new_duration}")    
  
     def find_phase_to_overwrite(self, new_state, exclude_indices=None):
-        """
-        Find the best existing phase to overwrite with a new phase state.
-        
-        Args:
-            new_state (str): The state string of the new phase to be added
-            exclude_indices (list): Optional list of phase indices that should not be overwritten
-            
-        Returns:
-            int: The index of the phase to overwrite, or None if no suitable phase found
-        """
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         phases = logic.phases
         
@@ -580,17 +533,6 @@ class AdaptivePhaseController:
         return best_phase_idx
 
     def overwrite_phase(self, phase_idx, new_state, new_duration):
-        """
-        Overwrite an existing phase with a new state and duration.
-        
-        Args:
-            phase_idx (int): Index of the phase to overwrite
-            new_state (str): New state string for the phase
-            new_duration (float): New duration for the phase
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
         try:
             # Get current logic
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -652,7 +594,6 @@ class AdaptivePhaseController:
             return False
 
     def create_or_extend_phase(self, green_lanes, delta_t):
-        """Fixed version to properly create or extend phases."""
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         valid_green_lanes = [lane for lane in green_lanes if lane in controlled_lanes]
@@ -734,10 +675,6 @@ class AdaptivePhaseController:
             return new_phase_idx
 
     def calculate_delta_t_and_penalty(self, R):
-        """
-        Calculate adaptive time adjustment based on reward (R), with both increase and decrease logic.
-        Returns raw_delta_t, delta_t, and penalty.
-        """
         # Raw delta-t is proportional to the reward difference
         raw_delta_t = self.alpha * (R - self.R_target)
 
@@ -822,7 +759,6 @@ class AdaptivePhaseController:
         self.last_R = np.clip(R, -100, 100)
         return self.last_R, bonus, penalty
     def shutdown(self):
-        """Gracefully stop the background writer and flush all state."""
         self._db_writer.stop()
         self.flush_pending_supabase_writes()
     def log_phase_switch(self, new_phase_idx):
@@ -1011,9 +947,6 @@ class AdaptivePhaseController:
             return 'severe_congestion', lane_id
         return None, None
     def find_best_phase_for_traffic(self):
-        """
-        Find the best phase to serve current traffic based on queue lengths and waiting times.
-        """
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         
@@ -1052,7 +985,6 @@ class AdaptivePhaseController:
         return best_phase
     # PATCH: Add helper method to find phase for lane
     def find_or_create_phase_for_lane(self, lane_id):
-        """Find existing phase that serves the lane, or create one if needed, with debug logging."""
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         
@@ -1073,7 +1005,6 @@ class AdaptivePhaseController:
 
     # PATCH: Override reorganize_or_create_phase to use pending requests
     def reorganize_or_create_phase(self, lane_id, event_type):
-        """Modified to use pending request system"""
         try:
             is_left_turn = any(link[6] == 'l' for link in traci.lane.getLinks(lane_id))
             now = traci.simulation.getTime()
@@ -1104,7 +1035,6 @@ class AdaptivePhaseController:
 
     # PATCH: Add status method for debugging
     def get_pending_request_status(self):
-        """Get current pending request status for debugging"""
         return {
             "pending_phase": self.pending_phase_request,
             "pending_extension": self.pending_extension_request,
@@ -1146,7 +1076,6 @@ class AdaptivePhaseController:
     
 
     def calculate_delta_t(self, R):
-        """Calculate adaptive time adjustment with smoothing"""
         raw_delta_t = self.alpha * (R - self.R_target)
         delta_t = 10 * np.tanh(raw_delta_t / 20)
         print(f"[DELTA_T] R={R:.2f}, R_target={self.R_target:.2f}, Δt={delta_t:.2f}")
@@ -1154,7 +1083,6 @@ class AdaptivePhaseController:
 
 
     def add_new_phase_for_lane(self, lane_id, green_duration=None, yellow_duration=3):
-        """Create phase for single lane, log RL-creation intent."""
         idx = self.add_new_phase(
             green_lanes=[lane_id],
             green_duration=green_duration or self.max_green,
@@ -1170,7 +1098,6 @@ class AdaptivePhaseController:
         return idx
 
     def get_protected_left_lanes(self):
-        """Return list of lanes that serve as protected left turns."""
         protected_lefts = []
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         for lane_id in controlled_lanes:
@@ -1181,9 +1108,6 @@ class AdaptivePhaseController:
         return protected_lefts
 
     def get_conflicting_straight_lanes(self, left_lane):
-        """
-        Given a left turn lane, return lanes that conflict with the left turn movement.
-        """
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         conflicting_lanes = []
         
@@ -1212,13 +1136,6 @@ class AdaptivePhaseController:
 
         return conflicting_lanes
     def create_protected_left_phase_for_lane(self, left_lane):
-        """
-        Create a new protected left phase for the specified left turn lane,
-        using link-based phase state for SUMO compatibility.
-        MODIFIED: Now uses phase overwriting instead of appending.
-        
-        Returns the phase index of the newly created or overwritten phase, or None on failure.
-        """
         try:
             controlled_links = traci.trafficlight.getControlledLinks(self.tls_id)
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -1269,16 +1186,6 @@ class AdaptivePhaseController:
             traceback.print_exc()
             return None
     def rl_create_or_overwrite_phase(self, state_vector, desired_green_lanes=None):
-        """
-        RL agent decides to create a new phase or overwrite an existing one based on current state.
-        
-        Args:
-            state_vector: Current state vector for the RL agent
-            desired_green_lanes: List of lanes that should be green in the new phase
-            
-        Returns:
-            int: The phase index of the created/overwritten phase
-        """
         if not hasattr(self.rl_agent, 'phase_overwrite_threshold'):
             # Initialize phase overwrite threshold (how often we overwrite vs append)
             self.rl_agent.phase_overwrite_threshold = 0.7
@@ -1443,9 +1350,7 @@ class AdaptivePhaseController:
         })
 
     def set_phase_from_API(self, phase_idx, requested_duration=None):
-        """
-        FIXED: Reset timer always, track extended time correctly, update display.
-        """
+
         print(f"[FIXED] set_phase_from_API({phase_idx}, requested_duration={requested_duration})")
         
         # Load phase from Supabase if available
@@ -1488,7 +1393,6 @@ class AdaptivePhaseController:
 
 
     def needs_yellow_transition(self, from_phase, to_phase):
-        """Check if yellow transition is needed between phases"""
         try:
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
             from_state = logic.getPhases()[from_phase].state
@@ -1503,7 +1407,6 @@ class AdaptivePhaseController:
             return False
 
     def find_yellow_transition_phase(self, from_phase, to_phase):
-        """Find existing yellow transition phase"""
         try:
             logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
             from_state = logic.getPhases()[from_phase].state
@@ -1528,7 +1431,6 @@ class AdaptivePhaseController:
             return None
 
     def _delayed_phase_switch(self, phase_idx, requested_duration):
-        """Execute delayed phase switch after yellow"""
         try:
             traci.trafficlight.setPhase(self.tls_id, phase_idx)
             if requested_duration:
@@ -1538,7 +1440,6 @@ class AdaptivePhaseController:
             print(f"[ERROR] Delayed phase switch failed: {e}")   
            
     def is_in_protected_left_phase(self):
-        """Return (lane_id, phase_idx) if currently in a protected left phase, else (None, None)"""
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         current_phase = traci.trafficlight.getPhase(self.tls_id)
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
@@ -1554,10 +1455,7 @@ class AdaptivePhaseController:
                 return lane_id, current_phase
         return None, None
     def step_extend_protected_left_if_blocked(self):
-        """
-        FIXED: If in protected left phase and blockage persists, extend the phase.
-        Otherwise, find a better phase and switch to it.
-        """
+
         lane_id, phase_idx = self.is_in_protected_left_phase()
         if lane_id is None:
             return False
@@ -1614,6 +1512,28 @@ class AdaptivePhaseController:
                 return True
                 
         return False
+    def ensure_phases_have_green(self):
+
+        logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
+        changed = False
+        for idx, phase in enumerate(logic.getPhases()):
+            if 'G' not in phase.state:
+                # Find the first red (or any) and turn it green
+                state_list = list(phase.state)
+                for i, ch in enumerate(state_list):
+                    if ch == 'r':
+                        state_list[i] = 'G'
+                        break
+                else:
+                    # If no red, just set the first position to green as a fallback
+                    state_list[0] = 'G'
+                new_state = ''.join(state_list)
+                print(f"[PATCH] Phase {idx} had no green, fixing: {phase.state} → {new_state}")
+                # Overwrite the phase with corrected state
+                self.overwrite_phase(idx, new_state, phase.duration)
+                changed = True
+        if changed:
+            print("[PATCH] All phases now have at least one green light.")
     def ensure_true_protected_left_phase(self, left_lane):
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
@@ -1657,7 +1577,6 @@ class AdaptivePhaseController:
         return len(phases) - 2
 
     def is_lane_green(self, lane_id):
-        """Check if the specified lane currently has a green light."""
         try:
             controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
             if lane_id not in controlled_lanes:
@@ -1678,10 +1597,6 @@ class AdaptivePhaseController:
             print(f"[ERROR] Failed to check green status for {lane_id}: {e}")
             return False 
     def detect_blocked_left_turn_with_conflict(self):
-        """
-        Enhanced detection of blocked left turns using combined speed/queue and occupancy criteria.
-        Returns (lane_id, needs_protection) tuple with comprehensive logging.
-        """
         print(f"[DEBUG] Checking left-turn lanes for blockage...")
         
         try:
@@ -1791,9 +1706,6 @@ class AdaptivePhaseController:
             print(f"[ERROR] Enhanced left turn detection failed: {e}")
             return None, False    
     def serve_protected_left_turn(self, left_lane):
-        """
-        Serve protected left turn by creating a new phase and activating it
-        """
         try:
             # Always create a new dedicated protected left phase
             phase_idx = self.create_protected_left_phase(left_lane)
@@ -1825,31 +1737,49 @@ class AdaptivePhaseController:
             return False
 
     def serve_true_protected_left_if_needed(self):
-        """
-        Entry point: If a left lane is blocked, create and activate a protected left phase.
-        Uses link-based state construction for SUMO compatibility.
-        """
         lane_id, needs_protection = self.detect_blocked_left_turn_with_conflict()
         if not needs_protection or lane_id is None:
             return False
-
+            
+        # Get current phase and how long it's been active
+        current_phase = traci.trafficlight.getPhase(self.tls_id)
+        current_time = traci.simulation.getTime()
+        time_in_phase = current_time - self.last_phase_switch_sim_time
+        
+        # CRITICAL FIX: If we've been serving the same protected left phase for too long,
+        # force a change to serve other movements
+        if time_in_phase > 30:  # 30 seconds max for any protected left phase
+            # Find a different phase that serves heavy traffic
+            next_phase = self.find_best_phase_for_traffic()
+            if next_phase is not None and next_phase != current_phase:
+                print(f"[ROTATION] Protected left phase {current_phase} has been active for {time_in_phase:.1f}s. Rotating to phase {next_phase}")
+                self.set_phase_from_API(next_phase)
+                return True
+        
+        # Don't re-request the same phase we're already in
         phase_idx = self.create_protected_left_phase_for_lane(lane_id)
         if phase_idx is None:
             print(f"[PATCH] Could not create protected left phase for {lane_id}")
             return False
-
-        # Calculate dynamic green as before (optional)
+            
+        # IMPORTANT FIX: Don't activate the same phase we're already in
+        if phase_idx == current_phase:
+            # Only extend the duration if needed
+            remaining_time = traci.trafficlight.getNextSwitch(self.tls_id) - current_time
+            if remaining_time < 15:  # Only extend if less than 15 seconds left
+                print(f"[ROTATION] Already in protected left phase {phase_idx}, extending duration")
+                traci.trafficlight.setPhaseDuration(self.tls_id, 15)
+            return True
+            
+        # Proceed with normal phase activation for a different phase
         queue = traci.lane.getLastStepHaltingNumber(lane_id)
         wait = traci.lane.getWaitingTime(lane_id)
         green_duration = min(self.max_green, max(self.min_green, queue * 2 + wait * 0.1))
-
-        # Activate
+        
         self.set_phase_from_API(phase_idx, requested_duration=green_duration)
         print(f"[PATCH] Activated protected left phase {phase_idx} for lane {lane_id} (duration: {green_duration}s)")
-        return True
-            
+        return True           
     def check_phase_limit(self):
-        """Check if we're at the SUMO phase limit and log a warning if so"""
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         num_phases = len(logic.phases)
         max_phases = 12  # SUMO hard limit
@@ -1865,11 +1795,6 @@ class AdaptivePhaseController:
             # Consider reusing or overwriting phases instead of adding
             pass
     def insert_yellow_phase_if_needed(self, from_phase, to_phase):
-        """
-        FIXED: When switching phases, if any lane is going from green to red,
-        insert a yellow phase before switching and wait for it to complete.
-        Handle phase limit by reusing existing yellow phases or overwriting.
-        """
         if from_phase == to_phase:
             return False
             
@@ -1973,11 +1898,6 @@ class AdaptivePhaseController:
             print(f"[ERROR] Yellow phase insertion failed: {e}")
             return False    
     def generate_optimal_phase_set(self, controlled_lanes):
-        """
-        Generate comprehensive phase set with proper yellow transitions for SUMO.
-        Ensures every possible green-to-red transition between phases has a yellow phase.
-        No duplicate phases are added. Every lane is guaranteed at least one green phase.
-        """
         phases = []
         phase_state_set = set()
 
@@ -2061,7 +1981,6 @@ class AdaptivePhaseController:
 
         return phases
     def enforce_min_green(self):
-        """Return True if enough time has passed since last phase switch."""
         current_sim_time = traci.simulation.getTime()
         elapsed = current_sim_time - self.last_phase_switch_sim_time
         if elapsed < self.min_green:
@@ -2071,11 +1990,6 @@ class AdaptivePhaseController:
 
 
     def adjust_phase_duration(self, delta_t):
-        """
-        Adjust the duration of the current phase using delta_t, allowing both increase and decrease.
-        This patch ensures the phase duration is reset (not accumulated), logs the change for display,
-        and accurately calculates extended_time.
-        """
         try:
             # Enforce minimum green time
             if not self.enforce_min_green() and not self.check_priority_conditions():
@@ -2116,10 +2030,6 @@ class AdaptivePhaseController:
             return traci.trafficlight.getPhaseDuration(self.tls_id)   
     
     def assess_traffic_conditions(self):
-        """
-        Placeholder for future traffic state assessment.
-        Returns a dummy object for now.
-        """
         class DummyTrafficState:
             has_emergency = False
             emergency_lane = None
@@ -2129,11 +2039,16 @@ class AdaptivePhaseController:
             starvation_threshold = 10000
             def get_starved_lanes(self, threshold): return []
         return DummyTrafficState()
-
+    def _get_phase_count(self, tls_id=None):
+        try:
+            if tls_id is None:
+                tls_id = self.tls_id
+            logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(tls_id)[0]
+            return len(logic.getPhases())
+        except Exception as e:
+            print(f"[ERROR] _get_phase_count failed for {tls_id}: {e}")
+            return 1  # Fallback to 1 phase (prevents crash)
     def control_step(self):
-        """
-        Enhanced control step with improved protected left turn logging.
-        """
         self.phase_count += 1
         now = traci.simulation.getTime()
         print(f"[DEBUG] === control_step START === at sim time {now}")
@@ -2142,7 +2057,37 @@ class AdaptivePhaseController:
         if self.step_extend_protected_left_if_blocked():
             print("[DEBUG] Protected left phase extended, skipping this step.")
             return
-
+        current_time = traci.simulation.getTime()
+        
+        # Track time since last phase change
+        time_since_change = current_time - self.last_phase_switch_sim_time
+        
+        # CRITICAL FIX: Force phase rotation after maximum time in one phase
+        if time_since_change > self.max_green:
+            current_phase = traci.trafficlight.getPhase(self.tls_id)
+            next_phase = (current_phase + 1) % self._get_phase_count(self.tls_id)
+            print(f"[FORCE ROTATION] Phase {current_phase} active for {time_since_change:.1f}s (>{self.max_green}s). Switching to phase {next_phase}")
+            self.set_phase_from_API(next_phase)
+            return
+            
+        # If any approach hasn't been served for too long, prioritize it
+        longest_waiting_approach = None
+        longest_wait = 0
+        for lane_id in self.lane_ids:
+            queue = traci.lane.getLastStepHaltingNumber(lane_id)
+            if queue > 0:  # Only consider lanes with vehicles
+                lane_wait = current_time - self.last_served_time.get(lane_id, 0)
+                if lane_wait > longest_wait:
+                    longest_wait = lane_wait
+                    longest_waiting_approach = lane_id
+                    
+        # Force service to starving approaches
+        if longest_waiting_approach and longest_wait > 60:  # 60 seconds starvation limit
+            phase_for_starving = self.find_phase_for_lane(longest_waiting_approach)
+            if phase_for_starving is not None:
+                print(f"[STARVATION PREVENTION] Lane {longest_waiting_approach} waited {longest_wait:.1f}s. Activating phase {phase_for_starving}")
+                self.set_phase_from_API(phase_for_starving)
+                return
         current_phase = traci.trafficlight.getPhase(self.tls_id)
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(self.tls_id)[0]
         num_phases = len(logic.getPhases())
@@ -2313,12 +2258,9 @@ class AdaptivePhaseController:
             self.update_R_target()
 
         print(f"[DEBUG] === control_step END ===")
+
+
 class EnhancedQLearningAgent:
-    """
-    Enhanced Q-Learning Agent for Adaptive Traffic Control.
-    Supports optimistic Q-table initialization, action masking, adaptive parameter saving, and
-    RL+adaptive hybrid logic.
-    """
     def __init__(
         self, state_size, action_size, adaptive_controller,
         learning_rate=0.1, discount_factor=0.95, epsilon=0.1, epsilon_decay=0.995, min_epsilon=0.01,
@@ -2356,7 +2298,6 @@ class EnhancedQLearningAgent:
         print(f"AGENT INIT: mode={self.mode}, epsilon={self.epsilon}")
 
     def is_valid_state(self, state):
-        """Check for valid state vector (no NaN/inf, correct size, not all zeros)."""
         arr = np.array(state)
         return (
             isinstance(state, (list, np.ndarray))
@@ -2375,12 +2316,8 @@ class EnhancedQLearningAgent:
             return (tl_id, (0,)) if tl_id is not None else (0,)
 
     def get_action(self, state, tl_id=None, action_size=None, strategy="epsilon_greedy", valid_actions_mask=None):
-        """
-        Epsilon-greedy action selection using optimistic Q-value initialization and masking.
-        """
         action_size = action_size or self.action_size
         key = self._state_to_key(state, tl_id)
-        # Initialize Q-values if needed
         if key not in self.q_table or len(self.q_table[key]) < self.max_action_space:
             arr = np.full(self.max_action_space, self.optimistic_init, dtype=float)
             if key in self.q_table and len(self.q_table[key]) > 0:
@@ -2403,23 +2340,9 @@ class EnhancedQLearningAgent:
 # Add to the RL agent class:
 
     def select_and_apply_phase(self, state_vector, traffic_state=None):
-        """
-        Select a phase and apply it, using the phase overwriting mechanism when needed.
-        
-        Args:
-            state_vector: Current state vector for the RL agent
-            traffic_state: Optional traffic state information
-            
-        Returns:
-            int: The phase index that was selected and applied
-        """
-        # Get current traffic conditions to find desired green lanes
         controlled_lanes = traci.trafficlight.getControlledLanes(self.adaptive_controller.tls_id)
-        
-        # Identify high-priority lanes
         priority_lanes = []
         
-        # Check for emergency vehicles
         for lane in controlled_lanes:
             vehicles = traci.lane.getLastStepVehicleIDs(lane)
             for vid in vehicles:
@@ -2429,8 +2352,7 @@ class EnhancedQLearningAgent:
                         break
                 except:
                     pass
-        
-        # Check for protected left turns needed
+     
         if not priority_lanes:
             blocked_left_lane, needs_protection = self.adaptive_controller.detect_blocked_left_turn_with_conflict()
             if needs_protection and blocked_left_lane:
@@ -2498,9 +2420,6 @@ class EnhancedQLearningAgent:
         # Fallback to current phase
         return traci.trafficlight.getPhase(self.adaptive_controller.tls_id)
     def update_q_table(self, state, action, reward, next_state, tl_id=None, extra_info=None, action_size=None):
-        """
-        Q-learning update for the table. Handles optimistic initialization and action masking.
-        """
         if self.mode == "eval" or not self.is_valid_state(state) or not self.is_valid_state(next_state):
             return
         if reward is None or np.isnan(reward) or np.isinf(reward):
@@ -2540,9 +2459,6 @@ class EnhancedQLearningAgent:
         pass
 
     def switch_or_extend_phase(self, state, green_lanes, force_protected_left=False):
-        """
-        RL agent logic to either switch to or extend a green phase, possibly for protected lefts.
-        """
         print(f"[DEBUG][RL Agent] switch_or_extend_phase with state={state}, green_lanes={green_lanes}, force_protected_left={force_protected_left}")
         R = self.adaptive_controller.calculate_reward()
         raw_delta_t, delta_t, penalty = self.adaptive_controller.calculate_delta_t_and_penalty(R)
@@ -2578,9 +2494,6 @@ class EnhancedQLearningAgent:
         return phase_idx
 
     def select_optimal_phase(self, traffic_state):
-        """
-        Intelligent, hierarchical phase selection based on traffic_state object properties.
-        """
         if getattr(traffic_state, "has_emergency", False):
             return self.get_emergency_phase(traffic_state.emergency_lane)
         severe_threshold = self.adaptive_params.get('severe_congestion_threshold', 10)
@@ -2592,9 +2505,6 @@ class EnhancedQLearningAgent:
         return self.select_phase(traffic_state)
 
     def select_phase(self, traffic_state):
-        """
-        Use a feature vector encoding of traffic_state for Q-table lookup.
-        """
         try:
             state_vector = np.array([
                 getattr(traffic_state, 'max_queue', 0),
@@ -2622,7 +2532,6 @@ class EnhancedQLearningAgent:
         return self.adaptive_controller.create_or_extend_protected_left_phase(left_lane, delta_t)
 
     def calculate_total_reward(self, adaptive_R, rl_reward):
-        """Sum of Adaptive reward R and RL reward."""
         return adaptive_R + rl_reward
 
     def _get_action_name(self, action):
@@ -2632,7 +2541,6 @@ class EnhancedQLearningAgent:
         }.get(action, f"Unknown Action {action}")
 
     def load_model(self, filepath=None):
-        """Load Q-table from file, if present."""
         filepath = filepath or self.q_table_file
         print(f"Attempting to load Q-table from: {filepath}")
         try:
@@ -2656,7 +2564,6 @@ class EnhancedQLearningAgent:
             return False, {}
 
     def save_model(self, filepath=None, adaptive_params=None):
-        """Persist Q-table and training data to a file, with backup."""
         filepath = filepath or self.q_table_file
         try:
             if os.path.exists(filepath):
@@ -2694,23 +2601,16 @@ class EnhancedQLearningAgent:
 
     # ---- Example stubs for hierarchical selection ----
     def get_emergency_phase(self, emergency_lane):
-        """Return the index of the phase serving the emergency_lane (to be implemented)."""
-        # Should call into adaptive_controller or controller logic
         return 0
 
     def get_congestion_relief_phase(self, congested_lane):
-        """Return the index of the phase serving the most congested lane (to be implemented)."""
         return 0
 
     def get_starvation_relief_phase(self, starved_lane):
-        """Return the index of the phase serving the most starved lane (to be implemented)."""
         return 0
 
 class UniversalSmartTrafficController:
-    """
-    Universal Smart Traffic Controller for SUMO, supporting RL and adaptive logic for multi-intersection scenarios.
-    Handles phase event logging, RL/Adaptive controller setup, dynamic phase/traffic logic, and learning.
-    """
+
     DILEMMA_ZONE_THRESHOLD = 12.0  # meters
 
     def __init__(self, sumocfg_path=None, mode="train", config=None, logger=None):
@@ -2908,8 +2808,6 @@ class UniversalSmartTrafficController:
             print(f"Error initializing left-turn lanes: {e}")
 
     def _is_in_dilemma_zone(self, tl_id, controlled_lanes, lane_data):
-        """Return True if any vehicle is in the dilemma zone for lanes about to switch from green to red.
-        PATCH: Avoid tuple index out of range if phase state length < controlled_lanes."""
         try:
             logic = self._get_traffic_light_logic(tl_id)
             if not logic:
@@ -2934,7 +2832,6 @@ class UniversalSmartTrafficController:
             return False
 
     def _find_starved_lane(self, controlled_lanes, current_time):
-        """Returns the lane starved past the threshold, or None."""
         for lane in controlled_lanes:
             idx = self.lane_id_to_idx.get(lane)
             if idx is not None and current_time - self.last_green_time[idx] > self.adaptive_params['starvation_threshold']:
@@ -2942,10 +2839,6 @@ class UniversalSmartTrafficController:
         return None
     
     def _handle_protected_left_turn(self, tl_id, controlled_lanes, lane_data, current_time):
-        """
-        Improved: Check for blocked left-turn lanes and serve a protected left phase if needed.
-        PATCH: Set protected left phase and duration using APC PKL information.
-        """
         try:
             apc = self.adaptive_phase_controllers.get(tl_id, self.apc)
             # Find left-turn lanes needing service (blocked: queue > 0, all vehicles stopped)
@@ -3029,7 +2922,6 @@ class UniversalSmartTrafficController:
             print(f"Error in _handle_protected_left_turn: {e}")
             return False
     def _find_best_left_turn_phase(self, tl_id, left_turn_lane, lane_data):
-        """Find best phase for protected left turns (prefer exclusive left phases)."""
         try:
             logic = self._get_traffic_light_logic(tl_id)
             if not logic: return None
@@ -3049,11 +2941,9 @@ class UniversalSmartTrafficController:
             return None
 
     def _is_left_turn_lane(self, lane_id):
-        """Check if the lane is a left-turn lane."""
         return lane_id in self.left_turn_lanes
 
     def _get_traffic_light_logic(self, tl_id):
-        """Get traffic light logic with caching"""
         if tl_id not in self.tl_logic_cache:
             try:
                 self.tl_logic_cache[tl_id] = traci.trafficlight.getAllProgramLogics(tl_id)[0]
@@ -3063,7 +2953,6 @@ class UniversalSmartTrafficController:
         return self.tl_logic_cache[tl_id]
 
     def _get_phase_count(self, tl_id):
-        """Get number of phases for traffic light"""
         try:
             logic = self._get_traffic_light_logic(tl_id)
             if logic:
@@ -3074,7 +2963,6 @@ class UniversalSmartTrafficController:
             return 4
 
     def _get_phase_name(self, tl_id, phase_idx):
-        """Get phase name"""
         try:
             logic = self._get_traffic_light_logic(tl_id)
             if logic and phase_idx < len(logic.phases):
@@ -3116,14 +3004,10 @@ class UniversalSmartTrafficController:
             print(f"Error in _calculate_adaptive_yellow: {e}")
             return 5.0
     def initialize_controller_phases(self):
-        """
-        PATCHED: Use sumocfg base phases as initial set, then fix their states and missing greens.
-        """
         print("[PHASE GENERATION] Hybrid initialization: using sumocfg phases as base set...")
-
         for tls_id in traci.trafficlight.getIDList():
             apc = self.adaptive_phase_controllers[tls_id]
-            # Get base phases from sumocfg
+
             base_logic = traci.trafficlight.getAllProgramLogics(tls_id)[0]
             base_phases = [Phase(p.duration, p.state) for p in base_logic.phases]
             controlled_lanes = traci.trafficlight.getControlledLanes(tls_id)
@@ -3160,10 +3044,6 @@ class UniversalSmartTrafficController:
                 print(f"[ERROR PATCH] Failed to set base phases for {tls_id}: {e}")
     
     def _add_new_green_phase_for_lane(self, tl_id, lane_id, min_green=None, yellow=3):
-        """
-        Creates and appends a new green+yellow phase for a specific lane, or overwrites if at phase limit.
-        Auto-detects the max allowed number of phases for this traffic light from initial logic.
-        """
         logic = traci.trafficlight.getCompleteRedYellowGreenDefinition(tl_id)[0]
         phases = list(logic.getPhases())
         controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
@@ -3386,7 +3266,6 @@ class UniversalSmartTrafficController:
         except Exception as e:
             self.logger.error(f"Error in run_step: {e}", exc_info=True)
     def _phase_has_traffic(self, logic, action, controlled_lanes, lane_data):
-        """Returns True if at least one green lane in the selected phase has traffic."""
         phase_state = logic.phases[action].state
         for lane_idx, lane in enumerate(controlled_lanes):
             if lane_idx < len(phase_state) and phase_state[lane_idx].upper() == 'G':
@@ -3407,11 +3286,6 @@ class UniversalSmartTrafficController:
                 qlen = lane_data.get(lane, {}).get("queue_length", None)
                 # print debug info as needed                
     def _get_yellow_phase(self, logic, from_idx, to_idx):
-        """
-        Find a yellow (amber) phase between two phases.
-        Returns the yellow phase index if found, else None.
-        """
-        # Defensive: check bounds!
         n_phases = len(logic.phases) if logic else 0
         if not logic or from_idx == to_idx or from_idx >= n_phases or to_idx >= n_phases or from_idx < 0 or to_idx < 0:
             return None
@@ -3577,9 +3451,6 @@ class UniversalSmartTrafficController:
         
         
     def _select_target_lane(self, tl_id, controlled_lanes, lane_data, current_time):
-        """Prefer lanes with vehicles; ignore empty unless all are empty.
-        Score: queue*0.5 + wait*0.3 + arrival*0.2 + starvation*0.3 + emergency."""
-        # Only consider lanes with vehicles, unless all are empty
         nonempty_lanes = [l for l in controlled_lanes if l in lane_data and lane_data[l]['queue_length'] > 0]
         lanes_to_consider = nonempty_lanes if nonempty_lanes else [l for l in controlled_lanes if l in lane_data]
         if not lanes_to_consider:
@@ -3605,7 +3476,6 @@ class UniversalSmartTrafficController:
         return max(candidates, key=lambda x: x[1])[0]
 
     def _get_phase_efficiency(self, tl_id, phase_index):
-        """Phase efficiency based on utilization"""
         try:
             total = sum(c for (tl, _), c in self.phase_utilization.items() if tl == tl_id)
             if not total: return 1.0
@@ -3614,7 +3484,6 @@ class UniversalSmartTrafficController:
         except: return 1.0
 
     def _adjust_traffic_lights(self, lane_data, lane_status, current_time):
-        """Adjust with priorities"""
         try:
             for tl_id in traci.trafficlight.getIDList():
                 try:
@@ -3628,7 +3497,6 @@ class UniversalSmartTrafficController:
             print(f"Error in _adjust_traffic_lights: {e}")
 
     def _handle_priority_conditions(self, tl_id, controlled_lanes, lane_data, current_time):
-        """Priority: Ambulance then left-turn"""
         amb = [l for l in controlled_lanes if lane_data.get(l, {}).get('ambulance')]
         if amb: return self._handle_ambulance_priority(tl_id, amb, lane_data, current_time)
         left = [l for l in controlled_lanes if lane_data.get(l, {}).get('left_turn') and
@@ -3637,7 +3505,6 @@ class UniversalSmartTrafficController:
         return False
 
     def _handle_ambulance_priority(self, tl_id, controlled_lanes, lane_data, current_time):
-        """Serve emergency vehicle lanes with priority"""
         try:
             amb_lanes = [l for l in controlled_lanes if lane_data.get(l, {}).get('ambulance')]
             if not amb_lanes: return False
@@ -3667,7 +3534,6 @@ class UniversalSmartTrafficController:
             return False
 
     def _perform_normal_control(self, tl_id, controlled_lanes, lane_data, current_time):
-        """Normal RL-based control"""
         try:
             if not isinstance(lane_data, dict):
                 print(f"⚠️ lane_data is {type(lane_data)}, expected dict")
@@ -3684,7 +3550,6 @@ class UniversalSmartTrafficController:
             print(f"Error in _perform_normal_control: {e}")
             traceback.print_exc()
     def _execute_control_action(self, tl_id, target_lane, action, lane_data, current_time):
-        """Execute the selected control action (shortened version)"""
         try:
             if not isinstance(lane_data, dict) or target_lane not in lane_data:
                 print("⚠️ Invalid lane_data in _execute_control_action")
@@ -3743,10 +3608,6 @@ class UniversalSmartTrafficController:
             print(f"Error in _execute_control_action: {e}")
 
     def _get_balanced_phase(self, tl_id, lane_data):
-        """
-        Get phase that maximizes sum(queue*0.8 + wait*0.5) for lanes with vehicles,
-        and penalize phases that are green for ONLY empty lanes.
-        """
         try:
             logic = self._get_traffic_light_logic(tl_id)
             if not logic:
@@ -3779,7 +3640,6 @@ class UniversalSmartTrafficController:
             return 0
 
     def _calculate_dynamic_green(self, lane_data):
-        """Calculate dynamic green time based on lane conditions (shortened)"""
         base = self.adaptive_params['min_green']
         queue = min(lane_data['queue_length'] * 0.7, 15)
         density = min(lane_data['density'] * 5, 10)
@@ -3788,7 +3648,6 @@ class UniversalSmartTrafficController:
         return min(max(total, base), self.adaptive_params['max_green'])
 
     def _find_phase_for_lane(self, tl_id, target_lane):
-        """Find phase that gives green to target lane (shortened)"""
         try:
             logic = self._get_traffic_light_logic(tl_id)
             if not logic: return 0
@@ -4021,7 +3880,6 @@ def main():
                         help='Controller mode: train (explore+learn), eval (exploit only), adaptive (exploit+learn)')
     parser.add_argument('--api', action='store_true', help='Start API server instead of simulation')
     args = parser.parse_args()
-
     start_universal_simulation(
         sumocfg_path=args.sumo,
         use_gui=args.gui,
@@ -4029,13 +3887,9 @@ def main():
         episodes=args.episodes,
         num_retries=args.num_retries,
         retry_delay=args.retry_delay,
-        mode=args.mode
-    )
+        mode=args.mode)
 
 def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episodes=1, num_retries=1, retry_delay=1, mode="train"):
-    """
-    Main simulation orchestration. Runs SUMO for the given number of episodes, initializes controller and visualization.
-    """
     global controller
     controller = None
 
@@ -4052,7 +3906,6 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
                 traci.start(sumo_cmd)
                 controller = UniversalSmartTrafficController(sumocfg_path=sumocfg_path, mode=mode)
                 controller.initialize()
-                # Force override of SUMO default phases at startup
                 if hasattr(controller, "initialize_controller_phases"):
                     print("[PATCH] Overriding SUMO default TL phases with controller logic.")
                     controller.initialize_controller_phases()
@@ -4085,15 +3938,10 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
             except Exception:
                 pass
             print("Simulation resources cleaned up")
-
     sim_thread = threading.Thread(target=simulation_loop)
     sim_thread.start()
-
-    # Wait for controller to be initialized by simulation thread
     while controller is None or not hasattr(controller, "adaptive_phase_controllers"):
         time.sleep(0.1)
-
-    # Wait until SUMO is ready (at least one TLS exists)
     while True:
         try:
             if traci.trafficlight.getIDList():
@@ -4101,13 +3949,10 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None, episo
         except Exception:
             pass
         time.sleep(0.1)
-
     display = SmartIntersectionTrafficDisplay(controller.phase_events, poll_interval=1)
     display.start()
-
     sim_thread.join()
     display.stop()
     return controller
-
 if __name__ == "__main__":
     main()
