@@ -1,9 +1,7 @@
 # python Lane7a.py --sumo dataset1.sumocfg --gui --max-steps 1000 --episodes 1
 
 import os, sys, time, json, pickle,traceback, logging, threading,argparse, datetime, warnings
-from collections import defaultdict
-from collections import deque
-
+from collections import defaultdict,deque
 import numpy as np
 import traci
 from traci._trafficlight import Logic, Phase
@@ -165,7 +163,6 @@ class AdaptivePhaseController:
         self.pending_extension_request = None
         self.pending_priority_type = None
         self._last_ext_telemetry = -1.0
-        self.pending_request_timestamp = 0
         self.left_block_steps = defaultdict(int)      # lane_id -> consecutive blocked steps while green
         self.left_block_min_steps = 3 
         self.activation = {
@@ -1822,8 +1819,8 @@ class AdaptivePhaseController:
                 has_vehicles = len(vehicles) > 0
                 
                 # Log detailed information for each left-turn lane
-                print(f"[DEBUG] Left lane {lane_id}: queue={queue}, speed={mean_speed:.2f}, "
-                    f"density={density:.3f}, green={is_green}, vehicles={len(vehicles)}")
+                #print(f"[DEBUG] Left lane {lane_id}: queue={queue}, speed={mean_speed:.2f}, "
+                    #f"density={density:.3f}, green={is_green}, vehicles={len(vehicles)}")
                 
                 # Skip if no vehicles or not green
                 if not has_vehicles:
@@ -1890,8 +1887,8 @@ class AdaptivePhaseController:
                 most_blocked = max(left_turn_candidates, key=lambda x: x[1])
                 lane_id, queue, speed, density, reason = most_blocked
                 
-                print(f"[PROTECTED LEFT SELECTED] Lane {lane_id} chosen for protection "
-                    f"(queue={queue}, {reason})")
+                #print(f"[PROTECTED LEFT SELECTED] Lane {lane_id} chosen for protection "
+                    #f"(queue={queue}, {reason})")
                 return lane_id, True
                 
             print(f"[DEBUG] No left-turn lanes require protection")
