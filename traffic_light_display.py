@@ -99,6 +99,8 @@ class SmartIntersectionTrafficDisplay:
         Compute time_left, base_duration, extended_time.
         Prefers using the controller's APC (accurate elapsed) if available,
         else falls back to last event record, else SUMO static duration.
+
+        PATCH: Show negative extended_time for shortened phases.
         """
         next_switch = self._safe_traci(lambda: traci.trafficlight.getNextSwitch(tl_id), now)
         time_left = max(0.0, (next_switch or now) - now)
@@ -120,7 +122,8 @@ class SmartIntersectionTrafficDisplay:
                 elapsed = max(0.0, now - float(getattr(apc, "last_phase_switch_sim_time", now)))
                 total_now = elapsed + time_left
                 if isinstance(base_duration, (int, float)) and base_duration > 0:
-                    extended_time = max(0.0, total_now - base_duration)
+                    # PATCH: Allow negative extended_time (decreased time)
+                    extended_time = total_now - base_duration
             except Exception:
                 pass
 
@@ -144,13 +147,13 @@ class SmartIntersectionTrafficDisplay:
             else:
                 base_duration = 0.0
 
+        # PATCH: Allow negative extended_time (decreased time)
         if extended_time is None and isinstance(base_duration, (int, float)) and base_duration >= 0:
-            # Estimate extended_time using total_now if we can recover elapsed from APC; else keep 0
             if apc is not None:
                 try:
                     elapsed = max(0.0, now - float(getattr(apc, "last_phase_switch_sim_time", now)))
                     total_now = elapsed + time_left
-                    extended_time = max(0.0, total_now - base_duration)
+                    extended_time = total_now - base_duration
                 except Exception:
                     extended_time = 0.0
             else:
@@ -288,6 +291,12 @@ def run_simulation_step(display, event_log):
                         base_duration = rec.get("base_duration", rec.get("duration", phase_duration))
                         extended_time = rec.get("extended_time", 0)
                         break
+
+                # PATCH: Allow negative extended_time (decreased time)
+                elapsed = max(0.0, current_time - rec.get("last_phase_switch_sim_time", current_time)) if 'last_phase_switch_sim_time' in rec else 0.0
+                total_now = elapsed + max(0.0, (next_switch or current_time) - current_time)
+                if isinstance(base_duration, (int, float)):
+                    extended_time = total_now - base_duration
 
                 event_log.append(
                     {
