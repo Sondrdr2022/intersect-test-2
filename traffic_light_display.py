@@ -159,88 +159,84 @@ class SmartIntersectionTrafficDisplay:
         self.no_data_label = tk.Label(main_frame, text="Waiting for traffic light data...", font=("Arial", 16))
 
     def show_extension_time_graph(self):
-        """Create and display the extension time graph showing base duration and extensions."""
+        """Create and display a more intuitive extension time graph."""
         if not self.history_data['time']:
             tk.messagebox.showwarning("No Data", "No simulation data available yet. Please run the simulation first.")
             return
-        
+
         # Create new window for graph
         graph_window = tk.Toplevel(self.root)
         graph_window.title("Phase Extension Analysis - Overall System")
         graph_window.geometry("1200x700")
-        
+
         # Create matplotlib figure
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
         fig.suptitle('Traffic Light Phase Extension Analysis', fontsize=16, fontweight='bold')
-        
-        # Plot 1: Extension time over time with base duration line
-        if self.history_data['extended_time']:
-            # Extension time
-            ax1.plot(self.history_data['time'], self.history_data['extended_time'], 
-                    'r-', linewidth=2, label='Extension Time', alpha=0.7)
-            
-            # Average base duration as flat line
-            if self.history_data['base_duration']:
-                avg_base = sum(self.history_data['base_duration']) / len(self.history_data['base_duration'])
-                ax1.axhline(y=0, color='g', linestyle='--', linewidth=2, 
-                           label='Zero Extension (Base Only)', alpha=0.5)
-                
-            ax1.fill_between(self.history_data['time'], 0, self.history_data['extended_time'],
-                            where=[x >= 0 for x in self.history_data['extended_time']],
-                            color='red', alpha=0.3, label='Extended Time')
-            ax1.fill_between(self.history_data['time'], 0, self.history_data['extended_time'],
-                            where=[x < 0 for x in self.history_data['extended_time']],
-                            color='blue', alpha=0.3, label='Reduced Time')
-            
-            ax1.set_ylabel('Extension Time\n(seconds)', fontsize=10, fontweight='bold')
-            ax1.grid(True, alpha=0.3)
-            ax1.legend(loc='upper right')
-            ax1.set_facecolor('#f5f5f5')
-            ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-        
-        # Plot 2: Total duration vs base duration
+
+        # Plot 1: Extension time as bar chart
+        times = self.history_data['time']
+        extensions = self.history_data['extended_time']
+        base_durations = self.history_data['base_duration']
+
+        # Separate extensions and reductions
+        ext_pos = [e if e > 0 else 0 for e in extensions]
+        ext_neg = [e if e < 0 else 0 for e in extensions]
+
+        # Bar chart for extensions (green) and reductions (red)
+        ax1.bar(times, ext_pos, width=3, color='green', label='Phase Extended')
+        ax1.bar(times, ext_neg, width=3, color='red', label='Phase Reduced')
+
+        # Baseline at zero
+        ax1.axhline(y=0, color='black', linestyle='--', linewidth=1, label='No Extension')
+
+        # Annotate max extension and min reduction
+        if extensions:
+            max_ext = max(extensions)
+            min_ext = min(extensions)
+            max_idx = extensions.index(max_ext)
+            min_idx = extensions.index(min_ext)
+            ax1.annotate(f'Max: {max_ext:.1f}s', xy=(times[max_idx], max_ext), xytext=(times[max_idx], max_ext+10),
+                        arrowprops=dict(facecolor='green', shrink=0.05), fontsize=9, color='green', ha='center')
+            ax1.annotate(f'Min: {min_ext:.1f}s', xy=(times[min_idx], min_ext), xytext=(times[min_idx], min_ext-10),
+                        arrowprops=dict(facecolor='red', shrink=0.05), fontsize=9, color='red', ha='center')
+
+        ax1.set_ylabel('Extension Time (seconds)', fontsize=11, fontweight='bold')
+        ax1.legend(loc='upper right')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_facecolor('#f5f5f5')
+        ax1.set_title('Phase Extension/Reduction per Step', fontsize=12, fontweight='bold')
+
+        # Plot 2: Total duration vs base duration (unchanged)
         if self.history_data['total_duration'] and self.history_data['base_duration']:
-            ax2.plot(self.history_data['time'], self.history_data['total_duration'], 
-                    'b-', linewidth=2, label='Total Duration', alpha=0.7)
-            ax2.plot(self.history_data['time'], self.history_data['base_duration'], 
-                    'g--', linewidth=2, label='Base Duration', alpha=0.7)
-            
-            # Fill area between base and total
-            ax2.fill_between(self.history_data['time'], 
-                           self.history_data['base_duration'],
-                           self.history_data['total_duration'],
-                           where=[t >= b for t, b in zip(self.history_data['total_duration'], 
-                                                        self.history_data['base_duration'])],
-                           color='red', alpha=0.2, label='Extension Area')
-            ax2.fill_between(self.history_data['time'], 
-                           self.history_data['base_duration'],
-                           self.history_data['total_duration'],
-                           where=[t < b for t, b in zip(self.history_data['total_duration'], 
-                                                       self.history_data['base_duration'])],
-                           color='blue', alpha=0.2, label='Reduction Area')
-            
-            ax2.set_ylabel('Duration\n(seconds)', fontsize=10, fontweight='bold')
+            ax2.plot(times, self.history_data['total_duration'], 'b-', linewidth=2, label='Total Duration', alpha=0.7)
+            ax2.plot(times, self.history_data['base_duration'], 'g--', linewidth=2, label='Base Duration', alpha=0.7)
+            ax2.fill_between(times, self.history_data['base_duration'], self.history_data['total_duration'],
+                            where=[t >= b for t, b in zip(self.history_data['total_duration'], self.history_data['base_duration'])],
+                            color='green', alpha=0.2, label='Extension Area')
+            ax2.fill_between(times, self.history_data['base_duration'], self.history_data['total_duration'],
+                            where=[t < b for t, b in zip(self.history_data['total_duration'], self.history_data['base_duration'])],
+                            color='red', alpha=0.2, label='Reduction Area')
+            ax2.set_ylabel('Duration (seconds)', fontsize=11, fontweight='bold')
             ax2.set_xlabel('Simulation Time (seconds)', fontsize=12, fontweight='bold')
-            ax2.grid(True, alpha=0.3)
             ax2.legend(loc='upper right')
+            ax2.grid(True, alpha=0.3)
             ax2.set_facecolor('#f0f8ff')
-        
-        # Add statistics
+            ax2.set_title('Actual Phase Duration vs Baseline', fontsize=12, fontweight='bold')
+
+        # Add statistics as before
         self.add_extension_statistics_to_graph(fig)
-        
         plt.tight_layout()
-        
+
         # Embed matplotlib figure in tkinter window
         canvas = FigureCanvasTkAgg(fig, master=graph_window)
         canvas.draw()
         canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
-        
+
         # Add toolbar for navigation
         from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
         toolbar = NavigationToolbar2Tk(canvas, graph_window)
         toolbar.update()
         canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
-
     def show_per_tl_extension_graphs(self):
         """Show extension time graphs for each traffic light separately."""
         if not self.tl_history_data:
