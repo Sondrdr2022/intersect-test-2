@@ -155,7 +155,7 @@ class AdaptivePhaseController:
         
         # Add caching for Supabase reads
         self._phase_cache = {}
-        self.enable_db_writes = False
+        self.enable_db_writes = True
         self._phase_cache_ttl = 30.0  # Cache for 30 seconds
         self._phase_cache_time = {}
         self._db_writer.start()
@@ -447,9 +447,13 @@ class AdaptivePhaseController:
         event["weights"] = self.weights.tolist()
         event["bonus"] = getattr(self, "last_bonus", 0)
         event["penalty"] = getattr(self, "last_penalty", 0)
-        # For saving to supabase keep serialization compatibility by converting when enqueuing.
+        
+        # Add to in-memory state
         self.apc_state["events"].append(event)
         self._save_apc_state_supabase()
+        
+        # ALSO queue for database writing
+        self.log_event_to_supabase(event)  # <-- Add this line
     def log_phase_to_event_log(self, phase_idx, new_duration):
         # Find phase info in self.apc_state["phases"]
         phase = next((p for p in self.apc_state["phases"] if p["phase_idx"] == phase_idx), None)
