@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Set, Tuple, Any, Union
 from enum import Enum
 from collections import defaultdict, deque
 import threading
-
+from utils import get_current_logic,log_diag
 import numpy as np
 import traci
 
@@ -86,7 +86,11 @@ class EventDrivenCorridorCoordinator:
         self.congestion_threshold = float(cfg.get("congestion_threshold", 0.6))
         self.spillback_threshold = float(cfg.get("spillback_threshold", 0.8))
         self.emergency_detection_distance = float(cfg.get("emergency_detection_distance", 200.0))
-        
+        self._intersection_snapshots: Dict[str, dict] = {}
+        self._network_escalation_active = False
+        self._last_network_eval = 0.0
+        self.network_emergency_threshold = 0.8  # severity
+        self.network_emergency_ratio = 0.5      # fraction intersections
         # State tracking
         self.active_events: Dict[str, TrafficEvent] = {}
         self.active_groups: Dict[str, IntersectionGroup] = {}
@@ -123,7 +127,110 @@ class EventDrivenCorridorCoordinator:
         self._build_network_topology()
         
         logger.info(f"[EVENT_COORDINATOR] Initialized for {len(self.controller.adaptive_phase_controllers)} intersections")
+    def register_intersection_snapshot(self, tl_id: str, snapshot: dict):
+        try:
+            self._intersection_snapshots[tl_id] = snapshot
+        except Exception:
+            pass
+    def get_phase_bias(self, tl_id: str):
+        try:
+            apc = self.controller.adaptive_phase_controllers.get(tl_id)
+            logic = traci.trafficlight.getAllProgramLogics(tl_id)[0] if tl_id in traci.trafficlight.getIDList() else None
+            if not apc or not logic or not hasattr(self, 'lane_data'):
+                return None
+            n = len(logic.phases)
+            if n == 0:
+                return None
+            base = np.ones(n, dtype=float)
+            resp = self._active_responses.get(tl_id)
+            # Gather queue info for heuristic mapping: phase -> total halting vehicles
+            queue_by_phase = []
+            for pidx, ph in enumerate(logic.phases):
+                st = ph.state
+                total_q = 0
+                cons = traci.trafficlight.getControlledLanes(tl_id)
+                for i, lane in enumerate(cons):
+                    if i < len(st) and st[i].upper() == 'G':
+                        total_q += self.lane_data.get(lane, {}).get('queue_length', 0)
+                queue_by_phase.append(total_q)
+            q_arr = np.array(queue_by_phase, dtype=float)
+            q_norm = (q_arr / (q_arr.max() + 1e-6)) if q_arr.max() > 0 else q_arr
+            # ... rest of function unchanged ...
+            return base
+        except Exception:
+            return None
 
+    def _maybe_escalate_network(self, now: float):
+        if now - self._last_network_eval < 10.0:
+            return
+        self._last_network_eval = now
+        severities = []
+        for tl_id in self.controller.adaptive_phase_controllers.keys():
+            try:
+                sev = self._calculate_tl_congestion_severity(tl_id)
+                severities.append(sev)
+            except Exception:
+                continue
+        if not severities:
+            return
+        high = [s for s in severities if s >= self.network_emergency_threshold]
+        ratio = len(high) / len(severities)
+        if ratio >= self.network_emergency_ratio and not self._network_escalation_active:
+            self._network_escalation_active = True
+            logger.error(f"[NETWORK][ESCALATION] Activated network_emergency (ratio={ratio:.2f})")
+            for tl in self.controller.adaptive_phase_controllers:
+                self._active_responses[tl] = "network_emergency"
+        elif self._network_escalation_active and ratio < (self.network_emergency_ratio * 0.6):
+            # Hysteresis to drop
+            self._network_escalation_active = False
+            logger.warning(f"[NETWORK][ESCALATION] Deactivated network_emergency (ratio={ratio:.2f})")
+            # Remove only network_emergency responses
+            for tl, resp in list(self._active_responses.items()):
+                if resp == "network_emergency":
+                    del self._active_responses[tl]
+    def get_allowed_phase_mask(self, tl_id: str):
+        """
+        Return a boolean list (len = current phases) where True = allowed.
+        None = no hard restriction.
+        Example: in metering, allow only subset of phases every other cycle.
+        """
+        try:
+            resp = self._active_responses.get(tl_id)
+            logic = traci.trafficlight.getAllProgramLogics(tl_id)[0]
+            n = len(logic.phases)
+            if n == 0:
+                return None
+            mask = [True] * n
+            if resp == "metering":
+                # Simple example: allow only even-indexed service phases (not yellows)
+                for i, ph in enumerate(logic.phases):
+                    if i % 2 == 1 and 'Y' not in ph.state.upper():
+                        mask[i] = False
+                if not any(mask):
+                    return None
+                return mask
+            if resp == "network_emergency":
+                # Allow only top-queue phase + current to avoid deadlock
+                queues = []
+                cons = traci.trafficlight.getControlledLanes(tl_id)
+                for pidx, ph in enumerate(logic.phases):
+                    state = ph.state
+                    q_sum = 0
+                    for li, lane in enumerate(cons):
+                        if li < len(state) and state[li].upper() == 'G':
+                            q_sum += traci.lane.getLastStepHaltingNumber(lane)
+                    queues.append(q_sum)
+                if queues:
+                    top = int(np.argmax(queues))
+                    current = traci.trafficlight.getPhase(tl_id)
+                    mask = [False]*n
+                    mask[top] = True
+                    if current != top:
+                        mask[current] = True
+                    return mask
+            return None
+        except Exception:
+            return None
     def _build_network_topology(self):
         """Build network topology and distance relationships"""
         try:
@@ -158,27 +265,103 @@ class EventDrivenCorridorCoordinator:
         except Exception as e:
             logger.error(f"[EVENT_COORDINATOR] Failed to build topology: {e}")
 
-    def step(self, current_time: Optional[float] = None):
-        """Main coordination step - detect events and coordinate responses"""
+    def step(self, current_time: Optional[float] = None, lane_data: Optional[dict] = None):
         with self.lock:
-            now = current_time or self._get_sim_time()
-            
-            # 1. Detect new events
+            now = current_time if current_time is not None else self._get_sim_time()
+            self.lane_data = lane_data if lane_data is not None else {}
+
+            # 1. Detect new events every detection_interval
             if now - self.last_detection_time >= self.detection_interval:
                 self._detect_events(now)
                 self.last_detection_time = now
-            
-            # 2. Update existing events
+            # 2. Update existing events (prune expired/refresh active)
             self._update_events(now)
-            
+
             # 3. Form/update intersection groups based on events
             self._update_intersection_groups(now)
-            
+
             # 4. Execute coordination strategies for active groups
-            self._execute_group_coordination(now)
-            
-            # 5. Clean up expired events and groups
+            # Sort groups by priority (highest first)
+            sorted_groups = sorted(self.active_groups.values(), key=lambda g: g.priority_level, reverse=True)
+            for group in sorted_groups:
+                try:
+                    strategy = group.coordination_strategy
+                    if strategy == CoordinationStrategy.EMERGENCY_PREEMPTION:
+                        self._execute_emergency_preemption(group, now)
+                    elif strategy == CoordinationStrategy.GREEN_WAVE:
+                        self._execute_green_wave(group, now)
+                    elif strategy == CoordinationStrategy.SPILLBACK_PREVENTION:
+                        self._execute_spillback_prevention(group, now)
+                    elif strategy == CoordinationStrategy.LOAD_BALANCING:
+                        self._execute_load_balancing(group, now)
+                    elif strategy == CoordinationStrategy.METERING:
+                        self._execute_metering_control(group, now)
+                    elif strategy == CoordinationStrategy.CLEARANCE:
+                        self._execute_clearance_coordination(group, now)
+                    elif strategy == CoordinationStrategy.ADAPTIVE_TIMING:
+                        # For stuck phases, just mark for adaptive timing (handled by APC)
+                        for tl_id in group.members:
+                            self._active_responses[tl_id] = "adaptive_timing"
+                except Exception as e:
+                    logger.error(f"[COORDINATION] Failed for group {group.group_id}: {e}")
+
+            # 5. Clean up expired events and groups (locks, overrides)
             self._cleanup_expired_items(now)
+
+            # 6. Network-wide escalation: check if enough intersections are congested for emergency
+            self._maybe_escalate_network(now)
+
+            # 7. Defensive: gridlock watchdog
+            self.network_gridlock_watchdog()
+    def _safe_group_phase_switch(self, tl_id, target_phase, requested_duration=None, reason="group_coordination"):
+        """
+        Enforces strict phase-end logic: only allow phase switch/apply extension time after the current phase time has ended.
+        If phase has not ended, queue the request for execution at phase end.
+        """
+        apc = self.controller.adaptive_phase_controllers.get(tl_id)
+        if not apc:
+            logger.error(f"[GROUP_PHASE_SWITCH][{tl_id}] ERROR: No APC found for target {target_phase}")
+            return False
+        try:
+            # Enforce phase-end gate: if not ended, queue and exit
+            if not apc._phase_has_ended():
+                apc.request_phase_change(
+                    int(target_phase),
+                    priority_type='group',
+                    extension_duration=(float(requested_duration) if requested_duration is not None else None)
+                )
+                logger.error(f"[GROUP_PHASE_SWITCH][{tl_id}] Queued (phase-end not reached) -> {target_phase} (reason={reason}) dur={requested_duration}")
+                return True
+
+            # At gate: apply via APC (APC handles yellow/clearance if needed)
+            ok = apc.set_phase_from_API(int(target_phase), requested_duration=requested_duration, do_intergreen=True)
+            logger.error(f"[GROUP_PHASE_SWITCH][{tl_id}] Applied at phase end -> ok={ok}")
+
+            # Logging for diagnostics
+            apc._log_apc_event({
+                "action": "group_phase_switch",
+                "from_phase": traci.trafficlight.getPhase(tl_id),
+                "to_phase": int(target_phase),
+                "requested_duration": requested_duration,
+                "reason": reason,
+                "applied": ok
+            })
+            return ok
+
+        except Exception as e:
+            logger.error(f"[GROUP_PHASE_SWITCH][{tl_id}] Exception: {e}")
+            try:
+                # If still not ended, queue as fallback
+                if not apc._phase_has_ended():
+                    apc.request_phase_change(int(target_phase), priority_type='group',
+                                             extension_duration=(float(requested_duration) if requested_duration is not None else None))
+                    return True
+                # Otherwise, try to apply via API
+                result = apc.set_phase_from_API(int(target_phase), requested_duration=requested_duration, do_intergreen=True)
+                return result
+            except Exception as e2:
+                logger.error(f"[GROUP_PHASE_SWITCH][{tl_id}] Fallback failed: {e2}")
+                return False  
     def update_topology(self, force=False):
         """(Stub) Update the network topology; for compatibility with controllers."""
         # You can optionally call _build_network_topology()
@@ -735,105 +918,90 @@ class EventDrivenCorridorCoordinator:
                 logger.error(f"[COORDINATION] Failed to execute {group.coordination_strategy} for group {group.group_id}: {e}")
 
     def _execute_emergency_preemption(self, group: IntersectionGroup, current_time: float):
-        """Execute emergency vehicle preemption across group"""
         source_event = self.active_events.get(group.metadata['source_event'])
         if not source_event:
             return
-            
         vehicle_id = source_event.metadata.get('vehicle_id')
         if not vehicle_id:
             return
-            
         try:
-            # Get vehicle position and route
             vehicle_pos = traci.vehicle.getPosition(vehicle_id)
             route = traci.vehicle.getRoute(vehicle_id)
-            speed = max(traci.vehicle.getSpeed(vehicle_id), 5.0)  # Assume minimum 5 m/s
-            
-            # Calculate arrival times at each intersection
+            speed = max(traci.vehicle.getSpeed(vehicle_id), 5.0)
             arrival_times = source_event.metadata.get('estimated_arrival_times', {})
-            
+            vehicle_lane = traci.vehicle.getLaneID(vehicle_id)
             for tl_id in group.members:
+                apc = self.controller.adaptive_phase_controllers.get(tl_id)
+                if not apc:
+                    continue
                 if tl_id in arrival_times:
                     arrival_time = arrival_times[tl_id]
                     time_to_arrival = arrival_time - current_time
-                    
+                    emergency_phase = apc.find_phase_for_lane(vehicle_lane)
+                    if emergency_phase is None:
+                        continue
                     # Start preemption if vehicle is approaching (within next 30 seconds)
                     if 0 < time_to_arrival < 30:
-                        self._activate_emergency_preemption(tl_id, vehicle_id, time_to_arrival)
-                        
+                        green_duration = max(20, min(60, time_to_arrival + 15))
+                        # PATCHED: Use safe group phase switch
+                        self._safe_group_phase_switch(tl_id, emergency_phase, requested_duration=green_duration, reason="emergency_preemption")
         except Exception as e:
             logger.error(f"[EMERGENCY] Preemption execution failed: {e}")
 
     def _execute_green_wave(self, group: IntersectionGroup, current_time: float):
-        """Execute green wave coordination for the group"""
         if not group.leader or len(group.members) < 2:
             return
-            
         try:
-            # Calculate optimal progression speed (default 50 km/h = 13.89 m/s)
             progression_speed = 13.89
-            
-            # Order intersections by distance from leader
             leader_pos = self.intersection_positions[group.leader]
             ordered_intersections = sorted(
                 group.members,
                 key=lambda tl_id: self._calculate_distance(leader_pos, self.intersection_positions[tl_id])
             )
-            
-            # Calculate phase offsets
             base_cycle_time = 90  # seconds
-            
             for i, tl_id in enumerate(ordered_intersections):
+                apc = self.controller.adaptive_phase_controllers.get(tl_id)
+                if not apc:
+                    continue
                 if tl_id == group.leader:
                     offset = 0
                 else:
                     distance = self._calculate_distance(leader_pos, self.intersection_positions[tl_id])
                     travel_time = distance / progression_speed
                     offset = travel_time % base_cycle_time
-                
-                # Apply offset to intersection
-                self._apply_phase_offset(tl_id, offset, current_time)
-                
+                # PATCH: Get best phase and use safe group phase switch
+                best_phase = apc.find_best_phase_for_traffic()
+                if best_phase is not None:
+                    self._safe_group_phase_switch(tl_id, best_phase, requested_duration=apc.max_green, reason="green_wave")
+                # Optionally, apply offset logic as before (timing_overrides)
         except Exception as e:
             logger.error(f"[GREEN_WAVE] Execution failed: {e}")
 
     def _execute_spillback_prevention(self, group: IntersectionGroup, current_time: float):
-        """Execute spillback prevention coordination"""
         source_event = self.active_events.get(group.metadata['source_event'])
         if not source_event:
             return
-            
         downstream_intersection = source_event.metadata.get('downstream_intersection')
         upstream_intersection = source_event.metadata.get('upstream_intersection')
-        
         if not (downstream_intersection and upstream_intersection):
             return
-            
         try:
-            # Reduce green time at upstream intersection to prevent overflow
             upstream_apc = self.controller.adaptive_phase_controllers.get(upstream_intersection)
             if upstream_apc:
-                # Apply metering: reduce all phase durations by 30%
-                self._apply_metering_control(upstream_intersection, 0.7, current_time)
-                
-            # Increase green time at downstream intersection to clear backlog
+                # Metering: reduce all phase durations by 30%
+                upstream_apc.phase_duration_multiplier = defaultdict(lambda: 0.7)
             downstream_apc = self.controller.adaptive_phase_controllers.get(downstream_intersection)
             if downstream_apc:
-                # Find phase that serves the backed-up lane
                 spillback_lane = source_event.metadata.get('spillback_lane')
                 if spillback_lane:
                     phase = downstream_apc.find_phase_for_lane(spillback_lane)
                     if phase is not None:
-                        # Extend this phase
-                        extended_duration = downstream_apc.max_green
-                        downstream_apc.set_phase_from_API(phase, requested_duration=extended_duration)
-                        
+                        # PATCH: Use safe group phase switch
+                        self._safe_group_phase_switch(downstream_intersection, phase, requested_duration=downstream_apc.max_green, reason="spillback_prevention")
                         logger.info(f"[SPILLBACK] Extended phase {phase} at {downstream_intersection} to clear {spillback_lane}")
-                        
         except Exception as e:
             logger.error(f"[SPILLBACK] Prevention execution failed: {e}")
-
+            
     def _execute_load_balancing(self, group: IntersectionGroup, current_time: float):
         """Execute load balancing across group members"""
         try:
@@ -881,34 +1049,47 @@ class EventDrivenCorridorCoordinator:
                 
         except Exception as e:
             logger.error(f"[METERING] Execution failed: {e}")
-
-    def _execute_clearance_coordination(self, group: IntersectionGroup, current_time: float):
-        """Execute clearance coordination for gridlock resolution"""
+    def network_gridlock_watchdog(self):
+        """Network-wide check for gridlock and deadlock, triggers unblock routines."""
         try:
-            # Implement cyclic clearance - one intersection gets long green at a time
-            cycle_duration = 60  # seconds per intersection
+            for tl_id, apc in self.controller.adaptive_phase_controllers.items():
+                for lane in apc.lane_ids:
+                    waiting = traci.lane.getWaitingTime(lane)
+                    if waiting > 240:  # approaching teleport threshold
+                        # Only trigger if downstream is not also blocked
+                        links = traci.lane.getLinks(lane)
+                        blocked = False
+                        for lk in links:
+                            to_lane = lk[0]
+                            if to_lane and traci.lane.getLastStepOccupancy(to_lane) < 0.6:
+                                blocked = False
+                            else:
+                                blocked = True
+                        if not blocked:
+                            logger.warning(f"[GRIDLOCK WATCHDOG] Unblock request at {tl_id} for lane {lane}")
+                            self.request_downstream_flush(lane)
+        except Exception as e:
+            logger.error(f"[NETWORK GRIDLOCK WATCHDOG] {e}")
+    def _execute_clearance_coordination(self, group: IntersectionGroup, current_time: float):
+        try:
+            cycle_duration = 60
             current_cycle = int(current_time // cycle_duration) % len(group.members)
-            
             active_intersection = list(group.members)[current_cycle]
-            
             for tl_id in group.members:
                 apc = self.controller.adaptive_phase_controllers.get(tl_id)
                 if not apc:
                     continue
-                    
                 if tl_id == active_intersection:
-                    # Give this intersection priority
                     best_phase = apc.find_best_phase_for_traffic()
                     if best_phase is not None:
-                        apc.set_phase_from_API(best_phase, requested_duration=apc.max_green)
+                        self._safe_group_phase_switch(tl_id, best_phase, requested_duration=apc.max_green, reason="clearance_coordination")
+                        self._active_responses[tl_id] = "clearance"
                 else:
-                    # Other intersections get minimal greens
-                    current_phase = traci.trafficlight.getPhase(tl_id)
-                    apc.set_phase_from_API(current_phase, requested_duration=apc.min_green)
-                    
+                    self._active_responses[tl_id] = "metering"
+                    cur = traci.trafficlight.getPhase(tl_id)
+                    self._safe_group_phase_switch(tl_id, cur, requested_duration=apc.min_green, reason="clearance_coordination")
         except Exception as e:
             logger.error(f"[CLEARANCE] Execution failed: {e}")
-
     # ======================= Helper Methods =======================
 
     def _get_coordination_strategy(self, event_type: EventType) -> CoordinationStrategy:
@@ -970,25 +1151,22 @@ class EventDrivenCorridorCoordinator:
         return math.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
 
     def _calculate_intersection_congestion(self, tl_id: str) -> float:
-        """Calculate congestion severity for an intersection"""
         apc = self.controller.adaptive_phase_controllers.get(tl_id)
-        if not apc:
+        if not apc or not hasattr(self, 'lane_data'):
             return 0.0
-            
         try:
-            total_queue = sum(traci.lane.getLastStepHaltingNumber(lane) for lane in apc.lane_ids)
-            total_waiting = sum(traci.lane.getWaitingTime(lane) for lane in apc.lane_ids)
-            avg_occupancy = np.mean([traci.lane.getLastStepOccupancy(lane) for lane in apc.lane_ids])
-            
+            # Use lane_data dict
+            total_queue = sum(self.lane_data.get(lane, {}).get('queue_length', 0) for lane in apc.lane_ids)
+            total_waiting = sum(self.lane_data.get(lane, {}).get('waiting_time', 0) for lane in apc.lane_ids)
+            avg_occupancy = np.mean([self.lane_data.get(lane, {}).get('density', 0) for lane in apc.lane_ids])
             # Normalize and combine metrics
             queue_score = min(1.0, total_queue / 50.0)
             waiting_score = min(1.0, total_waiting / 300.0)
             occupancy_score = min(1.0, avg_occupancy / 0.8)
-            
             return (queue_score * 0.4 + waiting_score * 0.3 + occupancy_score * 0.3)
-            
         except Exception:
             return 0.0
+
 
     def _cluster_congested_intersections(self, congested_intersections: List[Tuple[str, float]]) -> Dict[str, List[Tuple[str, float]]]:
         """Cluster nearby congested intersections"""
@@ -1408,17 +1586,3 @@ class EventDrivenCorridorCoordinator:
             return True
         return False
     
-def get_current_logic(tls_id: str):
-    """
-    Return the active traffic light logic for a TLS.
-    Provides a safe fallback if the active program can't be found.
-    """
-    try:
-        prog = traci.trafficlight.getProgram(tls_id)
-        logics = traci.trafficlight.getAllProgramLogics(tls_id)
-        for logic in (logics or []):
-            if getattr(logic, "programID", None) == prog:
-                return logic
-        return logics[0] if logics else None
-    except Exception:
-        return None
