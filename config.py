@@ -16,20 +16,27 @@ SUMO_HOME = os.getenv("SUMO_HOME", r"C:\Program Files (x86)\Eclipse\Sumo")
 
 LOGIC_MUTATION_COOLDOWN_S = 3.0     # rate-limit for add/overwrite phase ops
 MAX_PENDING_DB_OPS = 200            # cap the supabase queue
+
+# How long we tolerate a "yellow-only" or non-green state before forcing rotation
 YELLOW_MAX_HOLD_S = 4.0
 
-# --- PATCH: Dilemma zone and yellow logic parameters ---
-MIN_GREEN_HOLD_S = 3.0          # Minimum time a phase must stay green before preemption
+# --- SAFETY: Dilemma zone and yellow logic parameters (conservative defaults) ---
+MIN_GREEN_HOLD_S = 5.0          # Minimum time a phase must stay green before preemption (↑ from 3.0)
 DZ_EXTENSION_SLICE_S = 1.0      # Extension added when a dilemma vehicle blocks switch
 DZ_MAX_CUM_EXT_S = 4.0          # Maximum cumulative extension due to dilemma gating
 DZ_SPEED_FILTER = 0.5           # Below this speed (m/s) we treat vehicle as already stopped
-DZ_TIME_BUFFER = 2.5            # Time buffer (s) for dilemma zone detection
-DZ_DIST_FALLBACK = 12.0         # Fallback distance if no controller attribute threshold
+DZ_TIME_BUFFER = 4.0            # Time buffer (s) for dilemma zone detection (↑ from 2.5)
+DZ_DIST_FALLBACK = 50.0         # Fallback distance if no controller attribute threshold (↑ from 12.0)
 DYNAMIC_YELLOW = True           # Enable dynamic yellow computation
-REACTION_TIME_S = 1.0           # Reaction time used for dynamic yellow
-COMFORT_DECEL = 4.5             # Comfortable decel (match SUMO vehicle type if possible)
-MIN_YELLOW_S = 3.0              # Minimum yellow duration
-MAX_YELLOW_S = 6.0              # Cap yellow duration
+REACTION_TIME_S = 2.5           # Reaction time used for dynamic yellow (↑ from 1.0)
+COMFORT_DECEL = 2.0             # Comfortable decel (m/s^2) (↓ from 4.5)
+MIN_YELLOW_S = 4.0              # Minimum yellow duration (↑ from 3.0)
+MAX_YELLOW_S = 12.0             # Cap yellow duration (↑ from 6.0)
+
+# Extra approach safety parameters
+HIGH_SPEED_THRESHOLD = 10.0     # m/s (36 km/h) threshold for "high speed"
+CRITICAL_APPROACH_TIME = 4.0    # seconds: high-speed vehicle within v*t is critical
+SAFETY_MARGIN_FACTOR = 1.2      # Additional margin multiplier on stop distance
 
 # New: DB behavior toggles and timeouts expected by Lane8.py
 DB_MODE = os.getenv("DB_MODE", "supabase").lower()       # "supabase" | "file" | "disabled"
