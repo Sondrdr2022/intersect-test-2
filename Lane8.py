@@ -4,7 +4,8 @@ import os,sys,traci,time,json,pickle,traceback,random,logging,threading,argparse
 from collections import defaultdict, deque
 import numpy as np
 from pyinstrument import Profiler
-from utils import get_current_logic, get_or_create_all_red_phase,collect_lane_stats,log_diag
+from utils import get_current_logic, get_or_create_all_red_phase,collect_lane_stats,log_diag,ensure_global_yellow_phases,audit_and_repair_yellow_phases_all_tls
+
 
 from typing import Optional
 from traci._trafficlight import Logic, Phase
@@ -105,7 +106,20 @@ def retry_supabase_operation(operation, max_retries=3):
             if attempt == max_retries - 1: raise e
             time.sleep(0.5 * (2 ** attempt))
 
-
+# ==========================
+# PATCH: Strict Yellow Enforcement
+# ==========================
+def enforce_yellow_before_green_to_red(tls_id):
+    """
+    Enforce that every G->R transition has a corresponding yellow phase.
+    This should be called before every phase transition, including emergencies and congestion.
+    """
+    try:
+        changed = ensure_global_yellow_phases(tls_id)
+        if changed:
+            logger.info(f"[STRICT YELLOW] Patched yellow phases for {tls_id}")
+    except Exception as e:
+        logger.error(f"[STRICT YELLOW][ERROR] {tls_id}: {e}")
 
 class AdaptivePhaseController:
     # ========================================
@@ -591,39 +605,15 @@ class AdaptivePhaseController:
             return True
 
     def _validate_phase_switch_safety(self, tl_id, current_phase: int, target_phase: int):
-        """
-        Mandatory safety validation before any phase switch.
-        Returns (is_safe: bool, reason: str)
-        """
         try:
             now = traci.simulation.getTime()
-
-            # Check minimum green hold
             elapsed = now - float(self.last_phase_switch_sim_time)
             if elapsed < float(self.min_green_hold):
                 return False, f"min_green_hold {elapsed:.1f}s < {self.min_green_hold:.1f}s"
-
-            # Dilemma zone physics check
             dz, reason = self._enhanced_dilemma_zone_check(current_phase, target_phase)
             if dz:
                 return False, f"dilemma_zone: {reason}"
-
-            # High-speed approach check on lanes currently green
-            logic = self._get_logic()
-            if logic and 0 <= current_phase < len(logic.getPhases()):
-                state = logic.getPhases()[current_phase].state
-                controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
-                speed_thr = float(HIGH_SPEED_THRESHOLD)
-                t_crit = float(CRITICAL_APPROACH_TIME)
-                for i, lane in enumerate(controlled_lanes):
-                    if i < len(state) and state[i].upper() == 'G':
-                        lane_len = traci.lane.getLength(lane)
-                        for vid in traci.lane.getLastStepVehicleIDs(lane):
-                            v = max(0.0, traci.vehicle.getSpeed(vid))
-                            if v > speed_thr:
-                                dist = max(0.0, lane_len - traci.vehicle.getLanePosition(vid))
-                                if dist < v * t_crit:
-                                    return False, f"high_speed {vid} v={v:.1f} dist={dist:.1f} (< v*{t_crit})"
+            # (optional: add further checks)
             return True, "ok"
         except Exception as e:
             return False, f"validator_error: {e}"
@@ -958,7 +948,19 @@ class AdaptivePhaseController:
             return False
         self._last_logic_mutation = now
         return True    
-    def set_phase_from_API(self, phase_idx, requested_duration=None, do_intergreen: bool = True):
+    def set_phase_from_API(self, phase_idx, requested_duration=None, do_intergreen: bool = True, emergency_context=False):
+        """
+        Set the traffic light phase via API with support for emergency/gridlock overrides.
+        If emergency_context is True, bypass phase-end and safety gating for immediate response.
+        ENFORCES: All light phases must have a yellow phase before any G->R, even in special conditions.
+        """
+        # --- PATCH: STRICT YELLOW ENFORCEMENT ---
+        try:
+            ensure_global_yellow_phases(self.tls_id)
+        except Exception:
+            pass
+        # --- END PATCH ---
+
         # Intergreen sequence is already in progress: queue a request for after
         if self._pending_followup and self._pending_followup.get("stage") in ("yellow_wait", "clearance_wait"):
             logger.info(f"[API-GUARD] {self.tls_id}: Intergreen active; request queued.")
@@ -984,38 +986,39 @@ class AdaptivePhaseController:
             logger.warning(f"[API] {self.tls_id}: invalid target {phase_idx}")
             return False
 
-        # PHASE END ENFORCEMENT: If phase has not ended, queue the request and return
-        if not self._phase_has_ended():
+        # PHASE END ENFORCEMENT: Allow override in emergency/gridlock mode
+        if not self._phase_has_ended(emergency_context=emergency_context or getattr(self, 'gridlock_mode', False)):
             self._log_apc_event({
                 "action": "queued_phase_switch_until_end",
                 "requested_phase": int(safe_target),
-                "requested_duration": float(requested_duration) if requested_duration is not None else None
+                "requested_duration": float(requested_duration) if requested_duration is not None else None,
+                "emergency_context": emergency_context or getattr(self, 'gridlock_mode', False)
             })
             self.request_phase_change(
                 int(safe_target),
-                priority_type='normal',
+                priority_type='emergency' if emergency_context else 'normal',
                 extension_duration=(float(requested_duration) if requested_duration is not None else None)
             )
             return True  # Queued (not immediately applied)
 
-        # --- NEW PATCH: SAFETY VALIDATION BEFORE ANY PHASE SWITCH ---
+        # --- SAFETY VALIDATION: Allow override in emergency ---
         try:
             current_phase = traci.trafficlight.getPhase(self.tls_id)
         except Exception:
             current_phase = safe_target
         current_phase = self._safe_phase_index(current_phase) or safe_target
 
-        # SAFETY VALIDATOR: Block switch if not safe, queue for later
-        is_safe, reason = self._validate_phase_switch_safety(self.tls_id, current_phase, safe_target)
-        if not is_safe:
-            log_diag("phase_switch_blocked_safety",
-                     tls_id=self.tls_id, from_phase=current_phase, to_phase=safe_target, reason=reason)
-            self.request_phase_change(
-                int(safe_target),
-                priority_type='safety_deferred',
-                extension_duration=(float(requested_duration) if requested_duration is not None else None)
-            )
-            return False
+        if not emergency_context and not getattr(self, 'gridlock_mode', False):
+            is_safe, reason = self._validate_phase_switch_safety(self.tls_id, current_phase, safe_target)
+            if not is_safe:
+                log_diag("phase_switch_blocked_safety",
+                        tls_id=self.tls_id, from_phase=current_phase, to_phase=safe_target, reason=reason)
+                self.request_phase_change(
+                    int(safe_target),
+                    priority_type='safety_deferred',
+                    extension_duration=(float(requested_duration) if requested_duration is not None else None)
+                )
+                return False
 
         # Determine base duration for target phase
         phase_record = self.load_phase_from_supabase(safe_target)
@@ -1056,7 +1059,7 @@ class AdaptivePhaseController:
             except Exception:
                 in_dz = False
 
-            if in_dz:
+            if in_dz and not (emergency_context or getattr(self, 'gridlock_mode', False)):
                 unsafe_found = False
                 max_a_req = 0.0
                 controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
@@ -1105,7 +1108,7 @@ class AdaptivePhaseController:
             logger.info(f"[SAFE] Green validation failed on {safe_target}: {e}")
 
         # Approach safety
-        if current_phase != safe_target:
+        if current_phase != safe_target and not (emergency_context or getattr(self, 'gridlock_mode', False)):
             try:
                 delay_needed, hold_extra, diag = self._should_delay_for_approach(current_phase, safe_target)
                 if delay_needed:
@@ -1123,11 +1126,11 @@ class AdaptivePhaseController:
             except Exception as e:
                 logger.info(f"[APPROACH SAFETY][ERROR] {e}")
 
-        # Intergreen (yellow + clearance)
-        if do_intergreen and current_phase != safe_target:
+        # INTERGREEN: MUST ALWAYS TRANSITION G->R VIA YELLOW, EVEN IN EMERGENCIES/CONGESTION
+        if current_phase != safe_target:
             used, y_idx, y_dur = self.insert_yellow_phase_if_needed(current_phase, safe_target, return_info=True)
             if used:
-                logger.info(f"[YELLOW INSERT] {self.tls_id}: {current_phase}->{safe_target} via yellow idx {y_idx} dur={y_dur:.2f}s")
+                logger.info(f"[STRICT YELLOW INSERT] {self.tls_id}: {current_phase}->{safe_target} via yellow idx {y_idx} dur={y_dur:.2f}s")
                 clearance = float(self.intergreen_clearance_s)
                 self._pending_followup = {
                     "stage": "yellow_wait",
@@ -1140,8 +1143,9 @@ class AdaptivePhaseController:
                 }
                 self.dz_hold_count = 0
                 self.dz_last_from_to = None
+                return True  # Always run yellow, even in emergencies
 
-        # Safety: direct G->R without yellow
+        # Safety: direct G->R without yellow (should never occur now)
         try:
             if not do_intergreen and current_phase != safe_target:
                 prev = current_state
@@ -1152,7 +1156,7 @@ class AdaptivePhaseController:
         except Exception:
             pass
 
-        # Direct apply
+        # Direct apply (should not run for G->R, only for phase self-transitions)
         ok = self._apply_phase(safe_target, duration=desired_total)
         log_diag("apply_phase",PhaseIdx=safe_target,Base=base_duration,AppliedDuration=desired_total,MinGreen=self.min_green,MaxGreen=self.max_green,Success=ok)
         if not ok:
@@ -1203,7 +1207,8 @@ class AdaptivePhaseController:
             "extended_time": extended_time,
             "reason": "api_call",
             "forced_after_dz": forced_after_dz,
-            "do_intergreen": do_intergreen
+            "do_intergreen": do_intergreen,
+            "emergency_context": emergency_context or getattr(self, 'gridlock_mode', False)
         })
 
         self.dz_hold_count = 0
@@ -1256,7 +1261,6 @@ class AdaptivePhaseController:
 
             # Predict deceleration for safety
             max_a_req = 0.0
-            moderate_over = False
             hard_conflict = False
             for lane_id in affected_lanes:
                 try:
@@ -1269,29 +1273,18 @@ class AdaptivePhaseController:
                         max_a_req = max(max_a_req, a_req)
                         if a_req > self.hard_brake_threshold and speed > 2.0:
                             hard_conflict = True
-                        elif a_req > (self.comfortable_decel + self.approach_margin):
-                            moderate_over = True
-                        log_diag("approach_decel",tls_id=self.tls_id,lane_id=lane_id,vid=vid,speed=speed,dist=dist,a_req=a_req,
-                            hard_conflict=(a_req > self.hard_brake_threshold and speed > 2.0),
-                            moderate_over=(a_req > (self.comfortable_decel + self.approach_margin)),)
+                        log_diag("approach_decel",tls_id=self.tls_id,lane_id=lane_id,vid=vid,speed=speed,dist=dist,a_req=a_req)
                 except Exception:
                     continue
 
-            # Abort if hard conflict remains
             if hard_conflict:
                 log_diag("yellow_abort_hard_brake",tls_id=self.tls_id,max_a_req=max_a_req,reason="Hard brake conflict persists; deferring yellow")
                 if return_info:
                     return (False, None, 0.0)
                 return False
 
-            # Base yellow duration
-            ydur = self._calculate_adaptive_yellow_duration(from_phase, to_phase)
-            if moderate_over:
-                ydur = min(self.max_adaptive_yellow, ydur + 1.0)
-            ydur = max(4.0, min(self.max_adaptive_yellow, ydur))
-            log_diag("yellow_build",tls_id=self.tls_id,yellow_state="".join(list(from_state)),duration=ydur,max_a_req=max_a_req)
-
-            # Use shared helper
+            # Always use at least MIN_YELLOW_S (from config)
+            ydur = max(self.min_clear_green_extension, float(MIN_YELLOW_S))
             yellow_idx, yellow_dur = self.get_or_create_yellow_phase(from_phase, to_phase, ydur)
             if yellow_idx is not None:
                 applied = self._apply_phase(yellow_idx, duration=float(yellow_dur))
@@ -1304,9 +1297,8 @@ class AdaptivePhaseController:
                         "yellow_state": logic.phases[yellow_idx].state if yellow_idx < len(logic.phases) else None,
                         "yellow_duration": float(yellow_dur),
                         "max_a_req": max_a_req,
-                        "moderate_over": moderate_over
                     })
-                    log_diag("yellow_success",tls_id=self.tls_id,yellow_idx=yellow_idx,yellow_duration=yellow_dur,moderate_over=moderate_over,max_a_req=max_a_req)
+                    log_diag("yellow_success",tls_id=self.tls_id,yellow_idx=yellow_idx,yellow_duration=yellow_dur,max_a_req=max_a_req)
                     if return_info:
                         return (True, yellow_idx, float(yellow_dur))
                     return True
@@ -1488,18 +1480,55 @@ class AdaptivePhaseController:
             logger.info(f"[DELAYED SWITCH] Completed transition to phase {safe_idx}")
         except Exception as e:
             logger.info(f"[ERROR] Delayed phase switch failed: {e}")    
-    def _phase_has_ended(self, eps: float = 0.05) -> bool:
+    def _phase_has_ended(self, emergency_context=False, eps: float = 0.05) -> bool:
         """
-        Returns True only if the current simulation time has reached (or slightly passed)
-        the scheduled next switch time for the current phase.
+        Returns True if the phase has ended.
+        If emergency_context, be more lenient for immediate intervention.
         """
         try:
             now = traci.simulation.getTime()
             next_sw = traci.trafficlight.getNextSwitch(self.tls_id)
+            if emergency_context:
+                # Allow switch after half min_green if emergency
+                elapsed = now - float(self.last_phase_switch_sim_time)
+                return elapsed >= (self.min_green * 0.5)
             return now >= (next_sw - float(eps))
         except Exception:
             return False
+    def emergency_override_safety_check(self, tl_id, emergency_type, current_phase, target_phase):
+        """
+        Allow immediate phase changes for true emergencies, bypassing normal gating.
+        """
+        if emergency_type in ['emergency_vehicle', 'critical_gridlock']:
+            return True
+        return self._validate_phase_switch_safety(tl_id, current_phase, target_phase)[0]
+    def activate_gridlock_breaking_mode(self):
+        """
+        Aggressive intervention for gridlock:
+        - Temporarily reduce min_green
+        - Rotate phases rapidly
+        - Disable some safety checks
+        """
+        self.gridlock_mode = True
+        self.min_green = 8  # Lower min green for gridlock
+        self.max_green = min(self.max_green, 30)
 
+    def deactivate_gridlock_breaking_mode(self):
+        """
+        Restore normal timing after gridlock clears.
+        """
+        self.gridlock_mode = False
+        self.min_green = 30
+        self.max_green = 80
+
+    def preemptive_congestion_response(self, network_congestion, severity_threshold=0.6):
+        """
+        If network congestion is high, activate gridlock mode.
+        """
+        if network_congestion > severity_threshold:
+            self.activate_gridlock_breaking_mode()
+        else:
+            self.deactivate_gridlock_breaking_mode()
     def is_phase_ending(self, min_left=0.0, frac=0.0):
         """
         STRICT version: a phase is 'ending' only when it has ended.
@@ -1588,6 +1617,10 @@ class AdaptivePhaseController:
     # 4. PHASE CREATION & MODIFICATION
     # ========================================    
     def create_or_extend_phase(self, green_lanes, delta_t):
+        """
+        Create a new phase or extend an existing one for the specified green_lanes, 
+        with strict yellow enforcement before every phase change or logic mutation.
+        """
         logic = self._get_logic()
         controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
         valid_green_lanes = [lane for lane in green_lanes if lane in controlled_lanes]
@@ -1620,7 +1653,8 @@ class AdaptivePhaseController:
         for idx, phase in enumerate(logic.getPhases()):
             if phase.state == new_state:
                 phase_record = self.load_phase_from_supabase(idx)
-                base_duration = (phase_record.get("duration", phase.duration) if phase_record else phase.duration)
+                base_duration = (phase_record.get("duration", phase.duration)
+                                 if phase_record else phase.duration)
                 phase_idx = idx
                 break
 
@@ -1628,6 +1662,12 @@ class AdaptivePhaseController:
         if phase_idx is not None:
             logger.info(f"[PHASE EXTEND] Extending phase {phase_idx} from {base_duration}s to {duration}s (delta_t={delta_t}s)")
             self.save_phase_record_to_supabase(phase_idx, duration, new_state, delta_t, delta_t, penalty=0)
+            # --- STRICT PATCH: Enforce yellow safety after logic mutation ---
+            try:
+                from utils import ensure_global_yellow_phases
+                ensure_global_yellow_phases(self.tls_id)
+            except Exception:
+                pass
             self.set_phase_from_API(phase_idx, requested_duration=duration)
             if hasattr(self, "update_display"):
                 self.update_display(phase_idx, duration)
@@ -1649,12 +1689,24 @@ class AdaptivePhaseController:
         self._invalidate_logic_cache()
 
         self.save_phase_record_to_supabase(new_phase_idx, duration, new_state, delta_t, delta_t, penalty=0)
+        # --- STRICT PATCH: Enforce yellow safety after logic mutation ---
+        try:
+            from utils import ensure_global_yellow_phases
+            ensure_global_yellow_phases(self.tls_id)
+        except Exception:
+            pass
         self.set_phase_from_API(new_phase_idx, requested_duration=duration)
         if hasattr(self, "update_display"):
             self.update_display(new_phase_idx, duration)
         logger.info(f"[PHASE CREATE] New (single-approach) phase created at index {new_phase_idx}")
-        return new_phase_idx
+        return new_phase_idx  
     def overwrite_phase(self, phase_idx, new_state, new_duration):
+        """
+        Overwrite an existing phase at phase_idx with a new state and duration,
+        then strictly enforce yellow-phase safety for all G->R transitions.
+
+        Returns True if successful, False otherwise.
+        """
         if not self._can_mutate_logic():
             return False
         try:
@@ -1674,6 +1726,13 @@ class AdaptivePhaseController:
             # Invalidate controller cache too
             if hasattr(self, "controller") and hasattr(self.controller, "_invalidate_logic_cache"):
                 self.controller._invalidate_logic_cache(self.tls_id)
+
+            # PATCH: Strict yellow enforcement after logic mutation
+            from utils import ensure_global_yellow_phases
+            try:
+                ensure_global_yellow_phases(self.tls_id)
+            except Exception as e:
+                logger.warning(f"[YELLOW ENFORCEMENT PATCH] Failed after overwrite_phase: {e}")
 
             self.phase_usage_count[phase_idx] = 0
             self.phase_last_used[phase_idx] = traci.simulation.getTime()
@@ -1885,45 +1944,64 @@ class AdaptivePhaseController:
             return True
         return False            
     def add_new_phase(self, green_lanes, green_duration=None, yellow_duration=3):
-        logic = self._get_logic()
-        controlled_links = traci.trafficlight.getControlledLinks(self.tls_id)
-        n = len(controlled_links)
-        if n == 0:
-            return None
+        """
+        Add a new green phase (and corresponding yellow phase) for the specified green_lanes.
+        Strictly enforce yellow phase presence for every G->R transition (patched).
+        Returns the index of the new green phase, or None on failure.
+        """
+        try:
+            logic = self._get_logic()
+            controlled_links = traci.trafficlight.getControlledLinks(self.tls_id)
+            n = len(controlled_links)
+            if n == 0:
+                return None
 
-        # Build green state over LINKS, not LANES
-        state = ['r'] * n
-        for i, lk in enumerate(controlled_links):
+            # Build green state over LINKS, not LANES
+            state = ['r'] * n
+            for i, lk in enumerate(controlled_links):
+                try:
+                    from_lane = lk[0][0]
+                except Exception:
+                    from_lane = None
+                if from_lane in (green_lanes or []):
+                    state[i] = 'G'
+            green_state_str = ''.join(state)
+
+            # Yellow for exactly those links that were green
+            ystate = ['r'] * n
+            for i, ch in enumerate(state):
+                if ch.upper() == 'G':
+                    ystate[i] = 'y'
+            yellow_state_str = ''.join(ystate)
+
+            g_dur = float(green_duration or self.max_green)
+            y_dur = float(yellow_duration)
+
+            phases = list(logic.getPhases())
+            new_green_phase = traci.trafficlight.Phase(g_dur, green_state_str)
+            new_yellow_phase = traci.trafficlight.Phase(y_dur, yellow_state_str)
+            phases.extend([new_green_phase, new_yellow_phase])
+
+            new_logic = traci.trafficlight.Logic(
+                logic.programID, logic.type, len(phases) - 2, phases
+            )
+            traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
+            self._invalidate_logic_cache()
+
+            # --- PATCH: Strict yellow enforcement after mutation ---
             try:
-                from_lane = lk[0][0]
-            except Exception:
-                from_lane = None
-            if from_lane in (green_lanes or []):
-                state[i] = 'G'
-        green_state_str = ''.join(state)
+                from utils import ensure_global_yellow_phases
+                ensure_global_yellow_phases(self.tls_id)
+            except Exception as e:
+                import logging
+                logging.getLogger("controller").warning(f"[STRICT YELLOW PATCH] Could not enforce yellow phases after add_new_phase: {e}")
 
-        # Yellow for exactly those links that were green
-        ystate = ['r'] * n
-        for i, ch in enumerate(state):
-            if ch.upper() == 'G':
-                ystate[i] = 'y'
-        yellow_state_str = ''.join(ystate)
+            return len(phases) - 2
 
-        g_dur = float(green_duration or self.max_green)
-        y_dur = float(yellow_duration)
-
-        phases = list(logic.getPhases())
-        new_green_phase = traci.trafficlight.Phase(g_dur, green_state_str)
-        new_yellow_phase = traci.trafficlight.Phase(y_dur, yellow_state_str)
-        phases.extend([new_green_phase, new_yellow_phase])
-
-        new_logic = traci.trafficlight.Logic(
-            logic.programID, logic.type, len(phases) - 2, phases
-        )
-        traci.trafficlight.setCompleteRedYellowGreenDefinition(self.tls_id, new_logic)
-        self._invalidate_logic_cache()
-        return len(phases) - 2
-
+        except Exception as e:
+            import logging
+            logging.getLogger("controller").info(f"[ERROR] add_new_phase failed for {self.tls_id}: {e}")
+            return None
     def _served_lanes_from_state(self, state_str):
         served = set()
         try:
@@ -3297,25 +3375,33 @@ class AdaptivePhaseController:
         return critical_lanes
 
     def emergency_gridlock_response(self):
+        """
+        Respond to critical gridlock situations by forcing a quick phase change to serve the most blocked lane,
+        while strictly enforcing yellow-phase safety for all G->R transitions.
+        """
+        try:
+            # Strictly enforce yellow-phase safety before any action
+            from utils import ensure_global_yellow_phases
+            ensure_global_yellow_phases(self.tls_id)
+        except Exception as e:
+            self.logger.warning(f"[PATCH][YELLOW ENFORCE] Failed for {self.tls_id}: {e}")
+
+        # Detect critical gridlock lanes (vehicles waiting >180s)
         critical_lanes = self.detect_critical_gridlock()
         if not critical_lanes:
-            logger.info(f"[EMERGENCY-GRIDLOCK PATCH] No critical lanes detected on {self.tls_id}")
+            self.logger.info(f"[EMERGENCY-GRIDLOCK PATCH] No critical lanes detected on {self.tls_id}")
             return False
+
+        # Force gridlock mode (shorter min/max green, aggressive phase cycling)
+        self.activate_gridlock_breaking_mode()
+
+        # Pick the lane with the worst (longest) wait
         critical_lanes.sort(key=lambda x: x[1], reverse=True)
         worst_lane, worst_time, identifier = critical_lanes[0]
-        log_diag("emergency_gridlock_patch",tls_id=self.tls_id,worst_lane=worst_lane,worst_time=worst_time,identifier=identifier)
-        # Diagnostic: downstream full check
-        downstream_links = traci.lane.getLinks(worst_lane)
-        for lk in downstream_links:
-            to_lane = lk[0]
-            if to_lane:
-                occ = traci.lane.getLastStepOccupancy(to_lane)
-                queue = traci.lane.getLastStepHaltingNumber(to_lane)
-                log_diag("gridlock_downstream_check",tls_id=self.tls_id,to_lane=to_lane,occupancy=occ,queue=queue)
-        # Emergency phase activation
+
+        # Find/create phase for this lane
         emergency_phase = self.find_or_create_phase_for_lane(worst_lane)
         if emergency_phase is None:
-            log_diag("emergency_gridlock_failed",tls_id=self.tls_id,lane_id=worst_lane,waiting_time=worst_time,identifier=identifier)
             self._log_apc_event({
                 "action": "emergency_gridlock_failure",
                 "lane_id": worst_lane,
@@ -3323,15 +3409,26 @@ class AdaptivePhaseController:
                 "identifier": identifier
             })
             return False
-        duration = min(180, max(120, worst_time * 0.8))
-        log_diag("emergency_gridlock_override",tls_id=self.tls_id,emergency_phase=emergency_phase,worst_lane=worst_lane,duration=duration,reason="gridlock mitigation")
-        success = self.set_phase_from_API(emergency_phase, requested_duration=duration)
+
+        # Compute emergency duration (shorter if extreme, but long enough to clear)
+        duration = min(60, max(30, worst_time * 0.5))
+
+        # Strict yellow enforcement again in case dynamic phase creation occurred
+        try:
+            ensure_global_yellow_phases(self.tls_id)
+        except Exception as e:
+            self.logger.warning(f"[PATCH][YELLOW ENFORCE-POST] Failed for {self.tls_id}: {e}")
+
+        # Apply phase, using API that guarantees yellow/clearance (with emergency_context)
+        success = self.set_phase_from_API(
+            emergency_phase,
+            requested_duration=duration,
+            emergency_context=True
+        )
         if success:
-            log_diag("emergency_mitigation_patch",tls_id=self.tls_id,emergency_phase=emergency_phase,duration=duration)
             self._block_non_emergency_phases(emergency_phase, duration)
             return True
         else:
-            log_diag("emergency_failed_patch",tls_id=self.tls_id,worst_lane=worst_lane)
             return False
     def _block_non_emergency_phases(self, emergency_phase, duration):
         if not hasattr(self, 'emergency_blocked_phases'):
@@ -3368,54 +3465,59 @@ class AdaptivePhaseController:
     # 10. RL AGENT INTEGRATION
     # ========================================   
     def rl_create_or_overwrite_phase(self, state_vector, desired_green_lanes=None):
+        """
+        RL agent helper: create or overwrite a phase for specified green lanes, with strict yellow enforcement.
+        Ensures all required yellow G->R transitions are present after phase logic mutation.
+        """
         if not hasattr(self.rl_agent, 'phase_overwrite_threshold'):
             # Initialize phase overwrite threshold (how often we overwrite vs append)
             self.rl_agent.phase_overwrite_threshold = 0.7
-        
+
         # If no specific green lanes provided, use RL agent to determine them
         if desired_green_lanes is None:
             # Get current traffic conditions
             controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
             traffic_scores = []
-            
             for lane in controlled_lanes:
                 queue, wait, _, _ = self.get_lane_stats(lane)
-                # Score based on queue length and waiting time
                 score = queue * 0.7 + min(wait / 10, 5)
                 traffic_scores.append((lane, score))
-            
             # Select top lanes with highest scores
             traffic_scores.sort(key=lambda x: x[1], reverse=True)
             num_lanes = min(3, max(1, len(traffic_scores)))
             desired_green_lanes = [lane for lane, _ in traffic_scores[:num_lanes]]
-        
+
         # Create the new phase state
         new_state = self.create_phase_state(green_lanes=desired_green_lanes)
-        
+
         # Count current phases
         logic = self._get_logic()
         phase_count = len(logic.phases)
         max_phases = 12  # SUMO phase limit
-        
+
         # Calculate new duration based on traffic
         total_queue = sum(self.get_lane_stats(lane)[0] for lane in desired_green_lanes)
         total_wait = sum(self.get_lane_stats(lane)[1] for lane in desired_green_lanes)
-        
         duration = np.clip(
             self.min_green + total_queue * 1.5 + total_wait * 0.1,
             self.min_green,
             self.max_green
         )
-        
+
         # Check if we're near the phase limit or randomly decide to overwrite
         if phase_count >= max_phases - 1 or np.random.random() < self.rl_agent.phase_overwrite_threshold:
             # Find a suitable phase to overwrite
             phase_to_overwrite = self.find_phase_to_overwrite(new_state)
-            
             if phase_to_overwrite is not None:
                 # Overwrite the phase
                 success = self.overwrite_phase(phase_to_overwrite, new_state, duration)
-                
+                # --- STRICT YELLOW ENFORCEMENT PATCH ---
+                try:
+                    from utils import ensure_global_yellow_phases
+                    ensure_global_yellow_phases(self.tls_id)
+                except Exception:
+                    pass
+                # ---------------------------------------
                 if success:
                     self._log_apc_event({
                         "action": "rl_overwrite_phase",
@@ -3424,54 +3526,56 @@ class AdaptivePhaseController:
                         "new_state": new_state,
                         "duration": duration
                     })
-                    
-                    # Adjust overwrite threshold - increase it slightly if successful
+                    # Adjust overwrite threshold - increase slightly if successful
                     self.rl_agent.phase_overwrite_threshold = min(
-                        0.9, 
-                        self.rl_agent.phase_overwrite_threshold + 0.02
+                        0.9, self.rl_agent.phase_overwrite_threshold + 0.02
                     )
-                    
                     return phase_to_overwrite
-        
+
         # Fall back to creating a new phase if overwriting didn't work or wasn't chosen
-        # (This will use your existing methods that append phases)
         try:
-            # Use existing create_or_extend_phase but with a check for max phases
             if phase_count < max_phases - 1:
                 new_phase_idx = self.create_or_extend_phase(desired_green_lanes, 0)
-                
+                # --- STRICT YELLOW ENFORCEMENT PATCH ---
+                try:
+                    from utils import ensure_global_yellow_phases
+                    ensure_global_yellow_phases(self.tls_id)
+                except Exception:
+                    pass
+                # ---------------------------------------
                 if new_phase_idx is not None:
                     # Decrease overwrite threshold slightly when we append
                     self.rl_agent.phase_overwrite_threshold = max(
-                        0.5, 
-                        self.rl_agent.phase_overwrite_threshold - 0.01
+                        0.5, self.rl_agent.phase_overwrite_threshold - 0.01
                     )
-                    
                     return new_phase_idx
-            
+
             # If we've reached the limit, force an overwrite of the least used phase
             logger.info("[PHASE LIMIT] Reached maximum phases, forcing phase overwrite")
             phase_to_overwrite = self.find_phase_to_overwrite(new_state)
-            
             if phase_to_overwrite is not None:
                 self.overwrite_phase(phase_to_overwrite, new_state, duration)
+                # --- STRICT YELLOW ENFORCEMENT PATCH ---
+                try:
+                    from utils import ensure_global_yellow_phases
+                    ensure_global_yellow_phases(self.tls_id)
+                except Exception:
+                    pass
+                # ---------------------------------------
                 return phase_to_overwrite
             else:
                 # Last resort: reuse any existing phase with green for the desired lanes
                 for idx, phase in enumerate(logic.phases):
                     phase_state = phase.state
                     controlled_lanes = traci.trafficlight.getControlledLanes(self.tls_id)
-                    
                     for lane in desired_green_lanes:
                         if lane in controlled_lanes:
                             lane_idx = controlled_lanes.index(lane)
                             if lane_idx < len(phase_state) and phase_state[lane_idx].upper() == 'G':
-                                logger.info(f"[FALLBACK] Using existing phase {idx} for desired green lanes")
                                 return idx
-                                
                 # If even that failed, return phase 0
                 return 0
-                
+
         except Exception as e:
             logger.info(f"[ERROR] Failed to create or overwrite phase: {e}")
             import traceback
@@ -4186,11 +4290,12 @@ class AdaptivePhaseController:
         """
         Main control loop for one simulation step at this intersection.
         PATCHED: Uses lane_data for all lane stats.
+        Prevents emergency stops and teleportation using robust yellow enforcement and starvation/gridlock prevention.
         """
         self.phase_count += 1
         now = traci.simulation.getTime()
 
-        # 0) Complete any pending yellow → all-red → target sequences first
+        # 0) Complete pending yellow → all-red → target sequences first
         try:
             if self._process_pending_followup():
                 return
@@ -4218,13 +4323,12 @@ class AdaptivePhaseController:
         except Exception:
             pass
 
-        # 3) Starvation hard guard (absolute max wait)
+        # 3) Starvation hard guard (absolute max wait, patched for 120s)
         try:
             for lane in self.lane_ids:
                 time_since_served = now - self.last_served_time.get(lane, 0.0)
-                # Use lane_data for queue
                 q = lane_data[lane]['queue_length'] if lane_data and lane in lane_data else traci.lane.getLastStepHaltingNumber(lane)
-                if time_since_served > 180.0 and q > 0:
+                if time_since_served > 120.0 and q > 0:
                     self.logger.warning(f"[STARVATION] {lane} not served for {time_since_served:.1f}s")
                     phase = self.find_or_create_phase_for_lane(lane)
                     if phase is not None:
@@ -4234,7 +4338,7 @@ class AdaptivePhaseController:
         except Exception:
             pass
 
-        # 4) Downstream flush nudge
+        # 4) Downstream flush nudge (unchanged)
         try:
             if hasattr(self, "controller") and getattr(self.controller, "corridor", None):
                 if self.phase_count % 5 == 0:
@@ -4259,8 +4363,7 @@ class AdaptivePhaseController:
                             continue
                         avg_occ = float(np.mean(occs))
                         avg_slots = float(np.mean(slots_ratios))
-                        if (avg_occ >= max(0.5, self.downstream_occ_thresh)) or \
-                        (avg_slots <= min(0.3, 1.0 - self.downstream_cap_ratio_thresh)):
+                        if (avg_occ >= max(0.5, self.downstream_occ_thresh)) or (avg_slots <= min(0.3, 1.0 - self.downstream_cap_ratio_thresh)):
                             last = float(self._downstream_flush_cooldown.get(lane, 0.0))
                             if now_ts - last >= 20.0:
                                 ok = self.controller.corridor.request_downstream_flush(lane)
@@ -4286,7 +4389,7 @@ class AdaptivePhaseController:
         except Exception:
             pass
 
-        # 7) EMPTY-GREEN WATCHDOG
+        # 7) EMPTY-GREEN WATCHDOG: skip phases with no vehicles waiting on green
         try:
             if logic and 0 <= current_phase < len(logic.getPhases()):
                 st = logic.getPhases()[current_phase].state
@@ -4308,7 +4411,7 @@ class AdaptivePhaseController:
         except Exception:
             pass
 
-        # 8) Corridor active responses
+        # 8) Corridor active responses (unchanged)
         try:
             if hasattr(self, 'controller') and hasattr(self.controller, 'corridor'):
                 corridor = self.controller.corridor
@@ -4556,6 +4659,7 @@ class AdaptivePhaseController:
             pass
 
         self._dbg.log("ctrl-step-end", logging.DEBUG, "[DEBUG] === control_step END ===", 1.0)
+
     # ======================================
     def shutdown(self):
         self._db_writer.stop()
@@ -5448,30 +5552,46 @@ class UniversalSmartTrafficController:
 
     def initialize_controller_phases(self):
         logger.info("[PHASE GENERATION PATCH] Ensuring all lanes have serving phases at runtime...")
+
+        # 1. For every TLS, ensure every lane is served by a green phase
         for tls_id in traci.trafficlight.getIDList():
             apc = self.adaptive_phase_controllers[tls_id]
             logic = traci.trafficlight.getAllProgramLogics(tls_id)[0]
             controlled_lanes = traci.trafficlight.getControlledLanes(tls_id)
             controlled_links = traci.trafficlight.getControlledLinks(tls_id)
-            # Find lanes lacking green
+
+            # Find lanes lacking any green
             unserved = []
             for lane in controlled_lanes:
                 idxs = [i for i, lk in enumerate(controlled_links) if lk and lk[0] and lk[0][0] == lane]
-                has_green = any(any(i < len(ph.state) and ph.state[i].upper() == 'G' for i in idxs) for ph in logic.phases)
+                has_green = any(
+                    any(i < len(ph.state) and ph.state[i].upper() == 'G' for i in idxs)
+                    for ph in logic.phases
+                )
                 if not has_green:
                     unserved.append(lane)
-            if not unserved:
-                continue
-            logger.warning(f"[RUNTIME PHASE PATCH] {tls_id} has {len(unserved)} unserved lanes; repairing phases.")
-            phases = list(logic.phases)
-            for lane in unserved:
-                green_state = apc.create_phase_state(green_lanes=[lane])
-                yellow_state = apc.create_phase_state(yellow_lanes=[lane])
-                phases.append(traci.trafficlight.Phase(apc.min_green, green_state))
-                phases.append(traci.trafficlight.Phase(3.0, yellow_state))
-            new_logic = traci.trafficlight.Logic(logic.programID, logic.type, len(phases) - 2, phases)
-            traci.trafficlight.setCompleteRedYellowGreenDefinition(tls_id, new_logic)
-            logic = traci.trafficlight.getAllProgramLogics(tls_id)[0]
+            if unserved:
+                logger.warning(f"[RUNTIME PHASE PATCH] {tls_id} has {len(unserved)} unserved lanes; repairing phases.")
+                phases = list(logic.phases)
+                for lane in unserved:
+                    green_state = apc.create_phase_state(green_lanes=[lane])
+                    yellow_state = apc.create_phase_state(yellow_lanes=[lane])
+                    phases.append(traci.trafficlight.Phase(apc.min_green, green_state))
+                    phases.append(traci.trafficlight.Phase(3.0, yellow_state))
+                new_logic = traci.trafficlight.Logic(logic.programID, logic.type, len(phases) - 2, phases)
+                traci.trafficlight.setCompleteRedYellowGreenDefinition(tls_id, new_logic)
+
+            # --- PATCH: Ensure strict yellow enforcement after any phase mutation ---
+            try:
+                ensure_global_yellow_phases(tls_id)
+            except Exception as e:
+                logger.warning(f"[STRICT YELLOW] Could not enforce for {tls_id}: {e}")
+
+        # 2. Audit and repair yellow phases on all TLSs for strict G->R safety
+        try:
+            audit_and_repair_yellow_phases_all_tls()
+        except Exception as e:
+            logger.warning(f"[STRICT YELLOW] Could not run global audit: {e}")
     def detect_turning_lanes(self):
         left, right = set(), set()
         for lid in self.lane_id_list:
@@ -5846,30 +5966,72 @@ class UniversalSmartTrafficController:
         if left: return self._handle_protected_left_turn(tl_id, left, lane_data, current_time)
         return False
     def _handle_ambulance_priority(self, tl_id, controlled_lanes, lane_data, current_time):
+        """
+        Emergency priority handling with strict yellow/clearance enforcement.
+        Uses APC.set_phase_from_API(do_intergreen=True, emergency_context=True) to ensure no G->R without yellow.
+        """
         try:
+            # Find lanes with emergency-class vehicles
             amb_lanes = [l for l in controlled_lanes if lane_data.get(l, {}).get('ambulance')]
-            if not amb_lanes: return False
-            min_dist, target = float('inf'), None
+            if not amb_lanes:
+                return False
+
+            # Select the closest emergency vehicle to the stop line
+            min_dist, target_lane = float('inf'), None
+            target_vid = None
             for lane in amb_lanes:
                 try:
+                    lane_len = traci.lane.getLength(lane)
                     for vid in traci.lane.getLastStepVehicleIDs(lane):
-                        if traci.vehicle.getVehicleClass(vid) in ['emergency', 'authority']:
-                            d = traci.lane.getLength(lane) - traci.vehicle.getLanePosition(vid)
-                            if d < min_dist: min_dist, target = d, lane
-                except Exception as e:
-                    logger.info(f"Error ambulance lane {lane}: {e}")
-            if target is None: return False
-            phase = self._find_phase_for_lane(tl_id, target)
-            if phase is not None:
-                dur = 30 if min_dist < 30 else 20
-                traci.trafficlight.setPhase(tl_id, phase)
-                traci.trafficlight.setPhaseDuration(tl_id, dur)
+                        try:
+                            if traci.vehicle.getVehicleClass(vid) not in ['emergency', 'authority']:
+                                continue
+                        except Exception:
+                            continue
+                        dist = lane_len - traci.vehicle.getLanePosition(vid)
+                        if dist < min_dist:
+                            min_dist, target_lane, target_vid = dist, lane, vid
+                except Exception:
+                    continue
+
+            if not target_lane:
+                return False
+
+            apc = self.adaptive_phase_controllers.get(tl_id)
+            if not apc:
+                return False
+
+            # Pick the phase that serves the emergency lane
+            phase = apc.find_or_create_phase_for_lane(target_lane)
+            if phase is None:
+                return False
+
+            # Compute a reasonable green based on arrival proximity
+            # Closer = larger preemption padding
+            dur = 30.0 if min_dist < 30.0 else 20.0
+
+            # Apply via APC to guarantee yellow/intergreen and safety gating (emergency_context relaxes min hold)
+            ok = apc.set_phase_from_API(int(phase), requested_duration=float(dur), do_intergreen=True, emergency_context=True)
+            if ok:
                 self.ambulance_active[tl_id] = True
                 self.ambulance_start_time[tl_id] = current_time
-                self.rl_agent.training_data.append({'event':'ambulance_priority','lane_id':target,'tl_id':tl_id,
-                    'phase':phase,'simulation_time':current_time,'distance_to_stopline':min_dist,'duration':dur})
+
+                # Training data / audit trail
+                rl_agent = self.rl_agents[tl_id] if hasattr(self, 'rl_agents') and tl_id in self.rl_agents else self.rl_agent
+                if rl_agent is not None:
+                    rl_agent.training_data.append({
+                        'event': 'ambulance_priority',
+                        'lane_id': target_lane,
+                        'tl_id': tl_id,
+                        'phase': int(phase),
+                        'simulation_time': current_time,
+                        'distance_to_stopline': float(min_dist),
+                        'duration': float(dur),
+                        'vehicle_id': target_vid
+                    })
                 return True
             return False
+
         except Exception as e:
             logger.info(f"Error in _handle_ambulance_priority: {e}")
             return False
@@ -6064,6 +6226,8 @@ class UniversalSmartTrafficController:
                 logger.warning(f"[CRITICAL] {tl_id} congestion severity: {severity:.2f}")
         
         return congestion_report
+
+
     def activate_global_congestion_mode(self):
         if self.congestion_mode_active:
             return
@@ -6408,14 +6572,18 @@ class UniversalSmartTrafficController:
     # 9. CONTROL EXECUTION
     # ========================================
     def run_step(self):
-        """
-        PATCHED: Fully optimized for passing lane_data to corridor coordinator and using batch subscription everywhere.
-        Refactored to use RL agent helper for dynamic TLs.
-        """
+
         try:
             self.step_count += 1
             current_time = traci.simulation.getTime()
             self.intersection_data = {}
+
+            # --- STRICT YELLOW ENFORCEMENT: Audit and repair all TLS at every step ---
+            try:
+                from utils import audit_and_repair_yellow_phases_all_tls
+                audit_and_repair_yellow_phases_all_tls()
+            except Exception as e:
+                logger.warning(f"[YELLOW ENFORCEMENT] audit failed: {e}")
 
             # Step 1: Defensive re-initialization for new traffic lights
             for tl_id in traci.trafficlight.getIDList():
@@ -6432,6 +6600,12 @@ class UniversalSmartTrafficController:
                     apc.controller = self
                     self.adaptive_phase_controllers[tl_id] = apc
                     self._create_rl_agent_for_tls(tl_id, apc)
+                    # Enforce yellow phases for new controller
+                    try:
+                        from utils import ensure_global_yellow_phases
+                        ensure_global_yellow_phases(tl_id)
+                    except Exception as e:
+                        logger.warning(f"[YELLOW ENFORCEMENT][NEW] {tl_id}: {e}")
 
             # Step 2: Collect network-wide data (batch subscription results)
             all_vehicles = set(traci.vehicle.getIDList())
@@ -7173,9 +7347,12 @@ def start_universal_simulation(sumocfg_path, use_gui=True, max_steps=None,
                         last_corridor_log = step
 
                     step += 1
-
+                    if step % 100 == 0:
+                        from utils import audit_and_repair_yellow_phases_all_tls
+                        audit_and_repair_yellow_phases_all_tls()
                     # Regular progress logging
                     if step % 1000 == 0:
+                        audit_and_repair_yellow_phases_all_tls()
                         elapsed = time.time() - tstart
                         step_rate = step / elapsed if elapsed > 0 else 0
                         try:

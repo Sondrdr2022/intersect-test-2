@@ -30,7 +30,7 @@ DZ_DIST_FALLBACK = 50.0         # Fallback distance if no controller attribute t
 DYNAMIC_YELLOW = True           # Enable dynamic yellow computation
 REACTION_TIME_S = 2.5           # Reaction time used for dynamic yellow (↑ from 1.0)
 COMFORT_DECEL = 2.0             # Comfortable decel (m/s^2) (↓ from 4.5)
-MIN_YELLOW_S = 4.0              # Minimum yellow duration (↑ from 3.0)
+MIN_YELLOW_S = 5.0              # Minimum yellow duration (↑ from 3.0)
 MAX_YELLOW_S = 12.0             # Cap yellow duration (↑ from 6.0)
 
 # Extra approach safety parameters
