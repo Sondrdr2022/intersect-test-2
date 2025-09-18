@@ -2,14 +2,21 @@ import traci
 import logging
 import numpy as np
 from collections import defaultdict
+import time
 
 logger = logging.getLogger("controller")
 
+try:
+    from config import PHASE_CAP, MIN_YELLOW_S, YELLOW_AUDIT_SUPPRESS_WINDOW_S
+except Exception:
+    PHASE_CAP = 32
+    MIN_YELLOW_S = 4.0
+    YELLOW_AUDIT_SUPPRESS_WINDOW_S = 5.0
+
+# Simple rate-limit memory for [YELLOW AUDIT] spam
+_yellow_audit_last = {}  # key: (tls_id, i, j) -> last_log_time
+
 def log_diag(context, **kwargs):
-    """
-    Centralized diagnostic logger for controller events.
-    Usage: log_diag("set_phase_from_API", phase_idx=..., base=..., requested=...)
-    """
     msg = f"[DIAGNOSTIC][{context}] " + " | ".join(f"{k}={v}" for k, v in kwargs.items())
     logger.error(msg)
 
@@ -25,11 +32,9 @@ def get_current_logic(tls_id: str):
         logger.error(f"[LOGIC] Failed to get current logic for {tls_id}: {e}")
         return None
 
-def get_or_create_all_red_phase(tls_id: str, clearance_s: float = 3.0, phase_cap: int = 12) -> int | None:
-    """
-    Build or locate an all-red phase for the given TLS.
-    Returns the phase index, or None if not possible.
-    """
+def get_or_create_all_red_phase(tls_id: str, clearance_s: float = 3.0, phase_cap: int = None) -> int | None:
+    if phase_cap is None:
+        phase_cap = PHASE_CAP
     try:
         logic = get_current_logic(tls_id)
         if not logic:
@@ -37,22 +42,18 @@ def get_or_create_all_red_phase(tls_id: str, clearance_s: float = 3.0, phase_cap
         n_links = len(traci.trafficlight.getControlledLinks(tls_id))
         all_red = 'r' * max(0, n_links)
         phases = list(logic.getPhases())
-        # Find an existing all-red
         for idx, ph in enumerate(phases):
             if ph.state == all_red:
                 return idx
-        # Overwrite if at phase cap (prefer yellow phase)
         if len(phases) >= phase_cap:
             ow_idx = next((i for i, ph in enumerate(phases) if 'y' in ph.state), None)
             if ow_idx is None:
-                # Fallback: overwrite last phase
                 ow_idx = len(phases) - 1
             phases[ow_idx] = traci.trafficlight.Phase(float(clearance_s), all_red)
             new_logic = traci.trafficlight.Logic(logic.programID, logic.type,
                                                  min(logic.currentPhaseIndex, len(phases)-1), phases)
             traci.trafficlight.setCompleteRedYellowGreenDefinition(tls_id, new_logic)
             return ow_idx
-        # Append new
         phases.append(traci.trafficlight.Phase(float(clearance_s), all_red))
         new_logic = traci.trafficlight.Logic(logic.programID, logic.type,
                                              min(logic.currentPhaseIndex, len(phases)-1), phases)
@@ -145,21 +146,13 @@ try:
 except Exception:
     MIN_YELLOW_S = 4.0
 
-def ensure_global_yellow_phases(tls_id: str, yellow_duration: float | None = None, phase_cap: int = 12) -> bool:
-    """
-    Guarantee that for every green service phase, there exists a corresponding
-    'universal yellow' phase that turns all G heads to 'y' and all others to 'r'.
-    - Reuses existing yellow phases when possible.
-    - Appends missing yellow phases up to phase_cap.
-    - If over cap, overwrites existing yellow phases to install the missing ones.
-    - Also ensures an all-red clearance phase is present.
-    Returns True if the logic was changed, False otherwise.
-    """
+def ensure_global_yellow_phases(tls_id: str, yellow_duration: float | None = None, phase_cap: int = None) -> bool:
+    if phase_cap is None:
+        phase_cap = PHASE_CAP
     try:
         logic = get_current_logic(tls_id)
         if not logic:
             return False
-
         phases = list(logic.getPhases())
         if not phases:
             return False
@@ -170,37 +163,30 @@ def ensure_global_yellow_phases(tls_id: str, yellow_duration: float | None = Non
         existing_states = {ph.state: i for i, ph in enumerate(phases)}
         missing_yellow_states = []
 
-        # Build target 'universal yellow' state for each green phase
         for ph in phases:
             st = ph.state
             if not st:
                 continue
             if 'y' in st.lower():
-                continue  # already a yellow
-            # skip all-red phases
+                continue
             if set(st.lower()) == {'r'}:
                 continue
-            # build 'universal yellow' for this green phase
             y_state = ''.join(('y' if ch.upper() == 'G' else 'r') for ch in st[:n_links])
-            # if all are 'r' (degenerate), skip
             if 'y' not in y_state:
                 continue
             if y_state not in existing_states and y_state not in missing_yellow_states:
                 missing_yellow_states.append(y_state)
 
         if not missing_yellow_states:
-            # Ensure we also have one all-red (clearance) phase
             get_or_create_all_red_phase(tls_id, clearance_s=3.0, phase_cap=phase_cap)
             return False
 
         changed = False
-        # Try to append as many as possible, respect cap
         while missing_yellow_states and len(phases) < phase_cap:
             yst = missing_yellow_states.pop(0)
             phases.append(traci.trafficlight.Phase(default_y, yst))
             changed = True
 
-        # If still missing, overwrite existing yellow slots
         if missing_yellow_states:
             for idx, ph in enumerate(phases):
                 if not missing_yellow_states:
@@ -210,43 +196,34 @@ def ensure_global_yellow_phases(tls_id: str, yellow_duration: float | None = Non
                     phases[idx] = traci.trafficlight.Phase(default_y, yst)
                     changed = True
 
-        # If still missing after all attempts, log a warning (SUMO cap limitation)
         if missing_yellow_states:
             logger.warning(f"[YELLOW_ENFORCER] {tls_id}: Could not install {len(missing_yellow_states)} yellow states due to phase cap ({phase_cap}).")
 
         if changed:
             new_logic = traci.trafficlight.Logic(
-                logic.programID,
-                logic.type,
+                logic.programID, logic.type,
                 min(getattr(logic, "currentPhaseIndex", 0), len(phases)-1),
                 phases
             )
             traci.trafficlight.setCompleteRedYellowGreenDefinition(tls_id, new_logic)
 
-        # Always ensure an all-red clearance phase exists
         get_or_create_all_red_phase(tls_id, clearance_s=3.0, phase_cap=phase_cap)
-
         return changed
     except Exception as e:
         logger.error(f"[YELLOW_ENFORCER] Failed for {tls_id}: {e}")
-        return False
-    
-def audit_and_repair_yellow_phases_all_tls():
-    """
-    Audit all traffic lights for missing G->R yellow transitions.
-    If missing, attempt to repair automatically.
-    Returns: List of (tls_id, from_phase, to_phase) that lacked yellow.
-    """
+        return False    
+def audit_and_repair_yellow_phases_all_tls(controller):
     import traci
-    from utils import ensure_global_yellow_phases, get_current_logic
-    logger = logging.getLogger("controller")
-    problems = []
+    problems_all = []
+    now = time.time()
+
     for tls_id in traci.trafficlight.getIDList():
         logic = get_current_logic(tls_id)
         if not logic:
             continue
         phases = list(logic.getPhases())
         n = len(phases)
+        problems_this_tls = []
         for i, from_ph in enumerate(phases):
             for j, to_ph in enumerate(phases):
                 if i == j:
@@ -258,7 +235,6 @@ def audit_and_repair_yellow_phases_all_tls():
                 )
                 if not has_gr:
                     continue
-                # Check if a yellow exists for this transition
                 y_state = ''.join(
                     'y' if (from_ph.state[k].upper() == 'G' and to_ph.state[k].upper() == 'R') else from_ph.state[k]
                     for k in range(nmin)
@@ -269,11 +245,50 @@ def audit_and_repair_yellow_phases_all_tls():
                         found = True
                         break
                 if not found:
-                    logger.critical(f"[YELLOW AUDIT] {tls_id}: Missing yellow between phase {i} ({from_ph.state}) and {j} ({to_ph.state})")
-                    problems.append((tls_id, i, j))
-        # Attempt repair if any problem found
-        if problems:
-            changed = ensure_global_yellow_phases(tls_id)
+                    key = (tls_id, i, j)
+                    last = _yellow_audit_last.get(key, 0)
+                    if now - last >= YELLOW_AUDIT_SUPPRESS_WINDOW_S:
+                        logger.warning(f"[YELLOW AUDIT] {tls_id}: Missing yellow between phase {i} ({from_ph.state}) and {j} ({to_ph.state})")
+                        _yellow_audit_last[key] = now
+                    problems_this_tls.append((tls_id, i, j))
+
+        if problems_this_tls:
+            changed = ensure_global_yellow_phases(tls_id, phase_cap=PHASE_CAP)
             if changed:
                 logger.warning(f"[YELLOW AUDIT] {tls_id}: Repaired missing yellow phases.")
-    return problems
+                # Only re-init if the APC exposes such a method
+                apc = getattr(controller, "adaptive_phase_controllers", {}).get(tls_id)
+                if apc and hasattr(apc, "_invalidate_logic_cache"):
+                    apc._invalidate_logic_cache()
+        problems_all.extend(problems_this_tls)
+
+    return problems_all
+
+def enforce_yellow_phases_all_controllers(controller):
+    # unchanged except it will benefit from PHASE_CAP via APC methods
+    from collections.abc import Mapping
+    logger = logging.getLogger("controller")
+    ctrls = getattr(controller, "adaptive_phase_controllers", None)
+    if not ctrls or not isinstance(ctrls, Mapping):
+        logger.error("[NETWORK YELLOW PATCH] No adaptive_phase_controllers found on controller")
+        return
+    num_fixed = 0
+    for tls_id, apc in ctrls.items():
+        logic = apc._get_logic()
+        phases = getattr(logic, "phases", None)
+        if not phases:
+            continue
+        n = len(phases)
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                from_state = phases[i].state
+                to_state = phases[j].state
+                nmin = min(len(from_state), len(to_state))
+                if any(from_state[k].upper() == 'G' and to_state[k].upper() == 'R' for k in range(nmin)):
+                    yellow_idx, yellow_dur = apc.get_or_create_yellow_phase(i, j, apc.max_adaptive_yellow, allow_overwrite=True)
+                    if yellow_idx is not None:
+                        num_fixed += 1
+                        logger.info(f"[NETWORK YELLOW PATCH] {tls_id}: Ensured yellow for {i}->{j} (idx={yellow_idx}, dur={yellow_dur:.2f})")
+    logger.info(f"[NETWORK YELLOW PATCH] Completed. Total yellow transitions ensured: {num_fixed}")

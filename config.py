@@ -47,7 +47,13 @@ FALLBACK_DIR = os.getenv("DB_FALLBACK_DIR", "offline_db")
 DB_WRITE_INTERVAL = 300  # Write every 5 minutes
 DB_BATCH_SIZE = 500      # Larger batches
 USE_MEMORY_CACHE = True  # Use in-memory caching
+PHASE_CAP = int(os.getenv("SUMO_PHASE_CAP", "32"))
 
+# Throttle repeated [YELLOW AUDIT] logs for the same (tls, from, to) pair
+YELLOW_AUDIT_SUPPRESS_WINDOW_S = float(os.getenv("YELLOW_AUDIT_SUPPRESS_WINDOW_S", "5.0"))
+
+# Optional: hard on/off switch for strict enforcement (kept on by default)
+STRICT_YELLOW_ENFORCEMENT = os.getenv("STRICT_YELLOW_ENFORCEMENT", "true").lower() == "true"
 # --- PATCH: Non-blocking Async Supabase Writer implementation ---
 class PatchedAsyncSupabaseWriter(threading.Thread):
     """

@@ -8,7 +8,7 @@ from collections import defaultdict, deque
 import threading
 import numpy as np
 import traci
-from utils import get_current_logic, log_diag
+from utils import get_current_logic, log_diag,enforce_yellow_phases_all_controllers
 
 logger = logging.getLogger("controller")
 
@@ -436,6 +436,8 @@ class EventDrivenCorridorCoordinator:
             self._build_network_topology()
             self._rebuild_direction_maps()
             logger.info(f"[CORRIDOR_COORDINATOR] Topology updated (force={force})")
+            enforce_yellow_phases_all_controllers(self.controller)
+
         except Exception as e:
             logger.error(f"[CORRIDOR_COORDINATOR] update_topology failed: {e}")
 
