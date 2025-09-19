@@ -46,9 +46,13 @@ def get_or_create_all_red_phase(tls_id: str, clearance_s: float = 3.0, phase_cap
             if ph.state == all_red:
                 return idx
         if len(phases) >= phase_cap:
-            ow_idx = next((i for i, ph in enumerate(phases) if 'y' in ph.state), None)
+            # Prefer overwriting a NON-yellow, NON-all-red phase
+            ow_idx = next((i for i, ph in enumerate(phases)
+                           if ('y' not in ph.state.lower()) and (set(ph.state.lower()) != {'r'})), None)
             if ow_idx is None:
-                ow_idx = len(phases) - 1
+                # No safe slot; skip creation instead of deleting a yellow
+                logger.warning(f"[ALL_RED] {tls_id}: Phase cap reached; not overwriting a yellow to install all-red.")
+                return None
             phases[ow_idx] = traci.trafficlight.Phase(float(clearance_s), all_red)
             new_logic = traci.trafficlight.Logic(logic.programID, logic.type,
                                                  min(logic.currentPhaseIndex, len(phases)-1), phases)
@@ -62,7 +66,6 @@ def get_or_create_all_red_phase(tls_id: str, clearance_s: float = 3.0, phase_cap
     except Exception as e:
         logger.error(f"[ALL_RED] Failed for {tls_id}: {e}")
         return None
-
 def collect_lane_stats(
     lane_ids,
     vehicle_classes,
@@ -147,57 +150,75 @@ except Exception:
     MIN_YELLOW_S = 4.0
 
 def ensure_global_yellow_phases(tls_id: str, yellow_duration: float | None = None, phase_cap: int = None) -> bool:
+    """
+    Ensure that for every pair of phases (i->j) where some head goes G->R,
+    there exists a yellow phase whose state equals 'from_state' with only G->R
+    heads turned to 'y' (others left unchanged). This matches the auditor's expectation.
+    """
     if phase_cap is None:
         phase_cap = PHASE_CAP
     try:
         logic = get_current_logic(tls_id)
         if not logic:
             return False
-        phases = list(logic.getPhases())
+
+        phases = list(logic.getPhases() or [])
         if not phases:
             return False
 
-        n_links = len(traci.trafficlight.getControlledLinks(tls_id))
+        # Target yellow duration
         default_y = float(yellow_duration if yellow_duration is not None else MIN_YELLOW_S)
 
+        # Build set of existing states for fast membership
         existing_states = {ph.state: i for i, ph in enumerate(phases)}
-        missing_yellow_states = []
 
-        for ph in phases:
-            st = ph.state
-            if not st:
-                continue
-            if 'y' in st.lower():
-                continue
-            if set(st.lower()) == {'r'}:
-                continue
-            y_state = ''.join(('y' if ch.upper() == 'G' else 'r') for ch in st[:n_links])
-            if 'y' not in y_state:
-                continue
-            if y_state not in existing_states and y_state not in missing_yellow_states:
-                missing_yellow_states.append(y_state)
+        # Compute all missing pair-specific yellow states
+        missing_y_states = []
+        for i, from_ph in enumerate(phases):
+            for j, to_ph in enumerate(phases):
+                if i == j:
+                    continue
+                nmin = min(len(from_ph.state), len(to_ph.state))
+                # Does this transition require yellow?
+                if not any(from_ph.state[k].upper() == 'G' and to_ph.state[k].upper() == 'R' for k in range(nmin)):
+                    continue
+                # Pair-specific yellow: only convert those G->R heads to 'y'; keep others unchanged
+                y_list = list(from_ph.state[:nmin])
+                for k in range(nmin):
+                    if from_ph.state[k].upper() == 'G' and to_ph.state[k].upper() == 'R':
+                        y_list[k] = 'y'
+                y_state = ''.join(y_list)
+                if y_state not in existing_states and y_state not in missing_y_states:
+                    missing_y_states.append(y_state)
 
-        if not missing_yellow_states:
+        if not missing_y_states:
+            # Still ensure all-red is present, but don't destroy yellows
             get_or_create_all_red_phase(tls_id, clearance_s=3.0, phase_cap=phase_cap)
             return False
 
         changed = False
-        while missing_yellow_states and len(phases) < phase_cap:
-            yst = missing_yellow_states.pop(0)
-            phases.append(traci.trafficlight.Phase(default_y, yst))
+
+        # Append as many as possible without exceeding cap
+        while missing_y_states and len(phases) < phase_cap:
+            st = missing_y_states.pop(0)
+            phases.append(traci.trafficlight.Phase(default_y, st))
             changed = True
 
-        if missing_yellow_states:
-            for idx, ph in enumerate(phases):
-                if not missing_yellow_states:
+        # If at cap, try to overwrite a NON-yellow, NON-all-red phase
+        if missing_y_states:
+            # candidates: no 'y' in state, and not all 'r'
+            candidate_idxs = [idx for idx, ph in enumerate(phases)
+                              if ('y' not in ph.state.lower()) and (set(ph.state.lower()) != {'r'})]
+            for idx in candidate_idxs:
+                if not missing_y_states:
                     break
-                if 'y' in ph.state:
-                    yst = missing_yellow_states.pop(0)
-                    phases[idx] = traci.trafficlight.Phase(default_y, yst)
-                    changed = True
+                st = missing_y_states.pop(0)
+                phases[idx] = traci.trafficlight.Phase(default_y, st)
+                changed = True
 
-        if missing_yellow_states:
-            logger.warning(f"[YELLOW_ENFORCER] {tls_id}: Could not install {len(missing_yellow_states)} yellow states due to phase cap ({phase_cap}).")
+        # Log if we still couldn't fit some
+        if missing_y_states:
+            logger.warning(f"[YELLOW_ENFORCER] {tls_id}: Could not install {len(missing_y_states)} yellow states due to phase cap ({phase_cap}).")
 
         if changed:
             new_logic = traci.trafficlight.Logic(
@@ -207,11 +228,12 @@ def ensure_global_yellow_phases(tls_id: str, yellow_duration: float | None = Non
             )
             traci.trafficlight.setCompleteRedYellowGreenDefinition(tls_id, new_logic)
 
+        # Ensure all-red, but do NOT overwrite a yellow to create it
         get_or_create_all_red_phase(tls_id, clearance_s=3.0, phase_cap=phase_cap)
         return changed
     except Exception as e:
         logger.error(f"[YELLOW_ENFORCER] Failed for {tls_id}: {e}")
-        return False    
+        return False
 def audit_and_repair_yellow_phases_all_tls(controller):
     import traci
     problems_all = []
@@ -224,6 +246,8 @@ def audit_and_repair_yellow_phases_all_tls(controller):
         phases = list(logic.getPhases())
         n = len(phases)
         problems_this_tls = []
+        missing_pairs = []  # collect (i, j, y_state)
+
         for i, from_ph in enumerate(phases):
             for j, to_ph in enumerate(phases):
                 if i == j:
@@ -236,7 +260,8 @@ def audit_and_repair_yellow_phases_all_tls(controller):
                 if not has_gr:
                     continue
                 y_state = ''.join(
-                    'y' if (from_ph.state[k].upper() == 'G' and to_ph.state[k].upper() == 'R') else from_ph.state[k]
+                    'y' if (from_ph.state[k].upper() == 'G' and to_ph.state[k].upper() == 'R')
+                    else from_ph.state[k]
                     for k in range(nmin)
                 )
                 found = False
@@ -251,20 +276,120 @@ def audit_and_repair_yellow_phases_all_tls(controller):
                         logger.warning(f"[YELLOW AUDIT] {tls_id}: Missing yellow between phase {i} ({from_ph.state}) and {j} ({to_ph.state})")
                         _yellow_audit_last[key] = now
                     problems_this_tls.append((tls_id, i, j))
+                    missing_pairs.append((i, j))
 
         if problems_this_tls:
-            changed = ensure_global_yellow_phases(tls_id, phase_cap=PHASE_CAP)
-            if changed:
-                logger.warning(f"[YELLOW AUDIT] {tls_id}: Repaired missing yellow phases.")
-                # Only re-init if the APC exposes such a method
-                apc = getattr(controller, "adaptive_phase_controllers", {}).get(tls_id)
-                if apc and hasattr(apc, "_invalidate_logic_cache"):
-                    apc._invalidate_logic_cache()
-        problems_all.extend(problems_this_tls)
+            # Repair exactly the missing pairs using APC API (pair-specific)
+            apc = getattr(controller, "adaptive_phase_controllers", {}).get(tls_id)
+            if apc:
+                repaired = 0
+                for i, j in missing_pairs:
+                    try:
+                        dur = apc._calculate_adaptive_yellow_duration(i, j)
+                    except Exception:
+                        dur = float(MIN_YELLOW_S)
+                    idx, _ = apc.get_or_create_yellow_phase(i, j, dur, allow_overwrite=True)
+                    if idx is not None:
+                        repaired += 1
+                if repaired:
+                    logger.warning(f"[YELLOW AUDIT] {tls_id}: Repaired {repaired} missing yellow phases.")
+                    if hasattr(apc, "_invalidate_logic_cache"):
+                        apc._invalidate_logic_cache()
+            problems_all.extend(problems_this_tls)
 
     return problems_all
-
 def enforce_yellow_phases_all_controllers(controller):
+    # CRITICAL FIX: Prevent infinite recursion
+    if getattr(controller, '_in_network_yellow_enforcement', False):
+        return
+
+    from collections.abc import Mapping
+    logger = logging.getLogger("controller")
+    ctrls = getattr(controller, "adaptive_phase_controllers", None)
+    if not ctrls or not isinstance(ctrls, Mapping):
+        logger.error("[NETWORK YELLOW PATCH] No adaptive_phase_controllers found on controller")
+        return
+
+    try:
+        controller._in_network_yellow_enforcement = True
+        num_fixed = 0
+
+        for tls_id, apc in ctrls.items():
+            # Skip if this APC is already processing
+            if getattr(apc, '_in_yellow_audit', False):
+                continue
+
+            logic = apc._get_logic()
+            phases = getattr(logic, "phases", None)
+            if not phases:
+                continue
+            n = len(phases)
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        continue
+                    from_state = phases[i].state
+                    to_state = phases[j].state
+                    nmin = min(len(from_state), len(to_state))
+                    if any(from_state[k].upper() == 'G' and to_state[k].upper() == 'R' for k in range(nmin)):
+                        apc._in_yellow_audit = True
+                        try:
+                            yellow_idx, yellow_dur = apc.get_or_create_yellow_phase(i, j, apc.max_adaptive_yellow, allow_overwrite=True)
+                            if yellow_idx is not None:
+                                num_fixed += 1
+                                logger.info(f"[NETWORK YELLOW PATCH] {tls_id}: Ensured yellow for {i}->{j} (idx={yellow_idx}, dur={yellow_dur:.2f})")
+                        finally:
+                            apc._in_yellow_audit = False
+
+        logger.info(f"[NETWORK YELLOW PATCH] Completed. Total yellow transitions ensured: {num_fixed}")
+    finally:
+        controller._in_network_yellow_enforcement = False
+    # CRITICAL FIX: Prevent infinite recursion
+    if getattr(controller, '_in_network_yellow_enforcement', False):
+        return
+    
+    from collections.abc import Mapping
+    logger = logging.getLogger("controller")
+    ctrls = getattr(controller, "adaptive_phase_controllers", None)
+    if not ctrls or not isinstance(ctrls, Mapping):
+        logger.error("[NETWORK YELLOW PATCH] No adaptive_phase_controllers found on controller")
+        return
+    
+    try:
+        controller._in_network_yellow_enforcement = True
+        num_fixed = 0
+        
+        for tls_id, apc in ctrls.items():
+            # Skip if this APC is already processing
+            if getattr(apc, '_in_yellow_audit', False):
+                continue
+                
+            logic = apc._get_logic()
+            phases = getattr(logic, "phases", None)
+            if not phases:
+                continue
+            n = len(phases)
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        continue
+                    from_state = phases[i].state
+                    to_state = phases[j].state
+                    nmin = min(len(from_state), len(to_state))
+                    if any(from_state[k].upper() == 'G' and to_state[k].upper() == 'R' for k in range(nmin)):
+                        # Set flag to prevent recursion during this call
+                        apc._in_yellow_audit = True
+                        try:
+                            yellow_idx, yellow_dur = apc.get_or_create_yellow_phase(i, j, apc.max_adaptive_yellow, allow_overwrite=True)
+                            if yellow_idx is not None:
+                                num_fixed += 1
+                                logger.info(f"[NETWORK YELLOW PATCH] {tls_id}: Ensured yellow for {i}->{j} (idx={yellow_idx}, dur={yellow_dur:.2f})")
+                        finally:
+                            apc._in_yellow_audit = False
+        
+        logger.info(f"[NETWORK YELLOW PATCH] Completed. Total yellow transitions ensured: {num_fixed}")
+    finally:
+        controller._in_network_yellow_enforcement = False
     # unchanged except it will benefit from PHASE_CAP via APC methods
     from collections.abc import Mapping
     logger = logging.getLogger("controller")

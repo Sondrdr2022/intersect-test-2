@@ -5,8 +5,8 @@ import random
 import logging
 
 # Use environment variables as default, fallback to hardcoded (for development)
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://zizihmglxsobyxvgzosa.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InppemlobWdseHNvYnl4dmd6b3NhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NzY0NDY2NSwiZXhwIjoyMDczMjIwNjY1fQ.76nGiK9483TXczGWvH0y1IpmQaA01nASAtRHfzJUR5Q")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ffkpousbxdnzgttefnln.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZma3BvdXNieGRuemd0dGVmbmxuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1ODI0ODEyNiwiZXhwIjoyMDczODI0MTI2fQ.rr_oRLHIo_kUVy53qwnMzAO2JDbwtGBu3gGnIN64zSc")
 
 # Logging config
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # or "DEBUG", etc.

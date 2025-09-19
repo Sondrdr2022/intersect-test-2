@@ -330,6 +330,7 @@ class EventDrivenCorridorCoordinator:
 
         except Exception as e:
             logger.error(f"[PATCH][EMERGENCY TRACK] Failed: {e}")    
+
     def _safe_group_phase_switch(self, tl_id, target_phase, requested_duration=None, reason="group_coordination"):
         """
         Enforces strict phase-end logic and mandatory local safety validation.
