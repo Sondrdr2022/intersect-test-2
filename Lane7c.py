@@ -1,4 +1,4 @@
-# python Lane7b.py --sumo dataset1.sumocfg --gui --max-steps 1000 --episodes 1
+# python Lane7c.py --sumo dataset1.sumocfg --gui --max-steps 1000 --episodes 1
 import os, sys, time, json, pickle,traceback,random, logging, threading,argparse, datetime, warnings
 from collections import defaultdict,deque
 import numpy as np
@@ -3652,7 +3652,6 @@ class EnhancedQLearningAgent:
 
         # Determine current action space from this TLS
         try:
-            from corridor_coordinator import get_current_logic
             logic = get_current_logic(tls_id)
             n_phases = len(logic.getPhases()) if logic else 1
         except Exception:
